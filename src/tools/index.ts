@@ -1071,7 +1071,7 @@ export const SIM_TOOLS = [
       const r = memory.requestCapability({ source: "trader", missionId: ctx.missionId, ...i });
       return r.duplicate
         ? `Ya estaba pedida (#${r.id}): se suma tu petición. El usuario la verá.`
-        : `Petición #${r.id} anotada. El usuario la verá en el panel y en /cryptoagent:estado.`;
+        : `Petición #${r.id} anotada. El usuario la verá en el panel y en /dementeking:estado.`;
     },
   }),
 

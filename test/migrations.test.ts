@@ -8,7 +8,7 @@ import { db } from "../src/db.js";
 import { latestVersion, runMigrations, schemaVersion, type Migration } from "../src/migrations.js";
 
 const tempDb = () => {
-  const dir = mkdtempSync(path.join(os.tmpdir(), "cryptoagent-mig-"));
+  const dir = mkdtempSync(path.join(os.tmpdir(), "dementeking-mig-"));
   const conn = new DatabaseSync(path.join(dir, "sim.db"));
   conn.exec("CREATE TABLE missions (id INTEGER PRIMARY KEY)");
   return { dir, conn };

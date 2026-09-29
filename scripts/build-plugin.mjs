@@ -2,7 +2,7 @@
 // con todas sus dependencias dentro: el usuario no necesita ejecutar npm install.
 //   npm run build:plugin
 import { build } from "esbuild";
-import { copyFileSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 
 const out = "plugin/dist";
 rmSync(out, { recursive: true, force: true });
@@ -36,19 +36,11 @@ copyFileSync("knowledge/guia-del-terreno.md", `${out}/guia-del-terreno.md`);
 const kb = (f) => (statSync(f).size / 1024).toFixed(0);
 console.log(`Plugin empaquetado: ${out}/cryptosim.mjs (${kb(`${out}/cryptosim.mjs`)} KB), signer.mjs (${kb(`${out}/signer.mjs`)} KB), index.html, guia-del-terreno.md`);
 
-// El plugin se distribuye desde el marketplace NeumorStudio/claude-plugins. Si está clonado junto a
-// este repositorio (../claude-plugins), se copia allí el plugin y se sincroniza su versión en el catálogo.
-const marketplaceRepo = "../claude-plugins";
-if (existsSync(`${marketplaceRepo}/.claude-plugin/marketplace.json`)) {
-  const version = JSON.parse(readFileSync("plugin/.claude-plugin/plugin.json", "utf8")).version;
-  const target = `${marketplaceRepo}/plugins/cryptoagent`;
-  rmSync(target, { recursive: true, force: true });
-  cpSync("plugin", target, { recursive: true });
-  const catalogPath = `${marketplaceRepo}/.claude-plugin/marketplace.json`;
-  const catalog = JSON.parse(readFileSync(catalogPath, "utf8"));
-  for (const p of catalog.plugins) if (p.name === "cryptoagent") p.version = version;
-  writeFileSync(catalogPath, JSON.stringify(catalog, null, 2) + "\n");
-  console.log(`Copiado a ${target} (versión ${version}). Haz commit y push en ${marketplaceRepo} para publicarlo.`);
-} else {
-  console.log(`No se encuentra ${marketplaceRepo}: clona NeumorStudio/claude-plugins ahí para publicar.`);
-}
+// Este repositorio es también su propio marketplace (.claude-plugin/marketplace.json apunta a ./plugin):
+// se sincroniza la versión en el catálogo y basta con hacer commit y push para publicarla.
+const catalogPath = ".claude-plugin/marketplace.json";
+const version = JSON.parse(readFileSync("plugin/.claude-plugin/plugin.json", "utf8")).version;
+const catalog = JSON.parse(readFileSync(catalogPath, "utf8"));
+for (const p of catalog.plugins) if (p.name === "dementeking") p.version = version;
+writeFileSync(catalogPath, JSON.stringify(catalog, null, 2) + "\n");
+console.log(`Versión ${version} sincronizada en ${catalogPath}. Haz commit y push para publicarla.`);

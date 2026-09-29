@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>cryptoagent · la carrera</title>
+<title>dementeking · la carrera</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Anybody:wdth,wght@50..150,300..900&display=swap" rel="stylesheet">
@@ -463,7 +463,7 @@ function render() {
   const { mission: m, valuation: v } = state;
   if (!m) {
     $("missionName").textContent = "No hay ninguna misión";
-    $("missionSub").textContent = "Empieza una con /cryptoagent:trading en Claude Code.";
+    $("missionSub").textContent = "Empieza una con /dementeking:trading en Claude Code.";
     $("valueNum").textContent = "";
     return;
   }
@@ -867,7 +867,7 @@ function renderLearn() {
   if (mem.requests.length) {
     const first = mem.requests[0];
     ask.append(el("p", { class: "ask" }, el("b", {}, mem.requests.length === 1 ? "Pide algo que no tiene: " : `Pide ${mem.requests.length} cosas que no tiene, como: `),
-      first.capability, ". Contéstale con /cryptoagent:peticiones."));
+      first.capability, ". Contéstale con /dementeking:peticiones."));
   }
 }
 

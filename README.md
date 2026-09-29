@@ -1,4 +1,9 @@
-# cryptoagent
+# dementeking
+
+Copia de [cryptoagent](https://github.com/NeumorStudio/cryptoagent) (de Carlos) con otro nombre, para que cada uno
+tenga su agente y lo edite por separado. Parte de la v0.36.2 con todo su historial: las mejoras de cryptoagent se pueden
+traer con `git fetch carlos && git merge carlos/main` (remoto `carlos` = `NeumorStudio/cryptoagent`). Puede instalarse a
+la vez que cryptoagent sin que se pisen: comandos `/dementeking:*`, datos en `~/.dementeking` y panel en el puerto 4331.
 
 Plugin de Claude Code: un agente autónomo que opera criptomonedas **en simulación**.
 El dinero es ficticio, pero los precios, la liquidez y las comisiones son reales y del momento:
@@ -28,30 +33,29 @@ de VS Code y JetBrains. En el chat normal de Claude las habilidades se cargan, p
 En Claude Code:
 
 ```
-/plugin marketplace add NeumorStudio/claude-plugins
-/plugin install cryptoagent@neumorstudio
+/plugin marketplace add NeumorStudio/dementeking
+/plugin install dementeking@dementeking
 ```
 
-En la app de escritorio: **Ajustes → Plugins → Añadir marketplace** con `NeumorStudio/claude-plugins`, e instala
+En la app de escritorio: **Ajustes → Plugins → Añadir marketplace** con `NeumorStudio/dementeking`, e instala
 el plugin desde **Descubrir**. Después abre una sesión nueva.
 
-El plugin se distribuye desde el marketplace [NeumorStudio/claude-plugins](https://github.com/NeumorStudio/claude-plugins);
-este repositorio es su código fuente.
+Este repositorio es a la vez el código fuente y el marketplace (`.claude-plugin/marketplace.json` apunta a `./plugin`).
 
 ## Usar
 
-- `/cryptoagent:trading`: te pregunta capital, objetivo, tiempo, enfoque y si abrir el panel; crea la misión
+- `/dementeking:trading`: te pregunta capital, objetivo, tiempo, enfoque y si abrir el panel; crea la misión
   y lanza el agente en segundo plano. Si ya hay una misión activa, te deja continuarla, reemplazarla o detenerla.
-- `/cryptoagent:estado`: resumen de la misión en el chat (progreso, posiciones, últimos movimientos con su motivo
+- `/dementeking:estado`: resumen de la misión en el chat (progreso, posiciones, últimos movimientos con su motivo
   y la última nota del agente). Pensado también para consultarlo desde el móvil con Remote Control.
-- `/cryptoagent:parar`: detiene la misión activa (cerrando posiciones o no).
-- `/cryptoagent:peticiones`: lo que el agente ha pedido y no tiene; puedes aceptarlo, rechazarlo o marcarlo como hecho.
+- `/dementeking:parar`: detiene la misión activa (cerrando posiciones o no).
+- `/dementeking:peticiones`: lo que el agente ha pedido y no tiene; puedes aceptarlo, rechazarlo o marcarlo como hecho.
 
 Al terminar una misión, Claude te avisa con una notificación; con Remote Control conectado, también en el móvil.
 
 No inicies sesión en exchanges ni redes sociales dentro del navegador de la app: el agente lo usa.
 
-Los datos (misiones, diario, lecciones) se guardan en `~/.cryptoagent`, fuera del plugin: se conservan al
+Los datos (misiones, diario, lecciones) se guardan en `~/.dementeking`, fuera del plugin: se conservan al
 actualizar o reinstalar, y son los mismos se instale desde la app o desde la CLI.
 
 ## Usar en OpenCode
@@ -64,12 +68,12 @@ npm install
 npm run install:opencode
 ```
 
-Copia el simulador a `~/.cryptoagent/opencode`, añade el servidor MCP `cryptosim` a `~/.config/opencode/opencode.json`
+Copia el simulador a `~/.dementeking/opencode`, añade el servidor MCP `cryptosim` a `~/.config/opencode/opencode.json`
 (sin tocar el resto), y genera los agentes `trader` y `reviewer` (a partir de los mismos prompts) y los comandos:
-`/cryptoagent-trading` (p. ej. `/cryptoagent-trading 20 40 5`), `/cryptoagent-estado`, `/cryptoagent-parar`,
-`/cryptoagent-peticiones` y `/cryptoagent-panel`. Después, reinicia OpenCode.
+`/dementeking-trading` (p. ej. `/dementeking-trading 20 40 5`), `/dementeking-estado`, `/dementeking-parar`,
+`/dementeking-peticiones` y `/dementeking-panel`. Después, reinicia OpenCode.
 
-OpenCode tiene su propia base de datos (`~/.cryptoagent/opencode-data`) y su propio panel (http://localhost:4322):
+OpenCode tiene su propia base de datos (`~/.dementeking/opencode-data`) y su propio panel (http://localhost:4332):
 sus misiones y su memoria no se mezclan con las de Claude Code, así que puedes comparar cómo aprende con cada modelo.
 Otras diferencias: en OpenCode los agentes
 van uno detrás de otro (el revisor prepara, el trader trabaja y el revisor hace la retrospectiva al final, sin revisar a
@@ -81,8 +85,8 @@ Tras actualizar el código, vuelve a ejecutar `npm run install:opencode`.
 En marketplaces que no son de Anthropic la actualización automática viene desactivada. Para actualizar:
 
 ```
-/plugin marketplace update neumorstudio
-/plugin update cryptoagent@neumorstudio
+/plugin marketplace update dementeking
+/plugin update dementeking@dementeking
 ```
 
 O activa la actualización automática de este marketplace en el gestor de plugins.
@@ -95,9 +99,9 @@ El agente también puede operar con dinero de verdad, desde una cartera **nueva*
 
 ### Cómo empezar
 
-1. **Crea la cartera.** Escribe `/cryptoagent:cartera` (en OpenCode, `/cryptoagent-cartera`). Se abre en tu navegador la página de la cartera. Ahí eliges una contraseña y ves **una sola vez** la frase de recuperación: apúntala en papel. Puedes importarla en MetaMask (Base y BNB Chain) y en Phantom (Solana) para ver la cartera.
+1. **Crea la cartera.** Escribe `/dementeking:cartera` (en OpenCode, `/dementeking-cartera`). Se abre en tu navegador la página de la cartera. Ahí eliges una contraseña y ves **una sola vez** la frase de recuperación: apúntala en papel. Puedes importarla en MetaMask (Base y BNB Chain) y en Phantom (Solana) para ver la cartera.
 2. **Dale fondos.** Envía USDC o USDT a las direcciones de la página, y un poco de SOL, ETH o BNB para pagar la red.
-3. **Lanza una misión real.** `/cryptoagent:trading` pregunta primero el modo; elige **Real** y decide:
+3. **Lanza una misión real.** `/dementeking:trading` pregunta primero el modo; elige **Real** y decide:
    - **aprobación**: apruebas cada operación en la página de la cartera (espera hasta 90 s), o autónomo;
    - **límites**: máximo por operación y pérdida máxima.
 4. **Sigue la misión.** El panel muestra una banda "DINERO REAL", las aprobaciones pendientes y un enlace al explorador en cada operación.
@@ -118,7 +122,7 @@ El agente también puede operar con dinero de verdad, desde una cartera **nueva*
 ### Cómo se protege la clave
 
 - **El modelo nunca la ve.** La frase y la clave no pasan por el chat, la base de datos ni el panel. Firma un proceso aparte, el *firmante*, que escucha solo en `127.0.0.1`.
-- **Se guarda cifrada.** La frase está en `~/.cryptoagent/live/wallet.enc`, cifrada con tu contraseña (scrypt + AES-256-GCM). El firmante se desbloquea con esa contraseña en su página. Si se reinicia el ordenador, hay que volver a desbloquearla.
+- **Se guarda cifrada.** La frase está en `~/.dementeking/live/wallet.enc`, cifrada con tu contraseña (scrypt + AES-256-GCM). El firmante se desbloquea con esa contraseña en su página. Si se reinicia el ordenador, hay que volver a desbloquearla.
 - **El firmante revisa cada transacción antes de firmar:**
   - **Swaps:** solo van a Jupiter o al router de KyberSwap, y lo comprado vuelve a la propia cartera.
   - **Puentes:** solo van al contrato de Li.Fi, y el destino que devuelve Li.Fi debe ser la propia cartera.
@@ -127,7 +131,7 @@ El agente también puede operar con dinero de verdad, desde una cartera **nueva*
 
 ### Impuestos
 
-`/cryptoagent:impuestos` (en OpenCode, `/cryptoagent-impuestos`) exporta a CSV, para Excel, dos archivos:
+`/dementeking:impuestos` (en OpenCode, `/dementeking-impuestos`) exporta a CSV, para Excel, dos archivos:
 - **Operaciones reales:** todas, con hash, cantidades, valor en USD y EUR y comisión de red.
 - **Resultados por posición.**
 
@@ -175,22 +179,21 @@ npm install
 npm run build:plugin      # regenera plugin/dist a partir de src/
 npm run typecheck
 npm test                  # tests (cada archivo usa una base de datos temporal)
-npx tsx scripts/migrate-dry.ts   # prueba las migraciones sobre una copia de ~/.cryptoagent/sim.db
+npx tsx scripts/migrate-dry.ts   # prueba las migraciones sobre una copia de ~/.dementeking/sim.db
 npx tsx scripts/smoke.ts         # recorrido contra las APIs reales en una base de datos temporal
 ```
 
 Los cambios de esquema van en `src/migrations.ts`, como un paso nuevo al final de la lista. Antes de migrar una
-base de datos con datos se guarda una copia en `~/.cryptoagent/backups`.
+base de datos con datos se guarda una copia en `~/.dementeking/backups`.
 
 Los prompts de los agentes están solo en `plugin/agents/`. El runner por API los lee de ahí y quita las líneas
 marcadas con `<!-- solo-plugin -->`.
 
-Para probar tus cambios, clona `NeumorStudio/claude-plugins` junto a este repositorio (`../claude-plugins`),
-añádelo como marketplace local e instala el plugin. Tras cada cambio: `npm run build:plugin` (también copia el
-plugin a `../claude-plugins`) y `/plugin update cryptoagent@neumorstudio`.
+Para probar tus cambios, añade este repositorio como marketplace local (`/plugin marketplace add ./`) e instala el
+plugin. Tras cada cambio: `npm run build:plugin` y `/plugin update dementeking@dementeking`.
 
 **Publicar una versión**: sube `version` en `plugin/.claude-plugin/plugin.json` y ejecuta `npm run build:plugin`,
-que copia el plugin a `../claude-plugins` con la versión sincronizada. Haz commit y push en los dos repositorios.
+que sincroniza la versión en `.claude-plugin/marketplace.json`. Haz commit y push.
 Los usuarios reciben la versión nueva al actualizar; mientras no cambies `version`, no ven los cambios.
 
 ### Runner por API (opcional, sin Claude Code)
@@ -202,7 +205,7 @@ npx playwright install chromium
 cp .env.example .env      # pon tu ANTHROPIC_API_KEY
 npm run mission -- --capital 1000 --target 1050 --hours 24
 npm run agent             # trabaja hasta que termine la misión
-npm run dashboard         # panel en http://localhost:4321
+npm run dashboard         # panel en http://localhost:4331
 npm run watcher           # vigila órdenes y misión sin agente
 npm run report
 ```

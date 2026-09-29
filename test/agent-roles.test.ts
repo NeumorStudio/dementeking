@@ -7,7 +7,7 @@ import { test } from "node:test";
 import { SIM_TOOLS } from "../src/tools/index.js";
 
 const root = path.resolve(import.meta.dirname, "..");
-const PREFIX = "mcp__plugin_cryptoagent_cryptosim__";
+const PREFIX = "mcp__plugin_dementeking_cryptosim__";
 
 function disallowed(agent: string) {
   const md = readFileSync(path.join(root, "plugin/agents", `${agent}.md`), "utf8");

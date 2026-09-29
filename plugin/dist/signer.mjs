@@ -7242,7 +7242,7 @@ import os from "node:os";
 import path2 from "node:path";
 import { fileURLToPath } from "node:url";
 function resolveDataDir() {
-  return usable(process.env.DATA_DIR) ?? (BUNDLED ? path2.join(os.homedir(), ".cryptoagent") : path2.join(projectRoot, "data"));
+  return usable(process.env.DATA_DIR) ?? (BUNDLED ? path2.join(os.homedir(), ".dementeking") : path2.join(projectRoot, "data"));
 }
 var BUNDLED, here, projectRoot, usable;
 var init_paths = __esm({
@@ -63476,7 +63476,7 @@ function createSignerServer(opts) {
   };
   const ready = () => {
     if (state.stopped) throw new HttpError(423, "La cartera est\xE1 parada: el usuario debe desbloquearla de nuevo en su p\xE1gina");
-    if (!state.accounts) throw new HttpError(423, "La cartera est\xE1 bloqueada: el usuario debe desbloquearla en su p\xE1gina (/cryptoagent:cartera)");
+    if (!state.accounts) throw new HttpError(423, "La cartera est\xE1 bloqueada: el usuario debe desbloquearla en su p\xE1gina (/dementeking:cartera)");
     return state.accounts;
   };
   async function approveIntent(intent) {
@@ -63683,7 +63683,7 @@ async function runSigner() {
   };
   process.on("SIGINT", cleanup);
   process.on("SIGTERM", cleanup);
-  console.error(`Firmante de cryptoagent en http://127.0.0.1:${port}/wallet`);
+  console.error(`Firmante de dementeking en http://127.0.0.1:${port}/wallet`);
 }
 
 // src/live/signer/main.ts

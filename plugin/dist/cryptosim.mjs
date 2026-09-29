@@ -7614,7 +7614,7 @@ function asset(fileName, devPath) {
   return found;
 }
 function resolveDataDir() {
-  return usable(process.env.DATA_DIR) ?? (BUNDLED ? path.join(os.homedir(), ".cryptoagent") : path.join(projectRoot, "data"));
+  return usable(process.env.DATA_DIR) ?? (BUNDLED ? path.join(os.homedir(), ".dementeking") : path.join(projectRoot, "data"));
 }
 var BUNDLED, here, projectRoot, usable;
 var init_paths = __esm({
@@ -8075,7 +8075,7 @@ function supersededBy() {
   if (!CODE_VERSION) return null;
   const stored = getMeta("code_version");
   if (!stored || !newer(stored, CODE_VERSION)) return null;
-  return `Esta sesi\xF3n usa cryptoagent ${CODE_VERSION}, pero ya hay en marcha la versi\xF3n ${stored}. Para no estropear los datos, esta versi\xF3n ya no hace nada: abre una sesi\xF3n nueva de Claude Code.`;
+  return `Esta sesi\xF3n usa dementeking ${CODE_VERSION}, pero ya hay en marcha la versi\xF3n ${stored}. Para no estropear los datos, esta versi\xF3n ya no hace nada: abre una sesi\xF3n nueva de Claude Code.`;
 }
 function holdsTickLease() {
   const nowMs = Date.now();
@@ -10289,7 +10289,7 @@ async function signerStatus() {
 }
 async function runningSigner() {
   const s = await signerStatus();
-  if (!s) throw new Error("El firmante de la cartera no est\xE1 en marcha: pide al usuario que la abra y desbloquee con /cryptoagent:cartera");
+  if (!s) throw new Error("El firmante de la cartera no est\xE1 en marcha: pide al usuario que la abra y desbloquee con /dementeking:cartera");
   return s.info;
 }
 async function requestIntent(intent) {
@@ -10439,7 +10439,7 @@ __export(sync_exports, {
 });
 function livePub() {
   const pub = readWalletPublic(liveDir());
-  if (!pub) throw new Error("No hay cartera real. El usuario debe crearla con /cryptoagent:cartera");
+  if (!pub) throw new Error("No hay cartera real. El usuario debe crearla con /dementeking:cartera");
   return pub;
 }
 function missionTokens(missionId) {
@@ -11130,7 +11130,7 @@ function startMissionClock(missionId) {
 }
 async function missionStatus(missionId) {
   const mission = missionId !== void 0 ? getMission(missionId) : getActiveMission() ?? getLastMission();
-  if (!mission) return { active: false, message: "No hay ninguna misi\xF3n. El usuario debe crear una (/cryptoagent:trading en Claude Code, /cryptoagent-trading en OpenCode)." };
+  if (!mission) return { active: false, message: "No hay ninguna misi\xF3n. El usuario debe crear una (/dementeking:trading en Claude Code, /dementeking-trading en OpenCode)." };
   if (mission.status !== "active") {
     return {
       active: false,
@@ -43657,7 +43657,7 @@ ${body.slice(0, 2e4)}${body.length > 2e4 ? `
     }),
     run: async (i, ctx) => {
       const r = requestCapability({ source: "trader", missionId: ctx.missionId, ...i });
-      return r.duplicate ? `Ya estaba pedida (#${r.id}): se suma tu petici\xF3n. El usuario la ver\xE1.` : `Petici\xF3n #${r.id} anotada. El usuario la ver\xE1 en el panel y en /cryptoagent:estado.`;
+      return r.duplicate ? `Ya estaba pedida (#${r.id}): se suma tu petici\xF3n. El usuario la ver\xE1.` : `Petici\xF3n #${r.id} anotada. El usuario la ver\xE1 en el panel y en /dementeking:estado.`;
     }
   }),
   // ─── Revisor: lee todo lo ocurrido y escribe la memoria ────────────────────
@@ -44000,8 +44000,8 @@ ${ended.join("\n")}`;
 
 // src/dashboard/timeline.ts
 var projectsDir = path7.join(os2.homedir(), ".claude", "projects");
-var TRADER_AGENT = /(^|:)trader$/;
-var normalizeTool = (name) => name.replace(/^mcp__plugin_.*?_cryptosim__/, "mcp__cryptosim__");
+var TRADER_AGENT = /^(dementeking:)?trader$/;
+var normalizeTool = (name) => name.replace(/^mcp__plugin_dementeking_cryptosim__/, "mcp__cryptosim__");
 var COVERED_BY_DB = new Set(SIM_TOOLS.filter((t) => t.journaled).map((t) => `mcp__cryptosim__${t.name}`));
 function resultText(content) {
   if (typeof content === "string") return content;
@@ -44350,7 +44350,7 @@ async function isOurDashboard(url2) {
   }
 }
 async function startDashboard(opts = {}) {
-  const port = opts.port ?? Number(process.env.DASHBOARD_PORT || 4321);
+  const port = opts.port ?? Number(process.env.DASHBOARD_PORT || 4331);
   const log = opts.log ?? console.error;
   const url2 = `http://localhost:${port}`;
   if (running) return { url: running.url, alreadyRunning: true };
@@ -44388,7 +44388,7 @@ function closeLocal() {
 }
 async function stopDashboard(opts = {}) {
   if (closeLocal()) return true;
-  const url2 = `http://localhost:${opts.port ?? Number(process.env.DASHBOARD_PORT || 4321)}`;
+  const url2 = `http://localhost:${opts.port ?? Number(process.env.DASHBOARD_PORT || 4331)}`;
   if (!await isOurDashboard(url2)) return false;
   await fetch(`${url2}/api/shutdown`, { method: "POST", signal: AbortSignal.timeout(3e3) }).catch(() => void 0);
   return true;
@@ -44509,7 +44509,7 @@ function timeLeft(deadline) {
 }
 async function statusReport(missionId) {
   const m = missionId !== void 0 ? getMission(missionId) : getActiveMission() ?? getLastMission();
-  if (!m) return "No hay ninguna misi\xF3n. Crea una con /cryptoagent:trading.";
+  if (!m) return "No hay ninguna misi\xF3n. Crea una con /dementeking:trading.";
   const v = await valuation(m.id);
   const current = m.status === "active" ? v.totalUsd : m.final_usd ?? v.totalUsd;
   const change = (current - m.initial_usd) / m.initial_usd * 100;
@@ -44558,7 +44558,7 @@ async function statusReport(missionId) {
   if (review) lines.push("", `Revisor (${hhmm3(review.ts)}): ${review.title}${review.body ? ` \xB7 ${review.body.slice(0, 200)}` : ""}`);
   const requests = listCapabilityRequests("open");
   if (requests.length) {
-    lines.push("", `El agente pide (${requests.length}, rev\xEDsalas con /cryptoagent:peticiones):`);
+    lines.push("", `El agente pide (${requests.length}, rev\xEDsalas con /dementeking:peticiones):`);
     for (const r of requests.slice(0, 3)) lines.push(`- ${r.capability}${r.times_requested > 1 ? ` (${r.times_requested} veces)` : ""}`);
   }
   return lines.join("\n");

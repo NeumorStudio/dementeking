@@ -1,21 +1,21 @@
-// Instala cryptoagent en OpenCode (escritorio o terminal):   npm run install:opencode
-// - Copia el simulador empaquetado a ~/.cryptoagent/opencode (una copia estable, no depende de este repositorio).
+// Instala dementeking en OpenCode (escritorio o terminal):   npm run install:opencode
+// - Copia el simulador empaquetado a ~/.dementeking/opencode (una copia estable, no depende de este repositorio).
 // - Añade el servidor MCP `cryptosim` al opencode.json global, sin tocar el resto de la configuración.
 // - Genera los agentes `trader` y `reviewer` a partir de los mismos prompts del plugin de Claude Code, y los
-//   comandos /cryptoagent-*. No fija ningún modelo: usan el que tengas seleccionado en OpenCode.
-// Usa su propia base de datos (~/.cryptoagent/opencode-data) y su propio panel (puerto 4322), separados de Claude Code.
+//   comandos /dementeking-*. No fija ningún modelo: usan el que tengas seleccionado en OpenCode.
+// Usa su propia base de datos (~/.dementeking/opencode-data) y su propio panel (puerto 4332), separados de Claude Code.
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
 // Importar las herramientas abre la base de datos: que sea una temporal, no la de desarrollo ni la real.
-process.env.DATA_DIR = mkdtempSync(path.join(os.tmpdir(), "cryptoagent-install-"));
+process.env.DATA_DIR = mkdtempSync(path.join(os.tmpdir(), "dementeking-install-"));
 const { buildPrompt, REVIEWER_PROMPT_PATH, TRADER_PROMPT_PATH } = await import("../src/prompt.js");
 const { SIM_TOOLS } = await import("../src/tools/index.js");
 
 const root = path.resolve(import.meta.dirname, "..");
 const home = os.homedir();
-const serverDir = path.join(home, ".cryptoagent", "opencode");
+const serverDir = path.join(home, ".dementeking", "opencode");
 const configDir = path.join(home, ".config", "opencode");
 const MCP = "cryptosim";
 
@@ -34,9 +34,9 @@ if (existsSync(path.join(configDir, "opencode.jsonc"))) {
 const configFile = path.join(configDir, "opencode.json");
 const config = existsSync(configFile) ? (JSON.parse(readFileSync(configFile, "utf8")) as Record<string, any>) : { $schema: "https://opencode.ai/config.json" };
 // Base de datos y panel propios: las misiones y la memoria de OpenCode no se mezclan con las de Claude Code
-// (así se puede comparar cómo aprende con cada modelo), y el panel no choca con el de Claude Code (4321).
-const dataDir = path.join(home, ".cryptoagent", "opencode-data");
-const DASHBOARD_PORT = "4322";
+// (así se puede comparar cómo aprende con cada modelo), y el panel no choca con el de Claude Code (4331).
+const dataDir = path.join(home, ".dementeking", "opencode-data");
+const DASHBOARD_PORT = "4332";
 const server = { type: "local", command: [process.execPath, serverFile], environment: { DATA_DIR: dataDir, DASHBOARD_PORT, CRYPTOAGENT_HOST: "opencode" } };
 // OpenCode 2 entiende los dos formatos: el clásico (mcp.<nombre> con enabled) y el nuevo (mcp.servers.<nombre> con
 // disabled). Se respeta el que ya tenga el archivo.
@@ -80,11 +80,11 @@ const agentsDir = path.join(configDir, "agents");
 mkdirSync(agentsDir, { recursive: true });
 writeFileSync(
   path.join(agentsDir, "trader.md"),
-  agentFile("trader", "Agente de cryptoagent que intenta cumplir una misión de trading simulado (capital, objetivo y plazo). Lo lanza /cryptoagent-trading.", TRADER_PROMPT_PATH),
+  agentFile("trader", "Agente de dementeking que intenta cumplir una misión de trading simulado (capital, objetivo y plazo). Lo lanza /dementeking-trading.", TRADER_PROMPT_PATH),
 );
 writeFileSync(
   path.join(agentsDir, "reviewer.md"),
-  agentFile("reviewer", "Revisor de cryptoagent: analiza lo que hace el trader, escribe su memoria y le prepara cada misión. Lo lanza /cryptoagent-trading.", REVIEWER_PROMPT_PATH),
+  agentFile("reviewer", "Revisor de dementeking: analiza lo que hace el trader, escribe su memoria y le prepara cada misión. Lo lanza /dementeking-trading.", REVIEWER_PROMPT_PATH),
 );
 
 // ── 4. Comandos ─────────────────────────────────────────────────────────────
@@ -92,10 +92,10 @@ const ASK =
   "Para preguntar al usuario, usa la herramienta de preguntas si la tienes (con opciones); si no, pregunta en el chat y espera su respuesta.";
 
 const commands: Record<string, string> = {
-  "cryptoagent-trading": `---
-description: Lanza una misión de cryptoagent (trading simulado con precios reales) con su agente y su revisor
+  "dementeking-trading": `---
+description: Lanza una misión de dementeking (trading simulado con precios reales) con su agente y su revisor
 ---
-Vas a lanzar una misión de cryptoagent. Habla en español. Tú no operas ni escribes memoria: preparas la misión y lanzas a los agentes. ${ASK}
+Vas a lanzar una misión de dementeking. Habla en español. Tú no operas ni escribes memoria: preparas la misión y lanzas a los agentes. ${ASK}
 
 Argumentos del usuario: $ARGUMENTS
 (Formato orientativo: capital, objetivo y minutos, p. ej. "20 40 5" = 20 $ de capital, llegar a 40 $, en 5 minutos. Un objetivo en % se aplica sobre el capital.)
@@ -115,13 +115,13 @@ Argumentos del usuario: $ARGUMENTS
 
 No añadas nada a los mensajes de los subagentes: todo lo que necesitan está en su configuración y en el simulador.
 `,
-  "cryptoagent-estado": `---
-description: Cómo va la misión de cryptoagent
+  "dementeking-estado": `---
+description: Cómo va la misión de dementeking
 ---
 Llama a \`cryptosim_status_report\` y muestra su contenido tal cual, en español, sin tablas ni análisis propio.
 `,
-  "cryptoagent-parar": `---
-description: Detiene la misión activa de cryptoagent
+  "dementeking-parar": `---
+description: Detiene la misión activa de dementeking
 ---
 Habla en español. ${ASK}
 1. Llama a \`cryptosim_mission_status\`. Si no hay misión activa, dilo y termina.
@@ -129,30 +129,30 @@ Habla en español. ${ASK}
 3. Llama a \`cryptosim_stop_mission\` con close_positions según la respuesta.
 4. Cierra el panel con \`cryptosim_stop_dashboard\` y resume en una línea el valor final y que el panel se ha cerrado.
 `,
-  "cryptoagent-peticiones": `---
-description: Lo que el agente de cryptoagent ha pedido y no tiene (cuentas, herramientas, mercados)
+  "dementeking-peticiones": `---
+description: Lo que el agente de dementeking ha pedido y no tiene (cuentas, herramientas, mercados)
 ---
 Habla en español. ${ASK}
 1. Llama a \`cryptosim_capability_requests\`. Si no hay ninguna abierta, dilo y termina.
 2. Muéstralas de la más pedida a la menos: qué pide, cuántas veces, por qué y qué haría con ello.
 3. Pregunta si quiere responder a alguna (aceptada, rechazada o hecha, con una nota) y regístralo con \`cryptosim_resolve_capability_request\`.
 `,
-  "cryptoagent-panel": `---
-description: Abre el panel en directo de cryptoagent
+  "dementeking-panel": `---
+description: Abre el panel en directo de dementeking
 ---
 Llama a \`cryptosim_start_dashboard\` con open_in_system_browser: true y di en una línea dónde está el panel.
 `,
-  "cryptoagent-cartera": `---
-description: Abre la cartera real de la IA de cryptoagent (crearla, desbloquearla, ver saldos o pararla)
+  "dementeking-cartera": `---
+description: Abre la cartera real de la IA de dementeking (crearla, desbloquearla, ver saldos o pararla)
 ---
 Llama a \`cryptosim_start_wallet\`: abre en el navegador la página de la cartera real de la IA. Explica en pocas líneas, en español, según el estado:
 - sin cartera: que la cree en la página; verá la frase de recuperación una sola vez y debe apuntarla en papel (puede importarla en MetaMask y Phantom para verla);
 - bloqueada: que escriba su contraseña en la página;
 - desbloqueada: llama a \`cryptosim_wallet_status\` y enseña el total, el saldo por cadena y las direcciones.
-Nunca pidas ni repitas en el chat la frase ni la contraseña. Para que el agente opere con ella, se crea una misión en modo real con /cryptoagent-trading.
+Nunca pidas ni repitas en el chat la frase ni la contraseña. Para que el agente opere con ella, se crea una misión en modo real con /dementeking-trading.
 `,
-  "cryptoagent-impuestos": `---
-description: Exporta a CSV las operaciones con dinero real de cryptoagent (apoyo para la declaración)
+  "dementeking-impuestos": `---
+description: Exporta a CSV las operaciones con dinero real de dementeking (apoyo para la declaración)
 ---
 Llama a \`cryptosim_export_taxes\` (con year si el usuario indica un año: $ARGUMENTS) y enseña en pocas líneas, en español: cuántas operaciones y posiciones, el resultado realizado en USD y EUR y las rutas de los archivos. Recuerda que es un registro de apoyo, no asesoramiento fiscal (en España cada permuta es ganancia o pérdida patrimonial y Hacienda exige FIFO).
 `,
@@ -166,4 +166,4 @@ console.log(`Servidor MCP "${MCP}" en ${configFile}`);
 console.log(`Datos:       ${dataDir} (separados de Claude Code) · panel en http://localhost:${DASHBOARD_PORT}`);
 console.log(`Agentes:     ${path.join(agentsDir, "trader.md")}, reviewer.md`);
 console.log(`Comandos:    /${Object.keys(commands).join(", /")}`);
-console.log("Abre (o reinicia) OpenCode y escribe /cryptoagent-trading.");
+console.log("Abre (o reinicia) OpenCode y escribe /dementeking-trading.");

@@ -10,7 +10,7 @@ import { liveDir } from "./paths.js";
 
 export function livePub(): WalletPublic {
   const pub = readWalletPublic(liveDir());
-  if (!pub) throw new Error("No hay cartera real. El usuario debe crearla con /cryptoagent:cartera");
+  if (!pub) throw new Error("No hay cartera real. El usuario debe crearla con /dementeking:cartera");
   return pub;
 }
 

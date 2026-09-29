@@ -232,7 +232,7 @@ export function startMissionClock(missionId: number | null) {
 /** Estado de una misión (por defecto, la principal activa o la última). */
 export async function missionStatus(missionId?: number) {
   const mission = missionId !== undefined ? getMission(missionId) : (getActiveMission() ?? getLastMission());
-  if (!mission) return { active: false, message: "No hay ninguna misión. El usuario debe crear una (/cryptoagent:trading en Claude Code, /cryptoagent-trading en OpenCode)." };
+  if (!mission) return { active: false, message: "No hay ninguna misión. El usuario debe crear una (/dementeking:trading en Claude Code, /dementeking-trading en OpenCode)." };
   if (mission.status !== "active") {
     return {
       active: false,

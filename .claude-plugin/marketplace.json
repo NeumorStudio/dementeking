@@ -1,0 +1,31 @@
+{
+  "name": "dementeking",
+  "description": "DementeKing: agente de trading cripto en simulación (copia de cryptoagent de NeumorStudio, editable por separado).",
+  "owner": {
+    "name": "NeumorStudio"
+  },
+  "plugins": [
+    {
+      "name": "dementeking",
+      "source": "./plugin",
+      "description": "Agente de trading cripto en simulación con precios reales, misiones, memoria y panel en directo.",
+      "version": "0.36.2",
+      "displayName": "DementeKing",
+      "author": {
+        "name": "NeumorStudio"
+      },
+      "homepage": "https://github.com/NeumorStudio/dementeking",
+      "category": "finance",
+      "keywords": [
+        "crypto",
+        "trading",
+        "simulación",
+        "solana",
+        "pump.fun",
+        "binance",
+        "agente",
+        "finanzas"
+      ]
+    }
+  ]
+}

@@ -178,7 +178,7 @@ async function isOurDashboard(url: string): Promise<boolean> {
  * en este proceso o en otro, devuelve su URL sin arrancar otro.
  */
 export async function startDashboard(opts: { port?: number; log?: (msg: string) => void } = {}): Promise<{ url: string; alreadyRunning: boolean }> {
-  const port = opts.port ?? Number(process.env.DASHBOARD_PORT || 4321);
+  const port = opts.port ?? Number(process.env.DASHBOARD_PORT || 4331);
   const log = opts.log ?? console.error;
   const url = `http://localhost:${port}`;
   if (running) return { url: running.url, alreadyRunning: true };
@@ -219,7 +219,7 @@ function closeLocal(): boolean {
 /** Cierra el panel, esté en este proceso o en otro (de otra sesión). Devuelve si había uno abierto. */
 export async function stopDashboard(opts: { port?: number } = {}): Promise<boolean> {
   if (closeLocal()) return true;
-  const url = `http://localhost:${opts.port ?? Number(process.env.DASHBOARD_PORT || 4321)}`;
+  const url = `http://localhost:${opts.port ?? Number(process.env.DASHBOARD_PORT || 4331)}`;
   if (!(await isOurDashboard(url))) return false;
   await fetch(`${url}/api/shutdown`, { method: "POST", signal: AbortSignal.timeout(3000) }).catch(() => undefined);
   return true;

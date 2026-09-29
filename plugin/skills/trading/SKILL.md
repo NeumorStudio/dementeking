@@ -2,16 +2,16 @@
 name: trading
 description: Configura y lanza una misión del agente trader. Pregunta capital, objetivo y tiempo, abre el panel en directo si el usuario quiere y pone a trabajar en segundo plano al agente y a su revisor.
 disable-model-invocation: true
-allowed-tools: Agent, mcp__plugin_cryptoagent_cryptosim__mission_status, mcp__plugin_cryptoagent_cryptosim__create_mission, mcp__plugin_cryptoagent_cryptosim__start_dashboard, mcp__plugin_cryptoagent_cryptosim__stop_mission, mcp__plugin_cryptoagent_cryptosim__status_report, mcp__plugin_cryptoagent_cryptosim__wallet_status, mcp__plugin_cryptoagent_cryptosim__start_wallet
+allowed-tools: Agent, mcp__plugin_dementeking_cryptosim__mission_status, mcp__plugin_dementeking_cryptosim__create_mission, mcp__plugin_dementeking_cryptosim__start_dashboard, mcp__plugin_dementeking_cryptosim__stop_mission, mcp__plugin_dementeking_cryptosim__status_report, mcp__plugin_dementeking_cryptosim__wallet_status, mcp__plugin_dementeking_cryptosim__start_wallet
 ---
 
-Vas a preparar y lanzar una misión del agente `cryptoagent:trader`, con su revisor `cryptoagent:reviewer` (analiza lo que hace el trader y escribe su memoria). Habla con el usuario en español. Sigue estos pasos en orden.
+Vas a preparar y lanzar una misión del agente `dementeking:trader`, con su revisor `dementeking:reviewer` (analiza lo que hace el trader y escribe su memoria). Habla con el usuario en español. Sigue estos pasos en orden.
 
 ## 1. Comprobar el simulador
 
-Las herramientas del servidor MCP `cryptosim` (`mission_status`, `create_mission`, `start_dashboard`) pueden estar diferidas: si no las tienes cargadas, cárgalas con ToolSearch (`+cryptosim`). Si no aparecen, díselo al usuario según el caso y para aquí:
-- Si no tienes la herramienta Agent, estás en el chat normal de Claude, no en Claude Code. Explica que este plugin solo funciona en **Claude Code** (la pestaña **Code** de la app de escritorio, la terminal o las extensiones de VS Code y JetBrains), porque el simulador se ejecuta en su ordenador y el agente trabaja en segundo plano; el chat normal no puede arrancarlos. Dile que abra una sesión en la pestaña Code (sirve cualquier carpeta) y escriba `/cryptoagent:trading`.
-- Si sí la tienes, estás en Claude Code pero el plugin no está cargado: que compruebe en el gestor de plugins que `cryptoagent` está instalado y activado, y que abra una sesión nueva.
+Las herramientas del servidor MCP `cryptosim` (`mission_status`, `create_mission`, `start_dashboard`) pueden estar diferidas: si no las tienes cargadas, cárgalas con ToolSearch (`+dementeking`). Si no aparecen, díselo al usuario según el caso y para aquí:
+- Si no tienes la herramienta Agent, estás en el chat normal de Claude, no en Claude Code. Explica que este plugin solo funciona en **Claude Code** (la pestaña **Code** de la app de escritorio, la terminal o las extensiones de VS Code y JetBrains), porque el simulador se ejecuta en su ordenador y el agente trabaja en segundo plano; el chat normal no puede arrancarlos. Dile que abra una sesión en la pestaña Code (sirve cualquier carpeta) y escriba `/dementeking:trading`.
+- Si sí la tienes, estás en Claude Code pero el plugin no está cargado: que compruebe en el gestor de plugins que `dementeking` está instalado y activado, y que abra una sesión nueva.
 
 Llama a `mission_status`.
 
@@ -84,15 +84,15 @@ Si falla, díselo al usuario con el motivo y sigue: el agente puede trabajar sin
 
 Con la herramienta Agent, en este orden:
 
-1. **Preparación** (en primer plano, espera a que termine): `subagent_type` `cryptoagent:reviewer`, `description` `Preparar la misión`, `prompt` exactamente `Prepara la misión.` El revisor repasa las misiones anteriores y escribe un briefing para esta. Si falla, díselo al usuario en una línea y sigue: el trader puede trabajar sin briefing.
-2. **Trader** (en segundo plano): `subagent_type` `cryptoagent:trader`, `description` `Misión de trading`, `run_in_background` `true`, `prompt` exactamente `Trabaja en tu misión.`
-3. **Revisor durante la misión** (en segundo plano): `subagent_type` `cryptoagent:reviewer`, `description` `Revisor de la misión`, `run_in_background` `true`, `prompt` exactamente `Vigila la misión.`
+1. **Preparación** (en primer plano, espera a que termine): `subagent_type` `dementeking:reviewer`, `description` `Preparar la misión`, `prompt` exactamente `Prepara la misión.` El revisor repasa las misiones anteriores y escribe un briefing para esta. Si falla, díselo al usuario en una línea y sigue: el trader puede trabajar sin briefing.
+2. **Trader** (en segundo plano): `subagent_type` `dementeking:trader`, `description` `Misión de trading`, `run_in_background` `true`, `prompt` exactamente `Trabaja en tu misión.`
+3. **Revisor durante la misión** (en segundo plano): `subagent_type` `dementeking:reviewer`, `description` `Revisor de la misión`, `run_in_background` `true`, `prompt` exactamente `Vigila la misión.`
 
 No añadas nada más a los prompts: ni ideas, ni estrategias, ni contexto de esta conversación. Todo lo que necesitan está en su propia configuración y en el simulador.
 
 ## 6. Avisar al usuario
 
-Resume en pocas líneas: si es una misión REAL (y su aprobación y límites), capital, objetivo y plazo (fecha y hora de fin), el reparto, las instrucciones si las hay, dónde está el panel si se abrió, y que el agente ya trabaja en segundo plano con un revisor que analiza lo que hace y le prepara lo aprendido. La misión termina sola al alcanzar el objetivo o al acabarse el tiempo. Añade que puede escribir `/cryptoagent:estado` en cualquier momento para ver cómo va, también desde el móvil con Remote Control.
+Resume en pocas líneas: si es una misión REAL (y su aprobación y límites), capital, objetivo y plazo (fecha y hora de fin), el reparto, las instrucciones si las hay, dónde está el panel si se abrió, y que el agente ya trabaja en segundo plano con un revisor que analiza lo que hace y le prepara lo aprendido. La misión termina sola al alcanzar el objetivo o al acabarse el tiempo. Añade que puede escribir `/dementeking:estado` en cualquier momento para ver cómo va, también desde el móvil con Remote Control.
 
 ## 7. Mientras dura la misión
 

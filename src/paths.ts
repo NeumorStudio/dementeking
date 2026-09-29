@@ -22,10 +22,10 @@ export function asset(fileName: string, devPath: string): string {
 const usable = (dir: string | undefined) => (dir && !dir.includes("${") ? path.resolve(dir) : undefined);
 
 /**
- * Dónde se guarda la base de datos. En el plugin, siempre ~/.cryptoagent: fuera de la carpeta
+ * Dónde se guarda la base de datos. En el plugin, siempre ~/.dementeking: fuera de la carpeta
  * del plugin (sobrevive a las actualizaciones) y la misma se instale desde la app o desde la CLI,
  * para que la memoria del agente no quede repartida. DATA_DIR la sustituye (p. ej. en pruebas).
  */
 export function resolveDataDir(): string {
-  return usable(process.env.DATA_DIR) ?? (BUNDLED ? path.join(os.homedir(), ".cryptoagent") : path.join(projectRoot, "data"));
+  return usable(process.env.DATA_DIR) ?? (BUNDLED ? path.join(os.homedir(), ".dementeking") : path.join(projectRoot, "data"));
 }

@@ -1,5 +1,5 @@
 // Prueba las migraciones sobre una copia de una base de datos real, sin tocar el original.
-//   npx tsx scripts/migrate-dry.ts [--db ~/.cryptoagent/sim.db]
+//   npx tsx scripts/migrate-dry.ts [--db ~/.dementeking/sim.db]
 // Muestra la versión del esquema y el número de filas de cada tabla antes y después.
 import { existsSync, mkdtempSync } from "node:fs";
 import os from "node:os";
@@ -7,10 +7,10 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 const arg = process.argv.indexOf("--db");
-const source = path.resolve(arg >= 0 ? process.argv[arg + 1]! : path.join(os.homedir(), ".cryptoagent", "sim.db"));
+const source = path.resolve(arg >= 0 ? process.argv[arg + 1]! : path.join(os.homedir(), ".dementeking", "sim.db"));
 if (!existsSync(source)) throw new Error(`No existe ${source}`);
 
-const dir = mkdtempSync(path.join(os.tmpdir(), "cryptoagent-dry-"));
+const dir = mkdtempSync(path.join(os.tmpdir(), "dementeking-dry-"));
 const copy = path.join(dir, "sim.db");
 new DatabaseSync(source, { readOnly: true }).exec(`VACUUM INTO '${copy.replace(/'/g, "''")}'`);
 

@@ -1,5 +1,5 @@
 {
-  "name": "cryptoagent",
+  "name": "dementeking",
   "version": "0.36.2",
   "description": "Agente autónomo de trading cripto en simulación: dinero ficticio, precios, liquidez y comisiones reales en Solana (Jupiter, pump.fun), Base y BNB Chain (monedero tipo MetaMask) y Binance, con transferencias y puentes. Un agente revisor escribe su memoria entre misiones. Panel en directo.",
   "author": {
@@ -17,6 +17,6 @@
     "bnb-chain",
     "evm"
   ],
-  "homepage": "https://github.com/NeumorStudio/cryptoagent",
-  "repository": "https://github.com/NeumorStudio/cryptoagent"
+  "homepage": "https://github.com/NeumorStudio/dementeking",
+  "repository": "https://github.com/NeumorStudio/dementeking"
 }

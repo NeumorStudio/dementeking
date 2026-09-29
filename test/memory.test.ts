@@ -37,7 +37,7 @@ test("tipo de error: sin direcciones ni cifras", () => {
 });
 
 test("migración: las lecciones pasan a creencias con el mismo id y las tesis las citan", () => {
-  const dir = mkdtempSync(path.join(os.tmpdir(), "cryptoagent-mem-"));
+  const dir = mkdtempSync(path.join(os.tmpdir(), "dementeking-mem-"));
   const legacy = new DatabaseSync(path.join(dir, "sim.db"));
   legacy.exec(`
     CREATE TABLE missions (id INTEGER PRIMARY KEY, status TEXT, reviewed_at TEXT);

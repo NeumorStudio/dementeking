@@ -226,7 +226,7 @@ export function supersededBy(): string | null {
   const stored = getMeta("code_version");
   if (!stored || !newer(stored, CODE_VERSION)) return null;
   return (
-    `Esta sesión usa cryptoagent ${CODE_VERSION}, pero ya hay en marcha la versión ${stored}. ` +
+    `Esta sesión usa dementeking ${CODE_VERSION}, pero ya hay en marcha la versión ${stored}. ` +
     "Para no estropear los datos, esta versión ya no hace nada: abre una sesión nueva de Claude Code."
   );
 }

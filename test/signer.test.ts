@@ -5,7 +5,7 @@ import path from "node:path";
 import { after, test } from "node:test";
 import { createSignerServer } from "../src/live/signer/server.js";
 
-const dir = mkdtempSync(path.join(os.tmpdir(), "cryptoagent-signer-"));
+const dir = mkdtempSync(path.join(os.tmpdir(), "dementeking-signer-"));
 const token = "a".repeat(64);
 const signer = createSignerServer({ dir, token });
 const port = await signer.listen();

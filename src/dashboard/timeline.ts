@@ -42,10 +42,10 @@ export interface TimelineEvent {
 }
 
 const projectsDir = path.join(os.homedir(), ".claude", "projects");
-// El agente se llama `trader` en el proyecto y `cryptoagent:trader` dentro del plugin.
-const TRADER_AGENT = /(^|:)trader$/;
-// Las herramientas se llaman mcp__cryptosim__* en el proyecto y mcp__plugin_cryptoagent_cryptosim__* en el plugin.
-const normalizeTool = (name: string) => name.replace(/^mcp__plugin_.*?_cryptosim__/, "mcp__cryptosim__");
+// El agente se llama `trader` en el proyecto y `dementeking:trader` dentro del plugin.
+const TRADER_AGENT = /^(dementeking:)?trader$/;
+// Las herramientas se llaman mcp__cryptosim__* en el proyecto y mcp__plugin_dementeking_cryptosim__* en el plugin.
+const normalizeTool = (name: string) => name.replace(/^mcp__plugin_dementeking_cryptosim__/, "mcp__cryptosim__");
 
 // Herramientas del simulador cuyo efecto ya aparece en el diario o en la bitácora (se evitan duplicados).
 const COVERED_BY_DB = new Set(SIM_TOOLS.filter((t) => t.journaled).map((t) => `mcp__cryptosim__${t.name}`));

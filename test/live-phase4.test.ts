@@ -26,7 +26,7 @@ const mission = (usdc = 100) =>
   });
 
 test("el firmante frena un bucle: como mucho N operaciones por minuto", async () => {
-  const dir = mkdtempSync(path.join(os.tmpdir(), "cryptoagent-rate-"));
+  const dir = mkdtempSync(path.join(os.tmpdir(), "dementeking-rate-"));
   const token = "d".repeat(64);
   const signer = createSignerServer({ dir, token, deps: { walletValueUsd: async () => 100 } });
   const port = await signer.listen();

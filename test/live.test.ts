@@ -141,7 +141,7 @@ function liveMission(approval: "manual" | "auto"): Mission {
   });
 }
 
-const dir = mkdtempSync(path.join(os.tmpdir(), "cryptoagent-live-"));
+const dir = mkdtempSync(path.join(os.tmpdir(), "dementeking-live-"));
 const token = "c".repeat(64);
 let walletValue = 100;
 const sent: string[] = [];

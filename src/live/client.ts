@@ -47,7 +47,7 @@ export async function signerStatus(): Promise<{ info: SignerInfo; status: Signer
 
 async function runningSigner() {
   const s = await signerStatus();
-  if (!s) throw new Error("El firmante de la cartera no está en marcha: pide al usuario que la abra y desbloquee con /cryptoagent:cartera");
+  if (!s) throw new Error("El firmante de la cartera no está en marcha: pide al usuario que la abra y desbloquee con /dementeking:cartera");
   return s.info;
 }
 

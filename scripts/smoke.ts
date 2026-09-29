@@ -6,7 +6,7 @@ import { mkdtempSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-process.env.DATA_DIR = mkdtempSync(path.join(os.tmpdir(), "cryptoagent-smoke-"));
+process.env.DATA_DIR = mkdtempSync(path.join(os.tmpdir(), "dementeking-smoke-"));
 
 const { createMission } = await import("../src/sim/mission.js");
 const sim = await import("../src/sim/portfolio.js");

@@ -17,7 +17,7 @@ function timeLeft(deadline: string) {
 
 export async function statusReport(missionId?: number): Promise<string> {
   const m = missionId !== undefined ? getMission(missionId) : (getActiveMission() ?? getLastMission());
-  if (!m) return "No hay ninguna misión. Crea una con /cryptoagent:trading.";
+  if (!m) return "No hay ninguna misión. Crea una con /dementeking:trading.";
 
   const v = await valuation(m.id);
   const current = m.status === "active" ? v.totalUsd : (m.final_usd ?? v.totalUsd);
@@ -93,7 +93,7 @@ export async function statusReport(missionId?: number): Promise<string> {
   // Capacidades que el agente ha pedido y el usuario aún no ha contestado.
   const requests = listCapabilityRequests("open");
   if (requests.length) {
-    lines.push("", `El agente pide (${requests.length}, revísalas con /cryptoagent:peticiones):`);
+    lines.push("", `El agente pide (${requests.length}, revísalas con /dementeking:peticiones):`);
     for (const r of requests.slice(0, 3)) lines.push(`- ${r.capability}${r.times_requested > 1 ? ` (${r.times_requested} veces)` : ""}`);
   }
   return lines.join("\n");

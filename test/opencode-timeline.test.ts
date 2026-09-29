@@ -7,7 +7,7 @@ import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 
 // Una base de datos con la forma de la de OpenCode 2: una sesión del trader y otra de otro agente.
-const file = path.join(mkdtempSync(path.join(os.tmpdir(), "cryptoagent-oc-")), "opencode.db");
+const file = path.join(mkdtempSync(path.join(os.tmpdir(), "dementeking-oc-")), "opencode.db");
 const oc = new DatabaseSync(file);
 oc.exec(`
   CREATE TABLE session_v2 (id TEXT PRIMARY KEY, agent TEXT);

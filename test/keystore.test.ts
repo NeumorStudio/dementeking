@@ -15,7 +15,7 @@ test("deriva las mismas direcciones que MetaMask y Phantom", () => {
 });
 
 test("crear, descifrar, contraseña errónea y no sobrescribir", () => {
-  const dir = mkdtempSync(path.join(os.tmpdir(), "cryptoagent-wallet-"));
+  const dir = mkdtempSync(path.join(os.tmpdir(), "dementeking-wallet-"));
   assert.throws(() => createWallet(dir, "corta"), /al menos/);
   const { mnemonic, pub } = createWallet(dir, "una contraseña larga");
   assert.equal(mnemonic.split(" ").length, 12);

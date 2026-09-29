@@ -135,7 +135,7 @@ export function createSignerServer(opts: { dir: string; token: string; deps?: Pa
 
   const ready = () => {
     if (state.stopped) throw new HttpError(423, "La cartera está parada: el usuario debe desbloquearla de nuevo en su página");
-    if (!state.accounts) throw new HttpError(423, "La cartera está bloqueada: el usuario debe desbloquearla en su página (/cryptoagent:cartera)");
+    if (!state.accounts) throw new HttpError(423, "La cartera está bloqueada: el usuario debe desbloquearla en su página (/dementeking:cartera)");
     return state.accounts;
   };
 
@@ -363,5 +363,5 @@ export async function runSigner() {
   };
   process.on("SIGINT", cleanup);
   process.on("SIGTERM", cleanup);
-  console.error(`Firmante de cryptoagent en http://127.0.0.1:${port}/wallet`);
+  console.error(`Firmante de dementeking en http://127.0.0.1:${port}/wallet`);
 }
