@@ -74,6 +74,60 @@ test("fase: esperando plan si la clase no tiene ninguno o si el cerebro está es
   assert.equal(writing.classPlanId, 1);
 });
 
+test("fase: el cerebro escribiendo el plan de una misión recién creada es «plan», aunque haya plan vigente y lleve minutos callado", () => {
+  // Misión #27: pedida hace 1 min con el plan #1 vigente (su bloque ya jugado); el cerebro, lanzado a los 7 s, trabaja.
+  const m27 = mission({ plan_id: 1, requested_at: at(1), created_at: at(1) });
+  const p = derivePhase(input({ mission: m27, sessions: [session("planner", 0.9, 0.05)] }));
+  assert.equal(p.id, "esperando-plan");
+  assert.equal(p.planStep, "escribiendo");
+  assert.equal(p.agent?.name, "planner", "el panel dice «trabaja el cerebro»");
+  assert.equal(p.since, at(0.9), "el cronómetro cuenta desde que empezó el cerebro");
+  assert.equal(p.planId, null, "no es el plan #1 el que se está esperando");
+  assert.equal(p.classPlanId, 1);
+
+  // Una vuelta en esfuerzo máximo pasa minutos sin escribir: más de los 8 min de una sesión normal, sigue siendo el cerebro.
+  const quiet = derivePhase(input({ mission: mission({ plan_id: 1, requested_at: at(15) }), sessions: [session("planner", 14.8, 12)] }));
+  assert.equal(quiet.id, "esperando-plan");
+  assert.equal(quiet.agent?.name, "planner");
+  assert.equal(runningAgent([session("planner", 14.8, 12)], NOW), null, "para runningAgent ya estaría callado");
+
+  // Con el revisor de la misión anterior todavía escribiendo (más reciente), el que prepara esta es el cerebro.
+  const both = derivePhase(input({ mission: m27, sessions: [session("reviewer", 3, 0.01), session("planner", 0.9, 0.3)] }));
+  assert.equal(both.id, "esperando-plan");
+  assert.equal(both.agent?.name, "planner");
+
+  // En cuanto el ejecutor empieza con esta misión, la fase vuelve a ser la de siempre: esperando la señal.
+  const exec = derivePhase(input({ mission: mission({ plan_id: 2, requested_at: at(15) }), sessions: [session("executor", 2, 0.2), session("planner", 14.8, 12)] }));
+  assert.equal(exec.id, "esperando-senal");
+  assert.equal(exec.agent?.name, "executor");
+
+  // Un cerebro terminado (cost-state) o callado más de 20 min no cuenta como trabajando.
+  assert.equal(derivePhase(input({ mission: mission({ plan_id: 2, requested_at: at(15) }), sessions: [session("planner", 14.8, 13, true)] })).id, "esperando-senal");
+  assert.equal(derivePhase(input({ mission: mission({ plan_id: 1, requested_at: at(40) }), sessions: [session("planner", 39, 25)] })).id, "esperando-senal");
+});
+
+test("fase: recién creada y sin ningún agente todavía, se prepara (no se espera aún la señal); a los 2 min sin nadie, la de siempre", () => {
+  // Los segundos entre crear la misión y que escriba el primer agente (get_plan, arrancar claude).
+  const fresh = mission({ plan_id: 1, requested_at: at(0.15), created_at: at(0.15) });
+  const p = derivePhase(input({ mission: fresh }));
+  assert.equal(p.id, "esperando-plan");
+  assert.equal(p.planStep, "arrancando");
+  assert.equal(p.label, "Preparando la misión");
+  assert.equal(p.since, at(0.15));
+  assert.equal(p.agent, null);
+  assert.equal(p.planId, null);
+  assert.equal(p.classPlanId, 1);
+
+  // El ejecutor de la misión anterior (empezó antes de pedir esta) no cuenta como el de esta.
+  assert.equal(derivePhase(input({ mission: fresh, sessions: [session("executor", 20, 0.1, true)] })).planStep, "arrancando");
+  // El cerebro ya terminó y el ejecutor aún no ha escrito: el plan está hecho, se espera la señal.
+  assert.equal(derivePhase(input({ mission: fresh, sessions: [session("planner", 0.14, 0.02, true)] })).id, "esperando-senal");
+  // Pasados 2 min sin ningún agente: esperando señal, sin agente (como antes).
+  const stale = derivePhase(input({ mission: mission({ plan_id: 1, requested_at: at(3) }) }));
+  assert.equal(stale.id, "esperando-senal");
+  assert.equal(stale.agent, null);
+});
+
 test("fase: esperando señal, con la última vuelta del diario, el candidato y el plazo de 60 min", () => {
   const p = derivePhase(
     input({

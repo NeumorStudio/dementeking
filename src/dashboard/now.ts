@@ -1,6 +1,9 @@
 // «Ahora mismo»: en qué punto de la tanda está el equipo, sacado de la base de datos (misión, plan, diario) y de qué
 // agente tiene una sesión abierta. Las fases de una misión rápida, en orden:
-//   esperando plan   el cerebro (planner) escribe el plan, o la misión se ha creado sin plan para su clase
+//   esperando plan   el cerebro (planner) escribe el plan, o la misión se ha creado sin plan para su clase. Mientras el
+//                    ejecutor no haya empezado con ella, la misión sigue preparándose: un cerebro sin terminar cuenta como
+//                    trabajando aunque lleve minutos sin escribir (una vuelta en esfuerzo máximo no escribe nada hasta
+//                    acabar), y recién creada, antes de que arranque ningún agente, tampoco se espera aún la señal
 //   esperando señal  misión activa sin reloj: el ejecutor espera con wait_for_signal a un token que pase los filtros
 //   reloj            enter_with_exits compró y puso la toma de beneficio: el reloj de la misión corre
 //   revisando        la misión ha terminado y el revisor aún no la ha dado por revisada (solo las que tiene que revisar:
@@ -111,6 +114,11 @@ export interface Phase {
   skipped?: PhaseId[];
   /** El plan vigente de su clase (esperando plan: el que va a sustituir, si hay). */
   classPlanId?: number | null;
+  /**
+   * Esperando plan: por qué. escribiendo = el cerebro trabaja en él; sin-plan = la clase no tiene ninguno y aún no ha
+   * empezado; arrancando = misión recién creada y todavía sin ningún agente (el cerebro si toca plan nuevo, si no el ejecutor).
+   */
+  planStep?: "escribiendo" | "sin-plan" | "arrancando";
 }
 
 const LABEL: Record<PhaseId, string> = {
@@ -131,6 +139,20 @@ export function runningAgent(sessions: AgentSession[], nowMs: number): AgentSess
   return sessions.find((s) => !s.ended && nowMs - Date.parse(s.lastAt) < (s.main ? MAIN_IDLE_MS : SUB_IDLE_MS)) ?? null;
 }
 
+// Antes de que empiece el ejecutor, el cerebro sin terminar cuenta como trabajando hasta este tiempo sin escribir: piensa
+// en esfuerzo máximo (15-30 min por plan) y una vuelta larga no deja nada en su transcripción hasta que acaba.
+const PLANNER_IDLE_MS = 20 * 60_000;
+// Recién creada la misión, lo que tarda en arrancar el primer agente (get_plan y lanzar claude son unos segundos): hasta
+// entonces no se espera aún la señal. Pasado este tiempo sin nadie, la fase es la de siempre (esperando señal, sin agente).
+const STARTING_MS = 2 * 60_000;
+
+/** El cerebro con un plan a medias: la sesión de planner más reciente sin terminar y con algo escrito hace poco. */
+export function workingPlanner(sessions: AgentSession[], nowMs: number): AgentSession | null {
+  return sessions.find((s) => s.agent === "planner" && !s.ended && nowMs - Date.parse(s.lastAt) < PLANNER_IDLE_MS) ?? null;
+}
+
+const isExecutor = (s: AgentSession) => s.agent === "executor" || s.agent === "trader";
+
 const ACTIVE = new Set(["active", "closing"]);
 /** Jugadas hasta el final: siempre tienen retrospectiva. Una cancelada, solo si llegó a operar (pendingReviews). */
 const PLAYED = new Set(["succeeded", "expired", "bust"]);
@@ -142,7 +164,8 @@ export function derivePhase(i: PhaseInput): Phase {
   const agent = running ? { name: running.agent, since: running.startedAt, lastAt: running.lastAt } : null;
   if (!m) {
     const id: PhaseId = running?.agent === "planner" ? "esperando-plan" : "sin-mision";
-    return { id, label: LABEL[id], since: running?.startedAt ?? null, missionId: null, missionStatus: null, fast: false, costMode: null, planId: null, agent };
+    const planStep = id === "esperando-plan" ? { planStep: "escribiendo" as const } : {};
+    return { id, label: LABEL[id], since: running?.startedAt ?? null, missionId: null, missionStatus: null, fast: false, costMode: null, planId: null, agent, ...planStep };
   }
   const base = { missionId: m.id, missionStatus: m.status, fast: isFastMission(m), costMode: m.cost_mode ?? "sim", agent };
   const requested = m.requested_at ?? m.created_at;
@@ -164,10 +187,25 @@ export function derivePhase(i: PhaseInput): Phase {
       });
     }
     // Sin reloj: o falta el plan (el cerebro lo está escribiendo, o la clase no tiene ninguno), o se espera la señal.
-    if (running?.agent === "planner" || (m.plan_id === null && !i.classPlan)) {
-      return phase("esperando-plan", running?.agent === "planner" ? running.startedAt : requested, { planId: null, classPlanId: i.classPlan?.id ?? null });
+    // La señal la espera el ejecutor: mientras no haya empezado con esta misión, sigue preparándose.
+    const executorStarted = i.sessions.some((s) => isExecutor(s) && s.startedAt >= requested);
+    const planner = running?.agent === "planner" ? running : executorStarted ? null : workingPlanner(i.sessions, i.nowMs);
+    const classPlanId = i.classPlan?.id ?? null;
+    if (planner) {
+      return phase("esperando-plan", planner.startedAt, {
+        planId: null,
+        classPlanId,
+        planStep: "escribiendo",
+        agent: { name: "planner", since: planner.startedAt, lastAt: planner.lastAt },
+      });
     }
-    const executor = running && (running.agent === "executor" || running.agent === "trader") ? running : null;
+    if (m.plan_id === null && !i.classPlan) return phase("esperando-plan", requested, { planId: null, classPlanId, planStep: "sin-plan" });
+    // Recién creada y sin que haya trabajado aún ningún agente para ella (ni el cerebro ya terminado): arrancando.
+    const plannerDone = i.sessions.some((s) => s.agent === "planner" && s.ended && s.lastAt >= requested);
+    if (!executorStarted && !plannerDone && i.nowMs - Date.parse(requested) < STARTING_MS) {
+      return phase("esperando-plan", requested, { label: "Preparando la misión", planId: null, classPlanId, planStep: "arrancando" });
+    }
+    const executor = running && isExecutor(running) ? running : null;
     const waitedS = i.lastSignal?.summary.match(/Sin señal en (\d+) s/)?.[1];
     const seen = i.lastSignal?.summary.match(/Tokens frescos vistos: (\d+)/)?.[1];
     const inMission = (ts: string | null | undefined) => !!ts && ts >= requested;
@@ -197,7 +235,7 @@ export function derivePhase(i: PhaseInput): Phase {
   };
   const skipped: PhaseId[] = [...(m.started_at ? [] : (["reloj"] as const)), ...(reviewable || m.reviewed_at ? [] : (["revisando"] as const))];
   // Terminada: el cerebro trabajando es el plan de la siguiente (se escribe antes de crearla en algunos flujos).
-  if (running?.agent === "planner") return phase("esperando-plan", running.startedAt, { planId: null, classPlanId: i.classPlan?.id ?? null, result });
+  if (running?.agent === "planner") return phase("esperando-plan", running.startedAt, { planId: null, classPlanId: i.classPlan?.id ?? null, planStep: "escribiendo", result });
   if (reviewable && !m.reviewed_at) return phase("revisando", m.ended_at, { result, skipped });
   const since = [m.ended_at, m.reviewed_at].filter((x): x is string => !!x).sort().at(-1) ?? null;
   return phase("pausa", since, { result, skipped });

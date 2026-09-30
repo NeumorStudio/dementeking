@@ -78,6 +78,7 @@
   .value .cur { font-size: .45em; font-stretch: 120%; color: var(--muted); }
   .delta { font-size: clamp(22px, 2.6vw, 32px); font-weight: 700; font-stretch: 120%; }
   .delta.up { color: var(--up); } .delta.down { color: var(--down); }
+  .delta.idle { color: var(--muted); font-weight: 600; }
   .gap { color: var(--muted); font-size: 17px; flex-basis: 100%; }
 
   .track { position: relative; height: 96px; margin-top: 26px; overflow: clip; overflow-clip-margin: 14px; }
@@ -98,6 +99,9 @@
     background: var(--accent); box-shadow: 0 0 0 4px var(--bg); }
   .runner-tag { position: absolute; left: 0; top: 4px; transform: translateX(-50%); font-size: 12px; font-weight: 700; font-stretch: 125%;
     background: var(--accent); color: var(--accent-ink); padding: 1px 8px; border-radius: 4px; white-space: nowrap; }
+  /* Sin reloj: la pista vacía, con el corredor esperando en la salida, apagado. */
+  .track.idle .runner { background: var(--surface-2); box-shadow: 0 0 0 4px var(--bg), inset 0 0 0 2px var(--muted); }
+  .track.idle .runner-tag { background: var(--surface-2); color: var(--muted); }
   .ghost { position: absolute; left: 0; top: 41px; width: 18px; height: 18px; margin-left: -9px; border-radius: 50%;
     border: 2px dashed var(--muted); background: var(--bg); }
 
@@ -602,6 +606,8 @@ function render() {
     $("missionName").textContent = "No hay ninguna misión";
     $("missionSub").textContent = "Empieza una con /dementeking:trading en Claude Code.";
     $("valueNum").textContent = "";
+    $("delta").textContent = "";
+    $("gap").textContent = "";
     return;
   }
   const minutes = Math.round((new Date(m.deadline) - new Date(m.created_at)) / 60000);
@@ -615,27 +621,40 @@ function render() {
   $("missionSub").textContent = `De ${usd(m.initial_usd)} a ${usd(m.target_usd)} en ${span} · ${m.instructions ? `instrucciones: ${m.instructions}` : "modo libre"}`;
   renderClock();
 
-  const current = m.status === "active" ? v?.totalUsd : (m.final_usd ?? v?.totalUsd);
-  if (current != null) {
-    countTo(current);
-    const diff = current - m.initial_usd;
-    $("delta").textContent = `${signed((diff / m.initial_usd) * 100, " %")}`;
-    $("delta").className = "delta " + (diff >= 0 ? "up" : "down");
-    const toGo = m.target_usd - current;
-    document.body.classList.toggle("is-bust", m.status === "bust");
-    $("gap").textContent =
-      m.status === "succeeded" ? `Meta alcanzada: terminó con ${usd(m.final_usd ?? current)}.`
+  // La carrera sale del servidor (hero), siempre de esta misión: todo se reescribe en cada vuelta, para que no quede nada
+  // de la anterior. Sin reloj todavía, su punto de partida: capital inicial, meta, «sin arrancar» y la pista vacía.
+  const h = state.hero?.missionId === m.id ? state.hero
+    : { mode: "valuing", valueUsd: null, deltaPct: null, toGoUsd: null, runnerUsd: m.initial_usd, benchmarkUsd: null };
+  document.body.classList.toggle("is-bust", m.status === "bust");
+  const delta = $("delta"), gap = $("gap");
+  if (h.valueUsd != null) countTo(h.valueUsd);
+  else { shown = null; $("valueNum").textContent = "…"; }
+  if (h.mode === "prep") {
+    delta.textContent = "sin arrancar";
+    delta.className = "delta idle";
+    gap.textContent = `Sale con ${usd(m.initial_usd)} y la meta es ${usd(m.target_usd)} (${signed(((m.target_usd - m.initial_usd) / m.initial_usd) * 100, " %")}). ` +
+      `El reloj de ${span} arranca con la primera compra.`;
+  } else if (h.mode === "valuing") {
+    delta.textContent = "";
+    delta.className = "delta";
+    gap.textContent = "Valorando la cartera…";
+  } else {
+    const current = h.valueUsd, toGo = h.toGoUsd;
+    delta.textContent = signed(h.deltaPct, " %");
+    delta.className = "delta " + (h.deltaPct >= 0 ? "up" : "down");
+    gap.textContent =
+      m.status === "succeeded" ? `Meta alcanzada: terminó con ${usd(current)}.`
       : m.status === "bust" ? `☠ Sin fondos: se quedó con ${usd(current)} y ya no podía operar. Misión muerta.`
-      : m.status !== "active" ? `Terminó con ${usd(current)}, a ${usd(Math.max(0, toGo))} de la meta.`
+      : h.mode === "ended" ? `Terminó con ${usd(current)}, a ${usd(toGo)} de la meta.`
       : toGo <= 0 ? "En la meta: cerrando posiciones."
       : `Le faltan ${usd(toGo)} para la meta.`;
-    const bench = v?.benchmarkUsd;
-    if (bench != null && m.status === "active") {
+    const bench = h.benchmarkUsd;
+    if (bench != null) {
       const vs = current - bench;
-      $("gap").textContent += Math.abs(vs) < 0.005 ? " Va igual que si no hubiera operado." : ` Va ${usd(Math.abs(vs))} por ${vs > 0 ? "delante" : "detrás"} de no operar (el círculo discontinuo de la pista).`;
+      gap.textContent += Math.abs(vs) < 0.005 ? " Va igual que si no hubiera operado." : ` Va ${usd(Math.abs(vs))} por ${vs > 0 ? "delante" : "detrás"} de no operar (el círculo discontinuo de la pista).`;
     }
-    renderTrack(m, current, v);
   }
+  renderTrack(m, h.runnerUsd, h.benchmarkUsd, h.mode === "prep");
   renderChart();
   renderMoney(v);
   renderRealWallet();
@@ -643,8 +662,9 @@ function render() {
 }
 
 // ── Pista ────────────────────────────────────────────────────
-function renderTrack(m, value, v) {
-  const bench = v?.benchmarkUsd;
+function renderTrack(m, value, bench, idle = false) {
+  // Sin reloj, la pista vacía: el corredor espera en la salida, apagado.
+  $("track").classList.toggle("idle", idle);
   const stretch = m.target_usd - m.initial_usd;
   const lo = Math.min(m.initial_usd - stretch * 0.4, value, bench ?? Infinity);
   const hi = Math.max(m.target_usd, value) + stretch * 0.04;
@@ -674,6 +694,7 @@ function renderTrack(m, value, v) {
   $("runnerRail").style.transform = `translateX(${runner}%)`;
   // La etiqueta se centra sobre el corredor, salvo en los bordes de la pista, donde se recortaría.
   const tag = $("runnerRail").querySelector(".runner-tag");
+  tag.textContent = idle ? "en la salida" : "agente";
   tag.style.transform = runner < 6 ? "translateX(-14px)" : runner > 94 ? "translateX(calc(-100% + 14px))" : "translateX(-50%)";
 
   // El fantasma: lo que valdría la cartera si el agente no hubiera hecho nada.
@@ -704,7 +725,16 @@ function renderChart() {
   const m = state.mission, v = state.valuation;
   const svg = $("chart"), wrap = $("chartWrap");
   svg.replaceChildren();
+  svg.style.display = "";
   wrap.querySelector(".chart-empty")?.remove();
+  // Sin curva, solo el aviso (sin el hueco de un gráfico vacío encima).
+  const empty = (text) => { svg.style.display = "none"; wrap.append(el("p", { class: "chart-empty" }, text)); };
+  // Sin reloj todavía no hay carrera: lo que se mida antes de la salida no es de ella.
+  if (m.status === "active" && !m.started_at) {
+    $("chartTable").replaceChildren();
+    empty("La carrera todavía no ha empezado: la curva arranca con el reloj, en la primera compra.");
+    return;
+  }
   const t0 = new Date(m.created_at).getTime();
   // El reloj arranca cuando el agente empieza a trabajar: lo medido antes (mientras el revisor
   // preparaba la misión) queda fuera de la carrera, y la curva empieza en la salida.
@@ -714,7 +744,7 @@ function renderChart() {
   if (m.status === "active" && v?.totalUsd != null) points.push({ t: Date.now(), y: v.totalUsd });
   $("chartTable").replaceChildren(...points.slice(-60).map((p) => el("tr", {}, el("td", {}, hm(new Date(p.t).toISOString())), el("td", {}, usd(p.y)))));
   if (points.length < 2) {
-    wrap.append(el("p", { class: "chart-empty" }, "La curva aparece con la segunda medición (una por minuto mientras el panel está abierto)."));
+    empty("La curva aparece con la segunda medición (una por minuto mientras el panel está abierto).");
     return;
   }
 
@@ -952,7 +982,13 @@ function renderNow() {
   const li = (...c) => lines.push(el("li", {}, ...c));
   $("tpTrack").hidden = p.id !== "reloj";
   if (p.id === "esperando-plan") {
-    li(p.agent?.name === "planner" ? `El cerebro está escribiendo el plan desde las ${hm(p.agent.since)}.` : "La misión se ha creado sin plan para su clase: lo escribe el cerebro.");
+    if (p.agent?.name === "planner") {
+      // Una vuelta larga en esfuerzo máximo no escribe nada hasta acabar: se dice cuánto lleva callado.
+      const quiet = Date.now() - new Date(p.agent.lastAt);
+      li(`El cerebro está escribiendo el plan desde las ${hm(p.agent.since)}`, quiet > 90_000 ? ` (pensando: lo último que escribió fue ${agoS(p.agent.lastAt)})` : "", ".");
+    } else if (p.planStep === "arrancando") {
+      li(`Misión #${p.missionId} recién creada a las ${hm(p.since)}: arranca el equipo (el cerebro, si toca plan nuevo; si no, el ejecutor con el plan vigente).`);
+    } else li("La misión se ha creado sin plan para su clase: lo escribe el cerebro.");
     if (p.classPlanId != null) li(`El plan vigente de la clase es el #${p.classPlanId}.`);
   } else if (p.id === "esperando-senal") {
     const s = p.signal ?? {};
@@ -1044,7 +1080,9 @@ function renderNowTimer() {
     out.classList.toggle("urgent", left < 60_000);
   } else if (p.id === "pausa") out.replaceChildren(since != null ? longDur(since) : "", el("small", {}, "de pausa"));
   else if (since != null) {
-    const extra = p.id === "esperando-senal" && p.signal?.prepEndsAt ? `esperando · se cancela en ${longDur(new Date(p.signal.prepEndsAt) - Date.now())}` : p.id === "revisando" ? "desde que acabó" : "esperando";
+    const extra = p.id === "esperando-senal" && p.signal?.prepEndsAt ? `esperando · se cancela en ${longDur(new Date(p.signal.prepEndsAt) - Date.now())}`
+      : p.id === "esperando-plan" ? (p.agent?.name === "planner" ? "escribiendo el plan" : p.planStep === "arrancando" ? "arrancando" : "esperando")
+      : p.id === "revisando" ? "desde que acabó" : "esperando";
     out.replaceChildren(mmss(since), el("small", {}, extra));
   } else out.replaceChildren();
 }

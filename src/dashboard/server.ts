@@ -11,6 +11,7 @@ import { listOrders } from "../sim/orders.js";
 import { valuation } from "../sim/portfolio.js";
 import { listPositions } from "../sim/positions.js";
 import { loadBatches } from "./batches.js";
+import { heroModel } from "./hero.js";
 import { nowState } from "./now.js";
 import { agentSessions, signalSymbols, timeline } from "./timeline.js";
 import { walletBalances } from "../live/chain.js";
@@ -115,6 +116,8 @@ function state() {
     mission: mission ?? null,
     valuation,
     valuedAt: cached?.at ?? null,
+    // La carrera: la cifra grande y la pista, siempre de esta misión (sin reloj, su punto de partida; nunca la anterior).
+    hero: mission ? safe("la carrera", () => heroModel(mission, valuation)) : null,
     // Ahora mismo: en qué fase de la tanda está el equipo (esperando plan, señal, reloj, revisión o pausa).
     phase: safe("la fase de ahora", () =>
       nowState({ mission: mission ?? null, sessions: agentSessions(since), symbols: signalSymbols(since), valuation, valuedAt: valuation ? (cached?.at ?? null) : null }),

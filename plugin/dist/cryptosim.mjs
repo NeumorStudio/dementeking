@@ -8552,7 +8552,7 @@ var init_db = __esm({
     }
     runMigrations(db, config2.dataDir);
     now = () => (/* @__PURE__ */ new Date()).toISOString();
-    CODE_VERSION = "0.37.2";
+    CODE_VERSION = "0.37.3";
     semver = (v) => v.split(".").map((n3) => Number.parseInt(n3, 10) || 0);
     newer = (a, b) => {
       const [x, y] = [semver(a), semver(b)];
@@ -45524,6 +45524,29 @@ function loadBatches() {
   return value;
 }
 
+// src/dashboard/hero.ts
+function heroModel(m, v) {
+  const val = v && v.missionId === m.id ? v : null;
+  const base2 = { missionId: m.id, initialUsd: m.initial_usd, targetUsd: m.target_usd };
+  if (m.status === "active" && !m.started_at) {
+    return { ...base2, mode: "prep", valueUsd: m.initial_usd, deltaPct: null, toGoUsd: m.target_usd - m.initial_usd, runnerUsd: m.initial_usd, benchmarkUsd: null };
+  }
+  const live = m.status === "active";
+  const value = live ? val?.totalUsd ?? null : m.final_usd ?? val?.totalUsd ?? null;
+  if (value === null) {
+    return { ...base2, mode: "valuing", valueUsd: null, deltaPct: null, toGoUsd: null, runnerUsd: m.initial_usd, benchmarkUsd: null };
+  }
+  return {
+    ...base2,
+    mode: live ? "live" : "ended",
+    valueUsd: value,
+    deltaPct: (value - m.initial_usd) / m.initial_usd * 100,
+    toGoUsd: Math.max(0, m.target_usd - value),
+    runnerUsd: value,
+    benchmarkUsd: live ? val?.benchmarkUsd ?? null : null
+  };
+}
+
 // src/dashboard/now.ts
 init_db();
 init_mission_kind();
@@ -45540,6 +45563,12 @@ var SUB_IDLE_MS = 6 * 6e4;
 function runningAgent(sessions2, nowMs) {
   return sessions2.find((s) => !s.ended && nowMs - Date.parse(s.lastAt) < (s.main ? MAIN_IDLE_MS : SUB_IDLE_MS)) ?? null;
 }
+var PLANNER_IDLE_MS = 20 * 6e4;
+var STARTING_MS = 2 * 6e4;
+function workingPlanner(sessions2, nowMs) {
+  return sessions2.find((s) => s.agent === "planner" && !s.ended && nowMs - Date.parse(s.lastAt) < PLANNER_IDLE_MS) ?? null;
+}
+var isExecutor = (s) => s.agent === "executor" || s.agent === "trader";
 var ACTIVE = /* @__PURE__ */ new Set(["active", "closing"]);
 var PLAYED2 = /* @__PURE__ */ new Set(["succeeded", "expired", "bust"]);
 function derivePhase(i) {
@@ -45548,7 +45577,8 @@ function derivePhase(i) {
   const agent = running2 ? { name: running2.agent, since: running2.startedAt, lastAt: running2.lastAt } : null;
   if (!m) {
     const id = running2?.agent === "planner" ? "esperando-plan" : "sin-mision";
-    return { id, label: LABEL[id], since: running2?.startedAt ?? null, missionId: null, missionStatus: null, fast: false, costMode: null, planId: null, agent };
+    const planStep = id === "esperando-plan" ? { planStep: "escribiendo" } : {};
+    return { id, label: LABEL[id], since: running2?.startedAt ?? null, missionId: null, missionStatus: null, fast: false, costMode: null, planId: null, agent, ...planStep };
   }
   const base2 = { missionId: m.id, missionStatus: m.status, fast: isFastMission(m), costMode: m.cost_mode ?? "sim", agent };
   const requested = m.requested_at ?? m.created_at;
@@ -45568,10 +45598,23 @@ function derivePhase(i) {
         }
       });
     }
-    if (running2?.agent === "planner" || m.plan_id === null && !i.classPlan) {
-      return phase("esperando-plan", running2?.agent === "planner" ? running2.startedAt : requested, { planId: null, classPlanId: i.classPlan?.id ?? null });
+    const executorStarted = i.sessions.some((s) => isExecutor(s) && s.startedAt >= requested);
+    const planner = running2?.agent === "planner" ? running2 : executorStarted ? null : workingPlanner(i.sessions, i.nowMs);
+    const classPlanId = i.classPlan?.id ?? null;
+    if (planner) {
+      return phase("esperando-plan", planner.startedAt, {
+        planId: null,
+        classPlanId,
+        planStep: "escribiendo",
+        agent: { name: "planner", since: planner.startedAt, lastAt: planner.lastAt }
+      });
     }
-    const executor = running2 && (running2.agent === "executor" || running2.agent === "trader") ? running2 : null;
+    if (m.plan_id === null && !i.classPlan) return phase("esperando-plan", requested, { planId: null, classPlanId, planStep: "sin-plan" });
+    const plannerDone = i.sessions.some((s) => s.agent === "planner" && s.ended && s.lastAt >= requested);
+    if (!executorStarted && !plannerDone && i.nowMs - Date.parse(requested) < STARTING_MS) {
+      return phase("esperando-plan", requested, { label: "Preparando la misi\xF3n", planId: null, classPlanId, planStep: "arrancando" });
+    }
+    const executor = running2 && isExecutor(running2) ? running2 : null;
     const waitedS = i.lastSignal?.summary.match(/Sin señal en (\d+) s/)?.[1];
     const seen = i.lastSignal?.summary.match(/Tokens frescos vistos: (\d+)/)?.[1];
     const inMission = (ts) => !!ts && ts >= requested;
@@ -45599,7 +45642,7 @@ function derivePhase(i) {
     revertedEntries: i.revertedEntries ?? 0
   };
   const skipped = [...m.started_at ? [] : ["reloj"], ...reviewable || m.reviewed_at ? [] : ["revisando"]];
-  if (running2?.agent === "planner") return phase("esperando-plan", running2.startedAt, { planId: null, classPlanId: i.classPlan?.id ?? null, result });
+  if (running2?.agent === "planner") return phase("esperando-plan", running2.startedAt, { planId: null, classPlanId: i.classPlan?.id ?? null, planStep: "escribiendo", result });
   if (reviewable && !m.reviewed_at) return phase("revisando", m.ended_at, { result, skipped });
   const since = [m.ended_at, m.reviewed_at].filter((x) => !!x).sort().at(-1) ?? null;
   return phase("pausa", since, { result, skipped });
@@ -48243,6 +48286,8 @@ function state() {
     mission: mission ?? null,
     valuation: valuation2,
     valuedAt: cached2?.at ?? null,
+    // La carrera: la cifra grande y la pista, siempre de esta misión (sin reloj, su punto de partida; nunca la anterior).
+    hero: mission ? safe("la carrera", () => heroModel(mission, valuation2)) : null,
     // Ahora mismo: en qué fase de la tanda está el equipo (esperando plan, señal, reloj, revisión o pausa).
     phase: safe(
       "la fase de ahora",
