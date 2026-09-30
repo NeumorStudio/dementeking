@@ -57,14 +57,15 @@ export async function getQuote(
   amountBase: bigint,
   slippageBps: number,
   ttlMs = 2_000,
-  opts: { lowPriority?: boolean } = {},
+  opts: { lowPriority?: boolean; fresh?: boolean } = {},
 ): Promise<JupiterQuote> {
   const url =
     `${BASE}/swap/v1/quote?inputMint=${inputMint}&outputMint=${outputMint}` +
     `&amount=${amountBase.toString()}&slippageBps=${slippageBps}`;
   // Determina el precio de ejecución: caché muy corta (solo agrupa peticiones idénticas casi simultáneas).
-  // Con lowPriority (el gemelo mecánico), solo turnos libres de Jupiter: el agente va por delante.
-  const quote = await fetchJson<JupiterQuote & { error?: string }>(url, { timeoutMs: 15_000, ttlMs, lowPriority: opts.lowPriority });
+  // Con lowPriority (el gemelo mecánico), solo turnos libres de Jupiter: el agente va por delante. Con fresh (la
+  // cotización de después de la latencia), nunca la de la caché.
+  const quote = await fetchJson<JupiterQuote & { error?: string }>(url, { timeoutMs: 15_000, ttlMs, lowPriority: opts.lowPriority, fresh: opts.fresh });
   if (quote.error) throw new Error(`Jupiter: ${quote.error}`);
   return quote;
 }

@@ -18,6 +18,10 @@ export const config = {
   effort: (process.env.EFFORT || "high") as "low" | "medium" | "high" | "xhigh" | "max",
   initialUsd: num("INITIAL_USD", 1000),
   solanaTxFeeSol: num("SOLANA_TX_FEE_SOL", 0.0001),
+  // Misiones con costes realistas (create_mission con costs: "real"): la fee con prioridad que paga de verdad un swap de
+  // Solana en un memecoin recién graduado y lo que tarda la transacción desde que se cotiza hasta que entra en un bloque.
+  realSolanaTxFeeSol: num("REAL_SOLANA_TX_FEE_SOL", 0.00075),
+  latencyMs: num("LATENCY_MS", 2000),
   binanceTakerFee: num("BINANCE_TAKER_FEE", 0.001),
   // Comisión real de Binance por retirar USDC por la red Solana (septiembre de 2026).
   binanceUsdcWithdrawFee: num("BINANCE_USDC_WITHDRAW_FEE", 0.3),

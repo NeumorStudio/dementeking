@@ -142,6 +142,11 @@ export interface RequestOpts {
    * (HostBusyError si no hay ninguno en LOW_PRIORITY_MAX_WAIT_MS), y no reintenta si el servicio pide esperar.
    */
   lowPriority?: boolean;
+  /**
+   * Sin reutilizar la caché: una respuesta de hace un momento no vale (la cotización de después de la latencia de las
+   * misiones con costes realistas). La nueva sí se guarda, con su ttlMs.
+   */
+  fresh?: boolean;
 }
 
 async function request(url: string, opts: RequestOpts & { timeoutMs: number }): Promise<{ status: number; body: string }> {
@@ -203,7 +208,7 @@ export function fetchText(url: string, opts: RequestOpts = {}): Promise<{ status
   const key = opts.body !== undefined || opts.method === "POST" ? `${opts.method ?? "GET"} ${url} ${JSON.stringify(opts.body ?? null)}` : url;
   const nowMs = Date.now();
   const hit = cache.get(key);
-  if (hit && hit.expires > nowMs) return hit.value;
+  if (hit && hit.expires > nowMs && !opts.fresh) return hit.value;
 
   const value = request(url, { ...opts, timeoutMs: opts.timeoutMs ?? 15_000 });
   cache.set(key, { expires: nowMs + ttl, value });
@@ -225,7 +230,7 @@ export function fetchText(url: string, opts: RequestOpts = {}): Promise<{ status
  */
 /** Fallo de red o de límite de peticiones: vuelve a intentarlo más tarde y probablemente funcione. */
 export function isTransientError(err: unknown): boolean {
-  return /HTTP (408|429|5dd)|timeout|timed out|aborted|fetch failed|ECONN|ENOTFOUND|Rate limit/i.test(String((err as Error)?.message ?? err));
+  return /HTTP (408|429|5\d\d)|timeout|timed out|aborted|fetch failed|ECONN|ENOTFOUND|Rate limit/i.test(String((err as Error)?.message ?? err));
 }
 
 export function isNoRouteError(err: unknown): boolean {

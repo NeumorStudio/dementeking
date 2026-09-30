@@ -98,6 +98,21 @@ simulador es algo optimista (sin latencia ni MEV, la venta límite se llena just
 0 aciertos de 20 son compatibles con una tasa real de hasta el 16 %. Detalle en la sección 7 de la
 [guía del terreno](knowledge/guia-del-terreno.md).
 
+**Costes realistas (opcional).** Con `costs: "real"` en `create_mission`, los swaps de Solana de la misión (y los de su
+gemelo) pagan lo que pagaría una cartera de verdad: fee con prioridad de 0,00075 SOL por transacción (en vez de 0,0001),
+la renta de la cuenta de cada token nuevo (0,00203928 SOL) sin devolver al venderlo, y 2 s de latencia entre cotizar y
+ejecutar (`LATENCY_MS`): el swap se llena a la cotización de después y revierte si ha empeorado más que su slippage, y la
+toma de beneficio solo se llena si esa cotización sigue llegando al límite. Esas misiones son otra serie: las
+estadísticas por clase, el historial y las retrospectivas las separan de las de costes de siempre.
+
+La toma de beneficio en el objetivo cuenta el SOL que queda como estará al cerrar la misión (menos la red de la venta y
+la de convertirlo, y con su precio un 0,5 % más bajo): si salta, la misión queda conseguida. El cierre por objetivo mide
+igual lo que quedaría al cerrar (no la valoración en bruto), así que no se adelanta a esa orden, y su venta a mercado
+tiene un mínimo: si tras la latencia ya no llega, no se vende y la toma de beneficio sigue puesta. Una misión solo queda
+conseguida si lo que queda al final llega al objetivo: en la misión por defecto, si el SOL baja más de un ~4 % (~7 % con
+costes realistas) entre poner la toma de beneficio y que salte, se llena pero no llega. `mission_status` y la
+retrospectiva dicen además cuánto tardó en prepararse (de pedirla a arrancar el reloj) y en entrar desde la señal.
+
 ### Qué modelo usa cada agente
 
 | Agente | Papel | Modelo | Esfuerzo | Cuándo corre |

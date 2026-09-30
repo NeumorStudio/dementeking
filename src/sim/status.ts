@@ -1,7 +1,8 @@
 // Resumen de la misión en texto, pensado para leerse en el chat (también desde el móvil con Remote Control).
 import { db } from "../db.js";
 import { listCapabilityRequests } from "./memory.js";
-import { getActiveMission, getLastMission, getMission, missionDurationMinutes, PREP_TIMEOUT_MINUTES } from "./mission.js";
+import { describeCostMode } from "./costs.js";
+import { getActiveMission, getLastMission, getMission, missionDurationMinutes, missionMeasurement, PREP_TIMEOUT_MINUTES } from "./mission.js";
 import { listOrders } from "./orders.js";
 import { valuation } from "./portfolio.js";
 import { listPositions } from "./positions.js";
@@ -42,6 +43,21 @@ export async function statusReport(missionId?: number): Promise<string> {
   lines.push(`Misión #${m.id}: ${statusText}`);
   lines.push(`Valor: ${usd(current)} (${pct(change)}) · objetivo ${usd(m.target_usd)} · progreso ${Math.round(progress)} %`);
   lines.push(m.instructions ? `Instrucciones: ${m.instructions}` : "Modo libre");
+  if (m.mode !== "live") lines.push(`Costes: ${describeCostMode(m.cost_mode)}`);
+  // Lo que tardó en prepararse (de pedirla a arrancar el reloj) y en entrar desde la señal.
+  const measured = missionMeasurement(m);
+  const prep = measured?.prepMinutes?.toLocaleString("es-ES");
+  const timing = [
+    prep === undefined
+      ? ""
+      : m.started_at
+        ? `preparación ${prep} min`
+        : m.status === "active"
+          ? `preparándose desde hace ${prep} min`
+          : `preparación ${prep} min, sin llegar a arrancar el reloj`,
+    measured?.entryLatencySeconds != null ? `entrada a ${measured.entryLatencySeconds.toLocaleString("es-ES")} s de la señal` : "",
+  ].filter(Boolean);
+  if (timing.length) lines.push(`Tiempos: ${timing.join(" · ")}`);
 
   // Posiciones abiertas con su resultado sin realizar (valor de liquidación frente a lo que costaron).
   const open = listPositions(m.id).filter((p) => p.status === "open");

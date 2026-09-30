@@ -4,7 +4,7 @@
 // periódico (watcher.ts y el servidor MCP mientras está activo).
 import { db, logJournal, now } from "../db.js";
 import * as binance from "../market/binance.js";
-import { assertSimulated, binanceMarketOrder, getHoldings, LimitNotReached, swap } from "./portfolio.js";
+import { assertSimulated, binanceMarketOrder, getHoldings, LimitNotFilled, LimitNotReached, resending, swap } from "./portfolio.js";
 import type { ChainId, VenueId } from "./types.js";
 import { settleTransfers } from "./transfers.js";
 import { getVenue } from "./venues/index.js";
@@ -289,18 +289,24 @@ async function execute(order: OrderRow, reasoning: string, price: number | null,
       reasoning,
       meta: { exitReason: `orden condicional #${order.id}`, thesis: order.reasoning ?? undefined },
     };
-    const result =
-      getVenue(order.venue).kind === "chain"
-        ? await swap({ ...base, chain: order.venue as ChainId, ...(action as SwapAction), ...limitFill(order, action as SwapAction) })
-        : await binanceMarketOrder({ ...base, ...(action as BinanceAction) });
+    let result: Record<string, unknown>;
+    if (getVenue(order.venue).kind === "chain") {
+      const fill = limitFill(order, action as SwapAction);
+      const run = () => swap({ ...base, chain: order.venue as ChainId, ...(action as SwapAction), ...fill });
+      // A mercado (stops y órdenes por tiempo), con costes realistas: si revierte por la latencia, se reenvía como al
+      // cerrar la misión (liquidateAll). La toma de beneficio no: su límite la protege y, si no llega, sigue abierta.
+      result = fill.minOut === undefined ? await resending(order.mission_id, run) : await run();
+    } else {
+      result = await binanceMarketOrder({ ...base, ...(action as BinanceAction) });
+    }
     close(order.id, "filled", { ...seen, ...result });
     log.push(price === null ? `Orden #${order.id} ejecutada por tiempo` : `Orden #${order.id} ejecutada a ${order.trigger_label} = ${price}`);
   } catch (err) {
-    // Toma de beneficio que ya no llega al precio (se movió entre la comprobación y la venta): como una orden
-    // límite real, no se llena y sigue esperando.
-    if (err instanceof LimitNotReached) {
+    // Toma de beneficio que ya no llega al precio (se movió entre la comprobación y la venta) o sin cotización con la
+    // que comprobarlo: como una orden límite real, no se llena y sigue esperando.
+    if (err instanceof LimitNotFilled) {
       db.prepare("UPDATE orders SET status = 'open' WHERE id = ? AND status = 'executing'").run(order.id);
-      log.push(`Orden #${order.id}: el precio ya no llega al límite; sigue abierta`);
+      log.push(err instanceof LimitNotReached ? `Orden #${order.id}: el precio ya no llega al límite; sigue abierta` : `Orden #${order.id}: ${err.message}; sigue abierta`);
       return;
     }
     const message = (err as Error).message;

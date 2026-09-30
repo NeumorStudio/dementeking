@@ -26,15 +26,23 @@
 //   el gemelo vende a la cotización de ese momento, como el cierre de la misión. Con precios de después de su plazo no
 //   se decide nada: si la vigilancia llega tarde (el proceso estaba parado), se cierra con la última cotización de su
 //   plazo o, si nadie lo miró al final, no cuenta.
+//
+// Con costes realistas (costs.ts), el gemelo paga lo mismo que el agente: su toma de beneficio se calcula con esos costes,
+// cada uno descuenta de su resultado la red (compra, venta y convertir el gas al cerrar) y la renta de su cuenta, y la
+// latencia: tras el evento vuelve a cotizar la compra (si ha empeorado más que su slippage, revierte y no entra), y su
+// toma de beneficio y su venta al acabar el plazo se deciden con la cotización de después de la latencia.
 import { config } from "../config.js";
 import { db, logJournal } from "../db.js";
 import { HostBusyError } from "../market/http.js";
-import { fromBaseUnits, getQuote, USDC_MINT } from "../market/jupiter.js";
-import { isFastMission, parseMissionClass, TP_TARGET_MARGIN } from "./mission-kind.js";
+import { fromBaseUnits, getQuote, SOL_MINT, toBaseUnits, USDC_MINT } from "../market/jupiter.js";
+import { asCostMode, latencyMs, sleep, solanaCostProfile, solanaTxFee, type CostMode } from "./costs.js";
+import { isFastMission, liftTakeProfit, parseMissionClass, takeProfitProceeds, TP_TARGET_MARGIN, type RestAfterSale } from "./mission-kind.js";
 import { planForMission, type SignalSource } from "./plans.js";
-import { balance } from "./portfolio.js";
+import { balance, getHoldings } from "./portfolio.js";
 import { SignalScanner, type ScannerHit, type SignalTiming } from "./signals.js";
-import { getChain } from "./venues/index.js";
+import type { Allocation, Holding } from "./types.js";
+import { settleSolanaSwap, TOKEN_ACCOUNT_RENT_SOL } from "./venues/solana.js";
+import { getChain, type Settlement, type SwapQuote, type TokenRef, type WalletView } from "./venues/index.js";
 
 /** Gemelos por misión: los eventos siguientes a la entrada del agente. */
 export const SHADOW_COUNT = 3;
@@ -70,8 +78,13 @@ export const SHADOW_TIMING: ShadowTiming = {
 /** Margen para que un gemelo no se salte su cotización por unos milisegundos de retraso del temporizador. */
 const DUE_SLACK_MS = 250;
 
+/** Slippage de la compra y la venta del gemelo: el de enter_with_exits por defecto. */
+const TWIN_SLIPPAGE_BPS = 300;
+
 interface RunRow {
   mission_id: number;
+  /** De la misión (costs.ts): con 'real', el gemelo paga la red, la renta y la latencia como el agente. */
+  cost_mode?: string;
   started_at: string;
   detect_until: string;
   horizon_minutes: number;
@@ -105,9 +118,75 @@ interface TwinRow {
   closed_at: string | null;
   exit_usd: number | null;
   note: string | null;
+  /** Red y renta en USD (solo con costes realistas): se descuentan de su resultado. */
+  costs_usd: number;
 }
 
 const iso = (ms: number) => new Date(ms).toISOString();
+
+/** Lo que se lleva el gemelo: su venta menos sus costes (con los de siempre, 0 como hasta v0.37.0). */
+const netExit = (t: Pick<TwinRow, "exit_usd" | "costs_usd">) => t.exit_usd! - (t.costs_usd ?? 0);
+
+/** Token de papel con el que se liquidan en seco la compra y la venta del gemelo: solo importa lo que cuestan en SOL. */
+const PAPER_TOKEN: TokenRef = { address: "gemelo", symbol: "GEMELO", decimals: 6 };
+
+const paperQuote = (input: TokenRef, output: TokenRef, amountIn: number): SwapQuote => ({
+  chain: "solana",
+  input,
+  output,
+  amountIn,
+  grossOut: 0,
+  amountOut: input === PAPER_TOKEN ? 0 : 1,
+  route: [],
+  slippageBps: TWIN_SLIPPAGE_BPS,
+  warnings: [],
+});
+
+/**
+ * El resto de la cartera tras la venta del gemelo, como lo calcula enter_with_exits tras comprar (entry.ts): la cartera
+ * de Solana de ahora (la inicial: antes del reloj no se opera), la compra de `size` y la venta de todo liquidadas en seco
+ * con las reglas del monedero y los costes de la misión. El nativo, al precio al que se entregó al crear la misión (sin
+ * red: el gemelo se prepara al arrancar el reloj, sin esperar a nadie). null si no se puede calcular.
+ */
+function twinRest(
+  m: { id: number; initial_usd: number; benchmark: string | null; allocation: string | null },
+  size: number,
+  mode: CostMode,
+): RestAfterSale | null {
+  const chain = getChain("solana");
+  const holdings = getHoldings(m.id).filter((h) => h.venue === "solana");
+  const bal = new Map(holdings.map((h) => [h.asset, h.amount]));
+  const stable = chain.stables.map((s) => [s, bal.get(s.address) ?? 0] as const).sort((a, b) => b[1] - a[1])[0]![0];
+  const profile = solanaCostProfile(m.id, mode);
+  const w: WalletView = { balance: (a) => bal.get(a) ?? 0, ...(profile ? { profile } : {}) };
+  const apply = (s: Settlement) => {
+    if (!s.ok) return false;
+    for (const d of s.deltas) bal.set(d.asset, (bal.get(d.asset) ?? 0) + d.amount);
+    return true;
+  };
+  if (!apply(settleSolanaSwap(paperQuote(stable, PAPER_TOKEN, size), w))) return null;
+  if (!apply(settleSolanaSwap(paperQuote(PAPER_TOKEN, stable, bal.get(PAPER_TOKEN.address) ?? 0), w))) return null;
+  // Precio del nativo al entregarlo: la parte de Solana del capital menos sus estables, entre el nativo entregado.
+  let bench: Holding[] = [];
+  let alloc: Allocation = {};
+  try {
+    bench = JSON.parse(m.benchmark ?? "[]") as Holding[];
+    alloc = JSON.parse(m.allocation ?? "{}") as Allocation;
+  } catch {
+    return null;
+  }
+  const sol0 = bench.find((h) => h.venue === "solana" && h.asset === SOL_MINT)?.amount ?? 0;
+  const stables0 = bench.filter((h) => h.venue === "solana" && chain.isCash(h.asset)).reduce((s, h) => s + h.amount, 0);
+  const nativeUsd = sol0 > 0 ? ((m.initial_usd * (alloc.solana ?? 0)) / 100 - stables0) / sol0 : 0;
+  if (!(nativeUsd >= 0)) return null;
+  const nativeNow = holdings.find((h) => h.asset === SOL_MINT)?.amount ?? 0;
+  return {
+    otherUsd: m.initial_usd - size - nativeNow * nativeUsd,
+    nativeAfterSale: bal.get(SOL_MINT) ?? 0,
+    closeFeeNative: solanaTxFee(mode),
+    nativeUsd,
+  };
+}
 
 /**
  * Al arrancar el reloj de una misión rápida simulada cuyo mercado tiene fuente mecánica: prepara su gemelo con el tamaño
@@ -117,9 +196,21 @@ const iso = (ms: number) => new Date(ms).toISOString();
  */
 export function startShadowRun(missionId: number): { started: true } | { started: false; reason: string } {
   const m = db
-    .prepare("SELECT id, mode, class, created_at, deadline, started_at, initial_usd, target_usd FROM missions WHERE id = ?")
+    .prepare("SELECT id, mode, class, created_at, deadline, started_at, initial_usd, target_usd, benchmark, allocation, cost_mode FROM missions WHERE id = ?")
     .get(missionId) as
-    | { id: number; mode: string | null; class: string | null; created_at: string; deadline: string; started_at: string | null; initial_usd: number; target_usd: number }
+    | {
+        id: number;
+        mode: string | null;
+        class: string | null;
+        created_at: string;
+        deadline: string;
+        started_at: string | null;
+        initial_usd: number;
+        target_usd: number;
+        benchmark: string | null;
+        allocation: string | null;
+        cost_mode: string | null;
+      }
     | undefined;
   if (!m?.started_at) return { started: false, reason: "el reloj no ha arrancado" };
   if (m.mode === "live") return { started: false, reason: "misión real" };
@@ -132,9 +223,14 @@ export function startShadowRun(missionId: number): { started: true } | { started
   const size = Math.min(plan?.body.usd_amount ?? cash, cash);
   if (!(size >= 1)) return { started: false, reason: "sin efectivo en Solana" };
   // El resto de la cartera (el gas y lo que haya en otras cadenas) sigue ahí: antes del reloj no se puede operar, así
-  // que al arrancarlo la cartera vale lo del principio.
+  // que al arrancarlo la cartera vale lo del principio. La toma de beneficio, la misma que pondría enter_with_exits: en el
+  // objetivo con el gas tal como quedará al cerrar, o la del tp_ratio del plan (subida al objetivo si se queda corta por poco).
   const tpRatio = plan?.body.tp_ratio;
-  const tpUsd = tpRatio ? size * tpRatio : m.target_usd * (1 + TP_TARGET_MARGIN) - (m.initial_usd - size);
+  const rest = twinRest(m, size, asCostMode(m.cost_mode));
+  const atTarget = rest ? takeProfitProceeds(m.target_usd, rest) : m.target_usd * (1 + TP_TARGET_MARGIN) - (m.initial_usd - size);
+  const lift = tpRatio && rest ? liftTakeProfit({ ratioProceeds: size * tpRatio, targetUsd: m.target_usd, rest }) : undefined;
+  const lifted = lift?.liftedFromUsd !== undefined;
+  const tpUsd = tpRatio && !lifted ? size * tpRatio : atTarget;
   const durationMs = new Date(m.deadline).getTime() - new Date(m.started_at).getTime();
   const changed = db
     .prepare(
@@ -149,7 +245,11 @@ export function startShadowRun(missionId: number): { started: true } | { started
       source,
       size,
       tpUsd,
-      tpRatio ? `×${tpRatio} de lo que paga (plan #${plan!.id})` : `el objetivo de la misión neto de costes${plan ? ` (plan #${plan.id}, sin tp_ratio)` : ""}`,
+      tpRatio && !lifted
+        ? `×${tpRatio} de lo que paga (plan #${plan!.id})`
+        : lifted
+          ? `el objetivo de la misión neto de costes (plan #${plan!.id}: su ×${tpRatio} dejaba la cartera en ${lift!.liftedFromUsd!.toFixed(2)} $, por debajo del objetivo)`
+          : `el objetivo de la misión neto de costes${plan ? ` (plan #${plan.id}, sin tp_ratio)` : ""}`,
       SHADOW_COUNT,
     ).changes;
   return changed ? { started: true } : { started: false, reason: "ya tenía gemelo" };
@@ -171,7 +271,7 @@ function agentTokens(missionId: number): string[] {
 
 const twinsOf = (missionId: number) => db.prepare("SELECT * FROM shadow_positions WHERE mission_id = ? ORDER BY id").all(missionId) as unknown as TwinRow[];
 
-function openTwin(run: RunRow, hit: ScannerHit, nowMs: number): TwinRow | undefined {
+function openTwin(run: RunRow, hit: ScannerHit, nowMs: number, costsUsd = 0): TwinRow | undefined {
   let id: number | undefined;
   // Contar e insertar juntos: si dos procesos vigilan a la vez, no pasan de target_count.
   db.exec("BEGIN IMMEDIATE");
@@ -182,8 +282,8 @@ function openTwin(run: RunRow, hit: ScannerHit, nowMs: number): TwinRow | undefi
       const r = db
         .prepare(
           `INSERT OR IGNORE INTO shadow_positions
-             (mission_id, token, symbol, pool, opened_at, expires_at, usd_in, tokens_raw, decimals, entry_value_usd, last_value_usd, best_value_usd, last_quote_at, quotes)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
+             (mission_id, token, symbol, pool, opened_at, expires_at, usd_in, tokens_raw, decimals, entry_value_usd, last_value_usd, best_value_usd, last_quote_at, quotes, costs_usd)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
         )
         .run(
           run.mission_id,
@@ -199,6 +299,7 @@ function openTwin(run: RunRow, hit: ScannerHit, nowMs: number): TwinRow | undefi
           back,
           back,
           iso(nowMs),
+          costsUsd,
         );
       if (r.changes) id = Number(r.lastInsertRowid);
     }
@@ -233,8 +334,10 @@ async function quoteTwin(t: TwinRow, run: RunRow, nowMs: number, timing: ShadowT
   if (expired && nowMs - expiresMs > timing.lateMs) {
     const lastSeenMs = t.last_quote_at ? Date.parse(t.last_quote_at) : Number.NEGATIVE_INFINITY;
     if (expiresMs - lastSeenMs <= timing.unobservedMs) {
-      // Se le miró hasta el final (con cotización o intentándolo sin ruta): vale la última cotización de su plazo.
-      const exit = t.last_value_usd ?? 0;
+      // Se le miró hasta el final (con cotización o intentándolo sin ruta): vale la última cotización de su plazo. Si esa
+      // llegaba a la toma de beneficio es que no se pudo confirmar tras la latencia (costes realistas; si no, se habría
+      // llenado): cuenta como mucho su toma de beneficio, y sin acierto.
+      const exit = Math.min(t.last_value_usd ?? 0, run.tp_usd);
       return closeTwin(t, "expired", exit, "cerrado con la última cotización de su plazo (la vigilancia llegó tarde al cierre)", nowMs)
         ? `Gemelo #${t.id} (${name}) cerrado por tiempo con su última cotización: ${exit.toFixed(2)} $`
         : null;
@@ -245,8 +348,7 @@ async function quoteTwin(t: TwinRow, run: RunRow, nowMs: number, timing: ShadowT
   }
   let value: number;
   try {
-    const q = await getQuote(t.token, USDC_MINT, BigInt(t.tokens_raw), 300, 1_000, { lowPriority: true });
-    value = fromBaseUnits(q.outAmount, 6);
+    value = await sellQuote(t, 1_000);
   } catch (err) {
     // Jupiter ocupado con el agente: se vuelve a intentar en la vuelta siguiente, sin anotar nada.
     if (err instanceof HostBusyError) return null;
@@ -255,15 +357,69 @@ async function quoteTwin(t: TwinRow, run: RunRow, nowMs: number, timing: ShadowT
     db.prepare("UPDATE shadow_positions SET last_quote_at = ?, note = ? WHERE id = ? AND status = 'open'").run(iso(nowMs), `sin cotización: ${(err as Error).message.slice(0, 120)}`, t.id);
     return null;
   }
-  db.prepare(
-    "UPDATE shadow_positions SET quotes = quotes + 1, last_value_usd = ?, best_value_usd = MAX(COALESCE(best_value_usd, ?), ?), last_quote_at = ? WHERE id = ? AND status = 'open'",
-  ).run(value, value, value, iso(nowMs), t.id);
+  recordQuote(t, value, nowMs);
+  // Costes realistas: la venta (la toma de beneficio o la del final del plazo) se ejecuta con la cotización de después de
+  // la latencia, como la del agente.
+  const latency = latencyMs(asCostMode(run.cost_mode));
+  if (latency > 0 && (value >= run.tp_usd || expired)) {
+    await sleep(latency);
+    const after = await sellQuote(t, 1, true).catch((err) => err as Error);
+    if (after instanceof Error) {
+      // Sin la cotización de después, la toma de beneficio no se da por llenada (sigue abierto), tampoco en la vuelta de su
+      // plazo: se reintenta en la siguiente, dentro de lateMs, y pasado ese margen se cierra por tiempo (arriba). Al final
+      // del plazo y por debajo de la toma de beneficio, se vende con la que había.
+      if (!expired || value >= run.tp_usd) return null;
+    } else {
+      value = after;
+      recordQuote(t, value, nowMs);
+    }
+  }
   if (value >= run.tp_usd) {
     // Como la orden límite del agente: se llena justo a su precio (el exceso del pico no es suyo).
     return closeTwin(t, "hit", run.tp_usd, null, nowMs) ? `Gemelo #${t.id} (${name}) llega a la toma de beneficio: ${run.tp_usd.toFixed(2)} $` : null;
   }
   if (expired) return closeTwin(t, "expired", value, null, nowMs) ? `Gemelo #${t.id} (${name}) cerrado por tiempo: ${value.toFixed(2)} $` : null;
   return null;
+}
+
+/** Lo que daría vender ahora los tokens del gemelo (USDC), por el carril de baja prioridad de Jupiter. */
+async function sellQuote(t: TwinRow, ttlMs: number, fresh?: boolean): Promise<number> {
+  const q = await getQuote(t.token, USDC_MINT, BigInt(t.tokens_raw), TWIN_SLIPPAGE_BPS, ttlMs, { lowPriority: true, ...(fresh ? { fresh } : {}) });
+  return fromBaseUnits(q.outAmount, 6);
+}
+
+function recordQuote(t: TwinRow, value: number, nowMs: number) {
+  db.prepare(
+    "UPDATE shadow_positions SET quotes = quotes + 1, last_value_usd = ?, best_value_usd = MAX(COALESCE(best_value_usd, ?), ?), last_quote_at = ? WHERE id = ? AND status = 'open'",
+  ).run(value, value, value, iso(nowMs), t.id);
+}
+
+/**
+ * Costes realistas: la compra del gemelo tampoco entra al momento. Tras el evento pasa la latencia y se vuelve a cotizar;
+ * si da menos tokens de los que permite su slippage, revierte y el gemelo no entra en ese evento (como el agente, que lo
+ * perdería). Devuelve el evento con los tokens de la compra de verdad, o por qué no entra ('busy': Jupiter ocupado, se
+ * reintenta en la vuelta siguiente).
+ */
+async function buyAfterLatency(run: RunRow, hit: ScannerHit, latency: number): Promise<ScannerHit | "busy" | "reverted"> {
+  await sleep(latency);
+  let raw: bigint;
+  try {
+    raw = BigInt((await getQuote(USDC_MINT, hit.candidate.token, toBaseUnits(run.size_usd, 6), TWIN_SLIPPAGE_BPS, 1, { lowPriority: true, fresh: true })).outAmount);
+  } catch {
+    return "busy";
+  }
+  const decided = BigInt(hit.tokensOutRaw);
+  if (Number(raw) < Number(decided) * (1 - TWIN_SLIPPAGE_BPS / 10_000)) return "reverted";
+  const f = Number(raw) / Number(decided);
+  const quote = hit.candidate.quote!;
+  return { ...hit, tokensOutRaw: raw.toString(), candidate: { ...hit.candidate, quote: { ...quote, tokensOut: quote.tokensOut * f, backUsd: quote.backUsd * f } } };
+}
+
+/** Red (compra, venta y convertir el gas al cerrar) y renta de la cuenta de un gemelo con costes realistas, en USD. */
+async function twinCostsUsd(): Promise<number> {
+  const sol = 3 * solanaTxFee("real") + TOKEN_ACCOUNT_RENT_SOL;
+  const v = await getChain("solana").liquidationValue({ venue: "solana", asset: SOL_MINT, symbol: "SOL", decimals: 9, amount: sol });
+  return v.usd;
 }
 
 /**
@@ -279,7 +435,7 @@ function finalize(run: RunRow, nowMs: number): string | null {
   if (twins.length < run.target_count && nowMs < Date.parse(run.detect_until)) return null;
   const done = twins.filter((t) => t.status === "hit" || t.status === "expired");
   const hits = done.filter((t) => t.status === "hit").length;
-  const ret = done.length ? done.reduce((s, t) => s + (t.exit_usd! - t.usd_in), 0) / done.length / mission.initial_usd : null;
+  const ret = done.length ? done.reduce((s, t) => s + (netExit(t) - t.usd_in), 0) / done.length / mission.initial_usd : null;
   const note = done.length
     ? null
     : twins.length
@@ -314,7 +470,7 @@ export async function checkShadows(opts: { timing?: Partial<ShadowTiming>; nowMs
   const nowMs = opts.nowMs ?? Date.now();
   const log: string[] = [];
   const runs = db
-    .prepare("SELECT r.*, m.status AS mission_status FROM shadow_runs r JOIN missions m ON m.id = r.mission_id WHERE r.status = 'running' ORDER BY r.mission_id")
+    .prepare("SELECT r.*, m.status AS mission_status, m.cost_mode FROM shadow_runs r JOIN missions m ON m.id = r.mission_id WHERE r.status = 'running' ORDER BY r.mission_id")
     .all() as unknown as Array<RunRow & { mission_status: string }>;
   for (const id of scanners.keys()) if (!runs.some((r) => r.mission_id === id)) scanners.delete(id);
 
@@ -357,12 +513,27 @@ export async function checkShadows(opts: { timing?: Partial<ShadowTiming>; nowMs
       scanners.set(r.mission_id, scanner);
     }
     scanner.exclude([...agentTokens(r.mission_id), ...twinsOf(r.mission_id).map((t) => t.token)]);
-    // Un candidato nuevo son 3 peticiones a Jupiter (datos del token, compra y venta): solo si caben en esta vuelta.
-    const checks = budget >= 3 ? 1 : 0;
-    budget -= checks * 3;
-    const hit = await scanner.poll(checks).catch(() => null);
+    // Un candidato nuevo son 3 peticiones a Jupiter (datos del token, compra y venta), y con costes realistas una más
+    // (la compra tras la latencia): solo si caben en esta vuelta.
+    const latency = latencyMs(asCostMode(r.cost_mode));
+    const perCheck = latency > 0 ? 4 : 3;
+    const checks = budget >= perCheck ? 1 : 0;
+    budget -= checks * perCheck;
+    let hit = await scanner.poll(checks).catch(() => null);
     if (!hit) continue;
-    const twin = openTwin(r, hit, nowMs);
+    let costsUsd = 0;
+    if (latency > 0) {
+      const bought = await buyAfterLatency(r, hit, latency);
+      if (bought === "busy") continue; // el escáner lo vuelve a ofrecer en unos segundos si sigue fresco
+      if (bought === "reverted") {
+        scanner.exclude([hit.candidate.token]);
+        log.push(`Gemelo de la misión #${r.mission_id}: la compra de ${hit.candidate.symbol ?? hit.candidate.token} revierte tras la latencia (peor que su slippage); no entra`);
+        continue;
+      }
+      hit = bought;
+      costsUsd = await twinCostsUsd().catch(() => 0);
+    }
+    const twin = openTwin(r, hit, nowMs, costsUsd);
     if (twin) log.push(`Gemelo #${twin.id} de la misión #${r.mission_id}: ${twin.symbol ?? twin.token} con ${twin.usd_in.toFixed(2)} $ (vender al momento: ${twin.entry_value_usd.toFixed(2)} $)`);
   }
 
@@ -398,7 +569,8 @@ export function shadowSummary(missionId: number) {
     hits,
     twins: done.length,
     ...(unobserved ? { unobserved: `${unobserved} gemelo(s) sin observar al final de su plazo: no cuentan` } : {}),
-    ...(done.length ? { avgResultPct: pct(done.reduce((s, t) => s + (t.exit_usd! - t.usd_in), 0) / done.length / initial) } : {}),
+    ...(done.length ? { avgResultPct: pct(done.reduce((s, t) => s + (netExit(t) - t.usd_in), 0) / done.length / initial) } : {}),
+    ...(twins.some((t) => t.costs_usd > 0) ? { costs: "costes realistas: cada resultado descuenta la red y la renta de su cuenta (costsUsd)" } : {}),
     ...(run.note ? { note: run.note } : {}),
     positions: twins.map((t) => ({
       twinId: t.id,
@@ -408,7 +580,8 @@ export function shadowSummary(missionId: number) {
       status: t.status === "hit" ? "toma de beneficio" : t.status === "expired" ? "cerrado por tiempo" : "abierto",
       entryValuePct: pct(t.entry_value_usd / t.usd_in - 1),
       bestPct: t.best_value_usd !== null ? pct(t.best_value_usd / t.usd_in - 1) : undefined,
-      ...(t.exit_usd !== null ? { resultPct: pct(t.exit_usd / t.usd_in - 1) } : { nowPct: t.last_value_usd !== null ? pct(t.last_value_usd / t.usd_in - 1) : undefined }),
+      ...(t.exit_usd !== null ? { resultPct: pct(netExit(t) / t.usd_in - 1) } : { nowPct: t.last_value_usd !== null ? pct(t.last_value_usd / t.usd_in - 1) : undefined }),
+      ...(t.costs_usd > 0 ? { costsUsd: Number(t.costs_usd.toFixed(3)) } : {}),
       quotes: t.quotes,
       ...(t.note ? { note: t.note } : {}),
     })),

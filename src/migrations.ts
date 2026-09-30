@@ -254,6 +254,27 @@ export const MIGRATIONS: Migration[] = [
       db.exec("UPDATE missions SET class = 'libre' || substr(class, instr(class, '-')) WHERE mode = 'live' AND class IS NOT NULL AND class NOT LIKE 'libre-%'");
     },
   },
+  {
+    version: 14,
+    description: "Costes realistas por misión (cost_mode) y medidas de la entrada: cuándo se pidió, la señal y la compra",
+    up: (db) =>
+      db.exec(`
+        -- 'sim' (los costes de siempre) | 'real' (fee con prioridad, renta sin devolver y latencia al ejecutar): las dos
+        -- series no se mezclan en las estadísticas por clase.
+        ALTER TABLE missions ADD COLUMN cost_mode TEXT NOT NULL DEFAULT 'sim';
+        -- Cuándo se pidió la misión. No cambia nunca (created_at se reescribe al arrancar el reloj).
+        ALTER TABLE missions ADD COLUMN requested_at TEXT;
+        -- La última señal de wait_for_signal antes de la entrada, y la primera compra de enter_with_exits.
+        ALTER TABLE missions ADD COLUMN signal_at TEXT;
+        ALTER TABLE missions ADD COLUMN signal_token TEXT;
+        ALTER TABLE missions ADD COLUMN entry_at TEXT;
+        ALTER TABLE missions ADD COLUMN entry_latency_s REAL;
+        -- Las que aún no han arrancado el reloj conservan su hora de creación; en las demás ya no se sabe.
+        UPDATE missions SET requested_at = created_at WHERE started_at IS NULL;
+        -- Red y renta de cada gemelo con costes realistas, en USD (con los de siempre, 0: como hasta ahora).
+        ALTER TABLE shadow_positions ADD COLUMN costs_usd REAL NOT NULL DEFAULT 0;
+      `),
+  },
 ];
 
 /**

@@ -7,7 +7,7 @@
 // La escribe el agente revisor, no el que opera: así el agente no juzga sus propias decisiones.
 // El que opera deja observaciones (report_observation) y el revisor decide qué pasa a la memoria.
 import { db, logActivity, now } from "../db.js";
-import { getActiveMission, getLastMission, getMission, type Mission } from "./mission.js";
+import { getActiveMission, getLastMission, getMission, missionMeasurement, type Mission } from "./mission.js";
 import { isFastMission } from "./mission-kind.js";
 import { listPositions } from "./positions.js";
 import { DUPLICATE_THRESHOLD, fingerprint, similarity } from "./text.js";
@@ -938,11 +938,31 @@ export function recentApproach(count = 8) {
       orders,
       // Su clase y cómo quedó frente a lo que predijo el plan, a la línea base y a su gemelo mecánico.
       ...(m.class ? { missionClass: m.class } : {}),
+      // Con costes realistas es otra serie (costs.ts): el resumen no la mezcla con las de costes de siempre.
+      costs: m.cost_mode,
       ...(m.status !== "cancelled" && m.started_at ? comparedToTwin(m, twins) : {}),
     };
   });
   const n = perMission.length;
   const share = (f: (x: (typeof perMission)[number]) => boolean) => `${perMission.filter(f).length} de ${n}`;
+  // Si hay misiones de los dos modos de costes, los aciertos y el resultado van también por separado: son series distintas.
+  const modes = [...new Set(perMission.map((x) => x.costs))];
+  const byCosts =
+    modes.length > 1
+      ? Object.fromEntries(
+          modes.map((mode) => {
+            const xs = perMission.filter((x) => x.costs === mode);
+            return [
+              mode,
+              {
+                missions: xs.length,
+                succeeded: `${xs.filter((x) => x.succeeded).length} de ${xs.length}`,
+                avgResultPct: Number((xs.reduce((s, x) => s + x.resultPct, 0) / xs.length).toFixed(1)),
+              },
+            ];
+          }),
+        )
+      : undefined;
   // Éxitos seguidos al final de la serie: si el enfoque actual gana, no es estancamiento.
   let successStreak = 0;
   for (let i = n - 1; i >= 0 && perMission[i]!.succeeded; i--) successStreak++;
@@ -959,6 +979,9 @@ export function recentApproach(count = 8) {
       endedByDeadline: share((x) => x.closedByDeadline > 0),
       withYoungTokens: share((x) => x.tokenAgeMinutes !== null && x.tokenAgeMinutes < 60),
       venuesUsed: [...new Set(perMission.map((x) => x.venues))].join(", "),
+      ...(byCosts
+        ? { byCosts, costsNote: "hay misiones con costes de siempre (sim) y realistas (real): sus aciertos y resultados no se comparan entre sí" }
+        : {}),
     },
     perMission,
   };
@@ -983,6 +1006,7 @@ export function reviewQueue() {
       missionId: active.id,
       // rápida (simulada de 15 min o menos: planner y executor, sin briefing) o normal (el trader, con briefing).
       missionKind: isFastMission(active) ? "rápida" : "normal",
+      costs: active.cost_mode,
       profile: describe(profile(active)),
       instructions: active.instructions ?? undefined,
       deadline: active.deadline,
@@ -1028,12 +1052,17 @@ export function missionReviewData(missionId: number, since?: string) {
     : allPositions;
   // El gemelo, solo con la misión terminada: a mitad de misión podría llegarle al agente por el briefing.
   const twin = m.status === "active" || m.status === "closing" ? null : shadowSummary(missionId);
+  const measurement = missionMeasurement(m);
   return {
     mission: { ...mission, profile: describe(profile(m)) },
+    // Lo que tardó en prepararse (de pedirla a arrancar el reloj) y en entrar desde la señal de wait_for_signal.
+    ...(measurement ? { measurement } : {}),
     stats: missionStats(missionId),
     // Misión rápida: su gemelo mecánico (los eventos siguientes con la regla sin inteligencia) y cómo va su clase.
     ...(twin ? { twin } : {}),
-    ...(m.class && !since ? { missionClass: classStats({ cls: m.class, perMissionLimit: 10 })[0] ?? `${m.class}: aún sin misiones terminadas` } : {}),
+    ...(m.class && !since
+      ? { missionClass: classStats({ cls: m.class, costMode: m.cost_mode, perMissionLimit: 10 })[0] ?? `${m.class} (costes ${m.cost_mode}): aún sin misiones terminadas` }
+      : {}),
     briefing: !briefing
       ? null
       : since && briefing.updated_at <= from

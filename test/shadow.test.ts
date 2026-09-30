@@ -14,6 +14,7 @@ import { writePlan, type PlanBody } from "../src/sim/plans.js";
 import { logResearch } from "../src/sim/positions.js";
 import { checkShadows, SHADOW_COUNT, SHADOW_TIMING, shadowsRunning, shadowSummary, startShadowRun, type ShadowTiming } from "../src/sim/shadow.js";
 import { wilson } from "../src/sim/stats.js";
+import { NATIVE_DRIFT_MARGIN, TP_TARGET_MARGIN } from "../src/sim/mission-kind.js";
 import { config } from "../src/config.js";
 import { shadowTick, watchTick } from "../src/sim/watch.js";
 import { installFakeMarket, POOL_FEE, setExtraRoutes, setPrice, tokens } from "./fake-market.js";
@@ -88,10 +89,11 @@ test("gemelo: abre los 3 eventos siguientes (sin el del agente), sigue su precio
   startMissionClock(m.id);
 
   // Mismo tamaño y misma toma de beneficio que el agente: todo el efectivo de Solana y el precio que deja el objetivo
-  // cumplido neto de costes (el resto de la cartera, el gas, sigue ahí).
+  // cumplido neto de costes (el resto de la cartera, el gas, sigue ahí: 0,01 SOL menos la red de la compra, la de la venta
+  // y la de convertirlo al cerrar, con su precio un 0,5 % más bajo).
   const run = runOf(m.id)!;
   assert.equal(run.size_usd, 48.5);
-  assert.ok(Math.abs(run.tp_usd - (62.5 * 1.003 - 1.5)) < 1e-9, String(run.tp_usd));
+  assert.ok(Math.abs(run.tp_usd - (62.5 * (1 + TP_TARGET_MARGIN) - (0.01 - 3 * 0.0001) * 150 * (1 - NATIVE_DRIFT_MARGIN))) < 1e-9, String(run.tp_usd));
   assert.equal(shadowsRunning(), true);
   // Cada gemelo se cotiza al ritmo de la orden del agente en una misión rápida (antes, cada 10 s: la mitad).
   assert.equal(SHADOW_TIMING.quoteEveryMs, config.fastWatchIntervalSeconds * 1000);

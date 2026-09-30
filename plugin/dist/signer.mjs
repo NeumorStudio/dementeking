@@ -7276,6 +7276,10 @@ var init_config = __esm({
       effort: process.env.EFFORT || "high",
       initialUsd: num("INITIAL_USD", 1e3),
       solanaTxFeeSol: num("SOLANA_TX_FEE_SOL", 1e-4),
+      // Misiones con costes realistas (create_mission con costs: "real"): la fee con prioridad que paga de verdad un swap de
+      // Solana en un memecoin recién graduado y lo que tarda la transacción desde que se cotiza hasta que entra en un bloque.
+      realSolanaTxFeeSol: num("REAL_SOLANA_TX_FEE_SOL", 75e-5),
+      latencyMs: num("LATENCY_MS", 2e3),
       binanceTakerFee: num("BINANCE_TAKER_FEE", 1e-3),
       // Comisión real de Binance por retirar USDC por la red Solana (septiembre de 2026).
       binanceUsdcWithdrawFee: num("BINANCE_USDC_WITHDRAW_FEE", 0.3),
@@ -7777,6 +7781,26 @@ var init_migrations = __esm({
         up: (db2) => {
           db2.exec("UPDATE missions SET class = 'libre' || substr(class, instr(class, '-')) WHERE mode = 'live' AND class IS NOT NULL AND class NOT LIKE 'libre-%'");
         }
+      },
+      {
+        version: 14,
+        description: "Costes realistas por misi\xF3n (cost_mode) y medidas de la entrada: cu\xE1ndo se pidi\xF3, la se\xF1al y la compra",
+        up: (db2) => db2.exec(`
+        -- 'sim' (los costes de siempre) | 'real' (fee con prioridad, renta sin devolver y latencia al ejecutar): las dos
+        -- series no se mezclan en las estad\xEDsticas por clase.
+        ALTER TABLE missions ADD COLUMN cost_mode TEXT NOT NULL DEFAULT 'sim';
+        -- Cu\xE1ndo se pidi\xF3 la misi\xF3n. No cambia nunca (created_at se reescribe al arrancar el reloj).
+        ALTER TABLE missions ADD COLUMN requested_at TEXT;
+        -- La \xFAltima se\xF1al de wait_for_signal antes de la entrada, y la primera compra de enter_with_exits.
+        ALTER TABLE missions ADD COLUMN signal_at TEXT;
+        ALTER TABLE missions ADD COLUMN signal_token TEXT;
+        ALTER TABLE missions ADD COLUMN entry_at TEXT;
+        ALTER TABLE missions ADD COLUMN entry_latency_s REAL;
+        -- Las que a\xFAn no han arrancado el reloj conservan su hora de creaci\xF3n; en las dem\xE1s ya no se sabe.
+        UPDATE missions SET requested_at = created_at WHERE started_at IS NULL;
+        -- Red y renta de cada gemelo con costes realistas, en USD (con los de siempre, 0: como hasta ahora).
+        ALTER TABLE shadow_positions ADD COLUMN costs_usd REAL NOT NULL DEFAULT 0;
+      `)
       }
     ];
     MAX_BACKUPS = 10;
@@ -7973,7 +7997,7 @@ var init_db = __esm({
       }
     }
     runMigrations(db, config.dataDir);
-    CODE_VERSION = "0.37.0";
+    CODE_VERSION = "0.37.1";
     semver = (v) => v.split(".").map((n3) => Number.parseInt(n3, 10) || 0);
     newer = (a, b) => {
       const [x, y] = [semver(a), semver(b)];
@@ -8078,7 +8102,7 @@ function fetchText(url, opts = {}) {
   const key = opts.body !== void 0 || opts.method === "POST" ? `${opts.method ?? "GET"} ${url} ${JSON.stringify(opts.body ?? null)}` : url;
   const nowMs = Date.now();
   const hit = cache.get(key);
-  if (hit && hit.expires > nowMs) return hit.value;
+  if (hit && hit.expires > nowMs && !opts.fresh) return hit.value;
   const value = request(url, { ...opts, timeoutMs: opts.timeoutMs ?? 15e3 });
   cache.set(key, { expires: nowMs + ttl, value });
   value.then(
@@ -8184,7 +8208,7 @@ async function getTokenInfo(mint) {
 }
 async function getQuote(inputMint, outputMint, amountBase, slippageBps, ttlMs = 2e3, opts = {}) {
   const url = `${BASE}/swap/v1/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountBase.toString()}&slippageBps=${slippageBps}`;
-  const quote2 = await fetchJson(url, { timeoutMs: 15e3, ttlMs, lowPriority: opts.lowPriority });
+  const quote2 = await fetchJson(url, { timeoutMs: 15e3, ttlMs, lowPriority: opts.lowPriority, fresh: opts.fresh });
   if (quote2.error) throw new Error(`Jupiter: ${quote2.error}`);
   return quote2;
 }
@@ -9038,9 +9062,10 @@ function settleSolanaSwap(q, w) {
   if (q.amountIn > inBalance + DUST2) {
     return { ok: false, error: `Saldo insuficiente: tienes ${inBalance} ${q.input.symbol} y quieres vender ${q.amountIn}`, deltas: [], costs: [] };
   }
-  const opensAccount = output !== SOL_MINT && w.balance(output) <= DUST2;
-  const closesAccount = input !== SOL_MINT && inBalance - q.amountIn <= DUST2;
-  const costs = [{ kind: "network_fee", asset: SOL_MINT, symbol: "SOL", amount: config.solanaTxFeeSol }];
+  const p = w.profile;
+  const opensAccount = output !== SOL_MINT && (p ? !p.hasAccount(output) : w.balance(output) <= DUST2);
+  const closesAccount = (p ? p.rentRefund : true) && input !== SOL_MINT && inBalance - q.amountIn <= DUST2;
+  const costs = [{ kind: "network_fee", asset: SOL_MINT, symbol: "SOL", amount: p ? p.networkFee : config.solanaTxFeeSol }];
   if (opensAccount) costs.push({ kind: "rent", asset: SOL_MINT, symbol: "SOL", amount: TOKEN_ACCOUNT_RENT_SOL });
   if (closesAccount) costs.push({ kind: "rent_refund", asset: SOL_MINT, symbol: "SOL", amount: -TOKEN_ACCOUNT_RENT_SOL });
   const solCost = costs.reduce((s, c) => s + c.amount, 0);
@@ -9163,9 +9188,9 @@ var init_solana = __esm({
         if (typeof price !== "number") throw new Error(`Jupiter no da precio para ${asset}`);
         return price;
       },
-      async quote({ input, output, amountIn, slippageBps }) {
+      async quote({ input, output, amountIn, slippageBps, fresh }) {
         if (input.address === output.address) throw new Error("El token de entrada y salida son el mismo");
-        const q = await getQuote(input.address, output.address, toBaseUnits(amountIn, input.decimals), slippageBps);
+        const q = await getQuote(input.address, output.address, toBaseUnits(amountIn, input.decimals), slippageBps, fresh ? 1 : void 0, { fresh });
         const out = fromBaseUnits(q.outAmount, output.decimals);
         return {
           chain: "solana",
@@ -9192,7 +9217,7 @@ var init_solana = __esm({
           }
         }
         try {
-          const q = await getQuote(h.asset, USDC_MINT, toBaseUnits(h.amount, h.decimals), 100, opts?.fresh ? 1 : 1e4);
+          const q = await getQuote(h.asset, USDC_MINT, toBaseUnits(h.amount, h.decimals), 100, opts?.fresh ? 1 : 1e4, opts?.fresh ? { fresh: true } : {});
           return { usd: fromBaseUnits(q.outAmount, 6), method: "liquidaci\xF3n Jupiter", reliable: true };
         } catch (err) {
           if (isNoRouteError(err)) return { usd: 0, method: "sin ruta de venta: ahora no se puede vender", reliable: true };
@@ -9462,6 +9487,15 @@ var init_baselines2 = __esm({
   }
 });
 
+// src/sim/costs.ts
+var init_costs = __esm({
+  "src/sim/costs.ts"() {
+    "use strict";
+    init_config();
+    init_db();
+  }
+});
+
 // src/sim/stats.ts
 var init_stats = __esm({
   "src/sim/stats.ts"() {
@@ -9475,6 +9509,7 @@ var init_class_stats = __esm({
     "use strict";
     init_db();
     init_baselines2();
+    init_costs();
     init_stats();
   }
 });
@@ -9519,6 +9554,8 @@ var init_portfolio = __esm({
     init_binance();
     init_http();
     init_jupiter();
+    init_costs();
+    init_mission_kind();
     init_positions();
     init_types();
     init_binance2();
@@ -9572,10 +9609,12 @@ var init_shadow = __esm({
     init_db();
     init_http();
     init_jupiter();
+    init_costs();
     init_mission_kind();
     init_plans();
     init_portfolio();
     init_signals();
+    init_solana();
     init_venues();
     SHADOW_TIMING = {
       quoteEveryMs: config.fastWatchIntervalSeconds * 1e3,
@@ -9597,6 +9636,7 @@ var init_mission = __esm({
     init_mission_kind();
     init_baselines2();
     init_class_stats();
+    init_costs();
     init_plans();
     init_portfolio();
     init_types();
@@ -33891,7 +33931,7 @@ Message: ${transactionMessage}.
       }
       return signature2;
     }
-    function sleep3(ms2) {
+    function sleep4(ms2) {
       return new Promise((resolve) => setTimeout(resolve, ms2));
     }
     function encodeData3(type, fields) {
@@ -34701,7 +34741,7 @@ Message: ${transactionMessage}.
           }));
           if (connection._rpcEndpoint.includes("solana.com")) {
             const REQUESTS_PER_SECOND = 4;
-            await sleep3(1e3 / REQUESTS_PER_SECOND);
+            await sleep4(1e3 / REQUESTS_PER_SECOND);
           }
           offset += chunkSize;
           array = array.slice(chunkSize);
@@ -35874,7 +35914,7 @@ Message: ${transactionMessage}.
               break;
             }
             console.error(`Server responded with ${res.status} ${res.statusText}.  Retrying after ${waitTime}ms delay...`);
-            await sleep3(waitTime);
+            await sleep4(waitTime);
             waitTime *= 2;
           }
           const text = await res.text();
@@ -36997,7 +37037,7 @@ Message: ${transactionMessage}.
             let currentBlockHeight = await checkBlockHeight();
             if (done) return;
             while (currentBlockHeight <= lastValidBlockHeight) {
-              await sleep3(1e3);
+              await sleep4(1e3);
               if (done) return;
               currentBlockHeight = await checkBlockHeight();
               if (done) return;
@@ -37069,7 +37109,7 @@ Message: ${transactionMessage}.
                 });
                 return;
               }
-              await sleep3(2e3);
+              await sleep4(2e3);
               if (done) return;
               currentNonceValue = await getCurrentNonceValue();
               if (done) return;
@@ -37097,7 +37137,7 @@ Message: ${transactionMessage}.
                 break;
               }
               if (status.context.slot < (outcome.slotInWhichNonceDidAdvance ?? minContextSlot)) {
-                await sleep3(400);
+                await sleep4(400);
                 continue;
               }
               signatureStatus = status;
@@ -38169,7 +38209,7 @@ Message: ${transactionMessage}.
       async _blockhashWithExpiryBlockHeight(disableCache) {
         if (!disableCache) {
           while (this._pollingBlockhash) {
-            await sleep3(100);
+            await sleep4(100);
           }
           const timeSinceFetch = Date.now() - this._blockhashInfo.lastFetch;
           const expired = timeSinceFetch >= BLOCKHASH_CACHE_TIMEOUT_MS;
@@ -38199,7 +38239,7 @@ Message: ${transactionMessage}.
               };
               return latestBlockhash;
             }
-            await sleep3(MS_PER_SLOT / 2);
+            await sleep4(MS_PER_SLOT / 2);
           }
           throw new Error(`Unable to obtain a new blockhash after ${Date.now() - startTime}ms`);
         } finally {
@@ -63655,7 +63695,7 @@ init_evm();
 init_chain();
 var PolicyError = class extends Error {
 };
-var sleep2 = (ms) => new Promise((r) => setTimeout(r, ms));
+var sleep3 = (ms) => new Promise((r) => setTimeout(r, ms));
 var TOKEN_PROGRAMS2 = ["TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"];
 async function sendSolana(accounts, txBase64, opts) {
   const tx = import_web32.VersionedTransaction.deserialize(Buffer.from(txBase64, "base64"));
@@ -63701,7 +63741,7 @@ async function sendSolana(accounts, txBase64, opts) {
       return st.err ? { hash: hash3, ok: false, error: `la transacci\xF3n fall\xF3 en la cadena: ${JSON.stringify(st.err)}` } : { hash: hash3, ok: true };
     }
     await conn.sendRawTransaction(raw, { skipPreflight: true, maxRetries: 0 }).catch(() => void 0);
-    await sleep2(2e3);
+    await sleep3(2e3);
   }
   return { hash: hash3, ok: false, error: "no se confirm\xF3 a tiempo (puede que no se haya incluido): revisa el explorador" };
 }

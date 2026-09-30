@@ -69,3 +69,10 @@ test("carril de baja prioridad: nunca hace cola delante de una petición normal,
   await Promise.all(queued);
   assert.ok(!order.includes("L2"), "no llegó a salir");
 });
+
+test("isTransientError: los 5xx son transitorios (se reintentan)", async () => {
+  const { isTransientError } = await import("../src/market/http.js");
+  assert.equal(isTransientError(new Error("HTTP 502 Bad Gateway")), true);
+  assert.equal(isTransientError(new Error("HTTP 500")), true);
+  assert.equal(isTransientError(new Error("HTTP 404")), false);
+});

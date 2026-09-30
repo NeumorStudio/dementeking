@@ -2,10 +2,13 @@
 // agente?". Para cada clase: cuántas misiones y cuántas conseguidas (con su intervalo de Wilson al 95 %), la suma de las
 // P que predijo el cerebro frente a los aciertos (calibración), la línea base de la tabla, los aciertos del gemelo
 // mecánico medidos en la misma franja, y la comparación misión a misión con el gemelo.
+// Las misiones con costes realistas (costs.ts) son otra serie: cada clase se agrupa también por su modo de costes, y las
+// dos nunca se mezclan (con fee con prioridad, renta sin devolver y latencia, la toma de beneficio queda más lejos).
 // Con menos de MIN_MISSIONS_FOR_VERDICT misiones por clase no se saca ninguna conclusión: 7 de 20 deja un intervalo
 // del 18 al 57 %, y con P = 35 % ver 3 aciertos seguidos en 50 misiones pasa el 78 % de las veces por puro azar.
 import { db } from "../db.js";
 import { baselineForClass } from "./baselines.js";
+import { asCostMode, type CostMode } from "./costs.js";
 import { wilson } from "./stats.js";
 
 /** Misiones por clase antes de sacar conclusiones (y de cambiar reglas): un bloque de plan. */
@@ -23,6 +26,7 @@ interface Row {
   shadow_hits: number | null;
   shadow_return: number | null;
   ended_at: string | null;
+  cost_mode: string | null;
 }
 
 const pct1 = (x: number) => Number((x * 100).toFixed(1));
@@ -99,23 +103,32 @@ export function missionComparison(
 }
 
 /**
- * Estadísticas por clase de las misiones jugadas hasta el final (conseguidas, por tiempo o en bancarrota; las
- * canceladas no cuentan). Con cls, solo esa clase. perMissionLimit recorta la lista misión a misión (las últimas).
+ * Estadísticas por clase y modo de costes de las misiones jugadas hasta el final (conseguidas, por tiempo o en
+ * bancarrota; las canceladas no cuentan). Con cls, solo esa clase; con costMode, solo ese modo. perMissionLimit recorta
+ * la lista misión a misión (las últimas).
  */
-export function classStats(opts: { cls?: string | null; perMissionLimit?: number } = {}) {
+export function classStats(opts: { cls?: string | null; costMode?: CostMode | null; perMissionLimit?: number } = {}) {
   const rows = db
     .prepare(
-      `SELECT id, class, status, initial_usd, final_usd, predicted_p, baseline_p, plan_id, shadow_hits, shadow_return, ended_at
+      `SELECT id, class, status, initial_usd, final_usd, predicted_p, baseline_p, plan_id, shadow_hits, shadow_return, ended_at, cost_mode
        FROM missions
        WHERE status IN ('succeeded', 'expired', 'bust') AND class IS NOT NULL AND started_at IS NOT NULL ${opts.cls ? "AND class = ?" : ""}
        ORDER BY id`,
     )
     .all(...(opts.cls ? [opts.cls] : [])) as unknown as Row[];
   const twins = twinCounts();
-  const groups = new Map<string, Row[]>();
-  for (const r of rows) groups.set(r.class, [...(groups.get(r.class) ?? []), r]);
+  // Una serie por clase y modo de costes: las de costes realistas no se mezclan con las de siempre.
+  const groups = new Map<string, { cls: string; costs: CostMode; ms: Row[] }>();
+  for (const r of rows) {
+    const costs = asCostMode(r.cost_mode);
+    if (opts.costMode && costs !== opts.costMode) continue;
+    const key = `${r.class}|${costs}`;
+    const g = groups.get(key) ?? { cls: r.class, costs, ms: [] };
+    g.ms.push(r);
+    groups.set(key, g);
+  }
 
-  return [...groups.entries()].map(([cls, ms]) => {
+  return [...groups.values()].map(({ cls, costs, ms }) => {
     const n = ms.length;
     const hits = ms.filter((m) => m.status === "succeeded").length;
     const agent = rate(hits, n);
@@ -158,6 +171,7 @@ export function classStats(opts: { cls?: string | null; perMissionLimit?: number
     const limit = opts.perMissionLimit ?? n;
     return {
       class: cls,
+      costs,
       missions: n,
       hits,
       hitRate: agent.text,

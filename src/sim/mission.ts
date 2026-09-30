@@ -5,8 +5,9 @@ import { db, logJournal, now } from "../db.js";
 import { isFastMission, missionClass, missionDurationMinutes, PREP_TIMEOUT_MINUTES } from "./mission-kind.js";
 import { baselineForClass } from "./baselines.js";
 import { missionComparison, twinCounts } from "./class-stats.js";
+import { describeCostMode, type CostMode } from "./costs.js";
 import { attachPlanForMission } from "./plans.js";
-import { liquidateAll, planPortfolio, resetPortfolio, validateAllocation, valuation } from "./portfolio.js";
+import { closingCostsUsd, liquidateAll, planPortfolio, resetPortfolio, validateAllocation, valuation } from "./portfolio.js";
 import { DEFAULT_ALLOCATION, type Allocation, type ChainId, type Holding } from "./types.js";
 import { settleTransfers } from "./transfers.js";
 import { startShadowRun } from "./shadow.js";
@@ -52,6 +53,16 @@ export interface Mission {
   shadow_return: number | null;
   /** Por qué terminó: 'target' | 'deadline' | 'bust' | 'loss_limit' | 'user' | 'replaced' | 'prep_timeout'. */
   end_reason: string | null;
+  /** Costes de la simulación (costs.ts): 'sim' (los de siempre) o 'real' (fee con prioridad, renta sin devolver y latencia). */
+  cost_mode: CostMode;
+  /** Cuándo se pidió la misión. No cambia nunca (created_at se reescribe al arrancar el reloj); null en las anteriores a v0.37.1. */
+  requested_at: string | null;
+  /** La última señal de wait_for_signal antes de la entrada: cuándo y qué token. */
+  signal_at: string | null;
+  signal_token: string | null;
+  /** La primera compra de enter_with_exits y los segundos desde la señal (null si compró otro token o no hubo señal). */
+  entry_at: string | null;
+  entry_latency_s: number | null;
 }
 
 export interface MissionLimits {
@@ -125,6 +136,8 @@ export function missionHistory() {
                 : "cancelada",
       reviewed: m.review_origin !== null || m.reviewed_at !== null,
       ...(m.class ? { missionClass: m.class } : {}),
+      // Las de costes realistas son otra serie: no se comparan con las de costes de siempre.
+      costs: m.cost_mode,
       ...(m.status !== "cancelled" && m.started_at ? compared(m) : {}),
     };
   });
@@ -138,16 +151,19 @@ function insertMission(args: {
   allocation: Allocation;
   holdings: Holding[];
   live?: { approval: "manual" | "auto"; limits: MissionLimits };
+  costMode?: CostMode;
 }): number {
-  // Una sola hora para las dos fechas: deadline − created_at es la duración exacta (mission-kind.ts).
+  // Una sola hora para las dos fechas: deadline − created_at es la duración exacta (mission-kind.ts). requested_at guarda
+  // la misma hora y no se toca al arrancar el reloj: la diferencia con started_at es lo que tardó en prepararse.
   const created = Date.now();
   const deadline = new Date(created + args.durationMinutes * 60_000).toISOString();
   const id = Number(
     db
       .prepare(
-        "INSERT INTO missions (created_at, initial_usd, target_usd, deadline, instructions, allocation, benchmark, mode, approval, limits, class) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO missions (created_at, requested_at, initial_usd, target_usd, deadline, instructions, allocation, benchmark, mode, approval, limits, class, cost_mode) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       )
       .run(
+        new Date(created).toISOString(),
         new Date(created).toISOString(),
         args.initialUsd,
         args.targetUsd,
@@ -159,6 +175,7 @@ function insertMission(args: {
         args.live?.approval ?? null,
         args.live ? JSON.stringify(args.live.limits) : null,
         missionClass({ durationMinutes: args.durationMinutes, initialUsd: args.initialUsd, targetUsd: args.targetUsd, live: !!args.live }),
+        args.costMode ?? "sim",
       ).lastInsertRowid,
   );
   // En una misión real, los saldos son los de la cadena (holdings es su espejo).
@@ -169,9 +186,53 @@ function insertMission(args: {
     kind: "mission",
     summary:
       `${args.live ? "Misión REAL" : "Misión"} #${id} iniciada: de ${args.initialUsd.toFixed(2)} USD a ${args.targetUsd.toFixed(2)} USD ` +
-      `en ${Number(args.durationMinutes.toFixed(1))} min (el reloj arranca cuando el agente empieza a trabajar; si no arranca en ${PREP_TIMEOUT_MINUTES} min, la misión se cancela)`,
+      `en ${Number(args.durationMinutes.toFixed(1))} min (el reloj arranca cuando el agente empieza a trabajar; si no arranca en ${PREP_TIMEOUT_MINUTES} min, la misión se cancela)` +
+      (args.costMode === "real" ? ". Costes realistas: fee con prioridad, renta de las cuentas sin devolver y latencia al ejecutar" : ""),
   });
   return id;
+}
+
+/**
+ * wait_for_signal ha devuelto un candidato: queda en la misión activa (la última señal antes de la primera compra), para
+ * medir cuánto se tarda en entrar desde que llega el evento.
+ */
+export function recordSignal(missionId: number, token: string) {
+  db.prepare("UPDATE missions SET signal_at = ?, signal_token = ? WHERE id = ? AND status = 'active' AND entry_at IS NULL").run(now(), token, missionId);
+}
+
+/**
+ * enter_with_exits ha comprado: la primera compra queda en la misión con los segundos desde la señal (solo si es el token
+ * de la señal; si compró otro, la latencia no se sabe).
+ */
+export function recordEntry(missionId: number, token: string) {
+  const m = getMission(missionId);
+  if (!m || m.entry_at) return;
+  const at = Date.now();
+  const latency = m.signal_at && m.signal_token === token ? Number(((at - Date.parse(m.signal_at)) / 1000).toFixed(1)) : null;
+  db.prepare("UPDATE missions SET entry_at = ?, entry_latency_s = ? WHERE id = ? AND entry_at IS NULL").run(new Date(at).toISOString(), latency, missionId);
+}
+
+/**
+ * Lo que tardó cada fase de la entrada: de pedir la misión a arrancar el reloj (preparación) y de la señal a la compra.
+ * Solo lo que se sabe (las misiones anteriores a v0.37.1 no guardaban cuándo se pidieron).
+ */
+export function missionMeasurement(m: Mission) {
+  // Sin reloj, hasta ahora si sigue preparándose, o hasta que se canceló (prep_timeout, sustituida o parada): medirla
+  // hasta ahora hacía crecer sin fin la de una cancelada.
+  const prepEnd = m.started_at ?? (m.status === "active" ? null : m.ended_at);
+  const prepMs = m.requested_at ? (prepEnd ? Date.parse(prepEnd) : Date.now()) - Date.parse(m.requested_at) : null;
+  const prepNote = m.started_at
+    ? undefined
+    : m.status === "active"
+      ? "el reloj aún no ha arrancado: minutos preparándose hasta ahora"
+      : "se canceló sin arrancar el reloj: minutos que estuvo preparándose";
+  const out = {
+    ...(prepMs !== null ? { prepMinutes: Number((prepMs / 60_000).toFixed(1)), ...(prepNote ? { prepNote } : {}) } : {}),
+    ...(m.signal_at ? { signalAt: m.signal_at, signalToken: m.signal_token } : {}),
+    ...(m.entry_at ? { entryAt: m.entry_at, entryLatencySeconds: m.entry_latency_s } : {}),
+    ...(m.entry_at && m.entry_latency_s === null ? { entryLatencyNote: m.signal_at ? "compró otro token que el de la señal" : "entró sin señal de wait_for_signal" } : {}),
+  };
+  return Object.keys(out).length ? out : undefined;
 }
 
 function validate(initialUsd: number, targetUsd: number, durationMinutes: number) {
@@ -186,6 +247,7 @@ export async function createMission(
   durationMinutes: number,
   instructions?: string,
   allocation: Allocation = DEFAULT_ALLOCATION,
+  opts: { costMode?: CostMode } = {},
 ): Promise<Mission> {
   validate(initialUsd, targetUsd, durationMinutes);
   const plan = validateAllocation(allocation);
@@ -201,7 +263,7 @@ export async function createMission(
   const holdings = planPortfolio(initialUsd, plan, prices);
   cancelActive();
   // Cada misión tiene su propia cartera, órdenes y notas: empieza de cero sin arrastrar nada de la anterior.
-  return getMission(insertMission({ initialUsd, targetUsd, durationMinutes, instructions, allocation: plan, holdings }))!;
+  return getMission(insertMission({ initialUsd, targetUsd, durationMinutes, instructions, allocation: plan, holdings, costMode: opts.costMode }))!;
 }
 
 function cancelActive() {
@@ -330,10 +392,13 @@ export async function missionStatus(missionId?: number) {
         // prep_timeout: se canceló sin arrancar el reloj (en una rápida, no llegó ningún candidato que pasara el plan).
         ...(mission.end_reason ? { endReason: mission.end_reason } : {}),
         ...(mission.class ? { missionClass: mission.class } : {}),
+        costs: mission.cost_mode,
+        ...(missionMeasurement(mission) ? { measurement: missionMeasurement(mission) } : {}),
         instructions: mission.instructions,
       },
     };
   }
+  const measurement = missionMeasurement(mission);
   const v = await valuation(mission.id);
   const left = leftText(minutesLeft(mission) * 60_000);
   const idle = idleCheck(mission, v, left.seconds);
@@ -364,6 +429,9 @@ export async function missionStatus(missionId?: number) {
         }),
     timeLeft: left.text,
     secondsLeft: left.seconds,
+    // Con costes realistas, cuáles (el executor los nota en la toma de beneficio y al ejecutar); si no, solo el modo.
+    ...(isLive(mission) ? {} : { costs: mission.cost_mode === "real" ? describeCostMode("real") : "sim" }),
+    ...(measurement ? { measurement } : {}),
     userInstructions: mission.instructions ?? "ninguna: modo libre",
     ...(isLive(mission)
       ? {
@@ -470,6 +538,21 @@ function cancelForPrepTimeout(mission: Mission): string[] {
   return [summary];
 }
 
+/**
+ * Lo mínimo que tiene que dar la venta de cada token al cerrar por objetivo (`<cadena>:<token>` → su estable): lo que vale
+ * ahora menos su parte del margen que queda sobre el objetivo. Si todos llegan, la misión se queda en el objetivo; uno que
+ * tras la latencia ya no llega no se vende (liquidateAll), y la misión sigue con su toma de beneficio.
+ */
+function saleFloors(v: Awaited<ReturnType<typeof valuation>>, headroomUsd: number): Map<string, number> {
+  const tokens = v.holdings.filter((h) => {
+    const chain = allChains().find((c) => c.id === h.venue);
+    return chain && h.usd > 0 && !chain.isCash(h.asset) && h.asset !== chain.native.address;
+  });
+  const total = tokens.reduce((s, h) => s + h.usd, 0);
+  const keep = total > 0 ? Math.max(0, 1 - Math.max(0, headroomUsd) / total) : 1;
+  return new Map(tokens.map((h) => [`${h.venue}:${h.asset}`, h.usd * keep]));
+}
+
 async function checkOne(mission: Mission): Promise<string[]> {
   // Antes del reloj no hay plazo que vencer ni operaciones que vigilar: solo el tope de preparación.
   if (!mission.started_at) {
@@ -484,15 +567,25 @@ async function checkOne(mission: Mission): Promise<string[]> {
   }
   const v = await valuation(mission.id);
   const value = v.totalUsd;
+  // En una simulada, el objetivo se mide con lo que quedaría al cerrar: la red de cada venta y la conversión del gas, con
+  // los costes de la misión y las mismas reglas que la toma de beneficio en el objetivo (mission-kind.ts). Con la
+  // valoración en bruto se adelantaba a esa orden: con costes realistas, ~0,29 $ antes, y la venta a mercado dejaba la
+  // misión por debajo. En una real el nativo no se vende: cuenta entero.
+  const atClose = (x: typeof v) => (isLive(mission) ? x.totalUsd : x.totalUsd - closingCostsUsd(mission.id, x.holdings, { sellTokens: true }));
+  let closeValue = atClose(v);
   // Con un valor de reserva (sin cotización real) no se da el objetivo por conseguido.
-  let reached = value >= mission.target_usd && v.reliable;
+  let reached = closeValue >= mission.target_usd && v.reliable;
+  let floors: Map<string, number> | undefined;
   // Antes de venderlo todo por haber llegado, se confirma con cotizaciones del momento: la valoración puede venir
   // de una cotización de hace unos segundos, y en un token que se mueve un 40 % por minuto ya no vale. En la M4 de
   // la v0.36.1 se dio por alcanzado con 57,46 $, la venta dio 47,46 y se llevó por delante la toma de beneficio.
   if (reached && remaining(mission.deadline).ms > 0 && !isLive(mission)) {
     const fresh = await valuation(mission.id, false, { fresh: true });
-    reached = fresh.totalUsd >= mission.target_usd && fresh.reliable;
+    closeValue = atClose(fresh);
+    reached = closeValue >= mission.target_usd && fresh.reliable;
     if (!reached) return [];
+    // Y la venta tampoco puede dejarla por debajo: si tras la latencia ya no llega, no se vende (sigue la toma de beneficio).
+    floors = saleFloors(fresh, closeValue - mission.target_usd);
   }
   // Misión real: al llegar a la pérdida máxima se para sola (se vende a estables y se cierra).
   const floor = lossFloor(mission);
@@ -502,52 +595,69 @@ async function checkOne(mission: Mission): Promise<string[]> {
   if (!expired && !reached && !lossHit && !bust) return [];
 
   // Reclamo atómico: solo un proceso cierra la misión.
-  const status = reached ? "succeeded" : bust ? "bust" : "expired";
   if (!db.prepare("UPDATE missions SET status = 'closing' WHERE id = ? AND status = 'active'").run(mission.id).changes) return [];
 
   const reason = reached
-    ? `Cierre automático: objetivo de la misión #${mission.id} alcanzado (${value.toFixed(2)} ≥ ${mission.target_usd} USD)`
+    ? `Cierre automático: objetivo de la misión #${mission.id} alcanzado (${closeValue.toFixed(2)} ≥ ${mission.target_usd} USD al cerrar)`
     : bust
       ? `Parada automática: la misión #${mission.id} se ha quedado sin fondos para operar (${value.toFixed(2)} USD)`
       : lossHit
         ? `Parada automática: la misión #${mission.id} ha llegado a la pérdida máxima (${value.toFixed(2)} < ${floor!.toFixed(2)} USD)`
         : `Cierre automático: se acabó el plazo de la misión #${mission.id}`;
-  db.prepare("UPDATE orders SET status = 'cancelled', closed_at = ? WHERE status = 'open' AND mission_id = ?").run(now(), mission.id);
+  // Las que se cancelan aquí vuelven a estar abiertas si al final la misión no se cierra (abajo).
+  const cancelledOrders = (
+    db.prepare("UPDATE orders SET status = 'cancelled', closed_at = ? WHERE status = 'open' AND mission_id = ? RETURNING id").all(now(), mission.id) as Array<{ id: number }>
+  ).map((o) => o.id);
   await settleTransfers({ missionId: mission.id, force: true });
   // Con el objetivo tocado, el nativo se vende solo si al final se cierra: si lo realizado se queda corto y la
   // misión sigue, sin él no habría gas para volver a operar (en la M1 de la v0.35 se quedó sin SOL así).
   const keepNative = reached && !expired && !isLive(mission);
-  const problems = await liquidateAll(mission.id, null, reason, { keepNative });
+  const problems = await liquidateAll(mission.id, null, reason, { keepNative, ...(floors ? { floors } : {}) });
   let final = await valuation(mission.id, true);
 
   // El objetivo se detecta con el valor de liquidación estimado, pero lo que cuenta es lo
   // realizado al vender: el efectivo en stablecoins. Si al cerrar se queda corto y aún hay tiempo,
   // la misión continúa y se reintenta. Lo que no se pudo vender (p. ej. un token sin ruta de venta,
   // que vale 0) no impide cerrarla si el efectivo ya llega al objetivo.
-  // En una misión real, el nativo no se vende (paga la red de las siguientes): cuenta como realizado.
+  // En una misión real, el nativo no se vende (paga la red de las siguientes): cuenta como realizado. En una simulada,
+  // el que falta por convertir cuenta como quedará (sin la red de esa venta y con su precio un 0,5 % más bajo): contarlo
+  // en bruto daba la misión por conseguida y la conversión la dejaba por debajo del objetivo.
   const natives = new Set(allChains().map((c) => `${c.id}:${c.native.address}`));
-  const realizedUsd = final.holdings
-    .filter((h) => h.valuedBy === "stable" || ((isLive(mission) || keepNative) && natives.has(`${h.venue}:${h.asset}`)))
-    .reduce((s, h) => s + h.usd, 0);
-  const closes = !(reached && !expired && realizedUsd < mission.target_usd);
+  const realized = (x: typeof final, nativeAtClose: boolean) =>
+    x.holdings.filter((h) => h.valuedBy === "stable" || natives.has(`${h.venue}:${h.asset}`)).reduce((s, h) => s + h.usd, 0) -
+    (nativeAtClose ? closingCostsUsd(mission.id, x.holdings, { sellTokens: false }) : 0);
+  const realizedUsd = isLive(mission) ? realized(final, false) : keepNative ? realized(final, true) : 0;
+  let closes = !(reached && !expired && realizedUsd < mission.target_usd);
   if (keepNative && closes) {
     problems.push(...(await liquidateAll(mission.id, null, reason, { nativeOnly: true })));
     final = await valuation(mission.id, true);
+    // Si aun así la conversión la deja por debajo, no se da por conseguida.
+    closes = realized(final, false) >= mission.target_usd - 1e-9;
   }
   if (!closes) {
     db.prepare("UPDATE missions SET status = 'active' WHERE id = ?").run(mission.id);
-    const summary = problems.length
-      ? `Misión #${mission.id}: objetivo alcanzado, pero no se pudo vender todo (${problems.join("; ")}). La misión continúa y se reintentará.`
-      : `Misión #${mission.id}: al cerrar posiciones el resultado realizado (${final.totalUsd.toFixed(2)} USD) quedó por debajo ` +
-        `del objetivo (${mission.target_usd} USD) por comisiones y slippage. La misión continúa.`;
-    logJournal({ missionId: mission.id, sessionId: null, kind: "mission", summary, details: { problems } });
+    // La toma de beneficio y las demás órdenes siguen como estaban: si no se llegó a vender el token, sigue esperando su
+    // precio (una que vende todo un token que ya no queda se cancela sola en la vuelta siguiente de checkOrders).
+    const reopen = db.prepare("UPDATE orders SET status = 'open', closed_at = NULL WHERE id = ? AND status = 'cancelled'");
+    const reopened = cancelledOrders.filter((id) => reopen.run(id).changes > 0);
+    const summary =
+      (problems.length
+        ? `Misión #${mission.id}: objetivo alcanzado, pero no se pudo vender todo (${problems.join("; ")}). La misión continúa y se reintentará.`
+        : `Misión #${mission.id}: al cerrar posiciones el resultado realizado (${final.totalUsd.toFixed(2)} USD) quedó por debajo ` +
+          `del objetivo (${mission.target_usd} USD) por comisiones y slippage. La misión continúa.`) +
+      (reopened.length ? ` Las órdenes abiertas siguen puestas (${reopened.map((id) => `#${id}`).join(", ")}).` : "");
+    logJournal({ missionId: mission.id, sessionId: null, kind: "mission", summary, details: { problems, reopenedOrders: reopened } });
     return [summary];
   }
 
-  const endReason = reached ? "target" : bust ? "bust" : lossHit ? "loss_limit" : "deadline";
+  // Conseguida solo si lo que queda llega al objetivo: al acabar el plazo se vende todo a mercado, y una venta peor que la
+  // valoración la deja en "terminada por tiempo" aunque la valoración llegara.
+  const succeeded = reached && final.totalUsd >= mission.target_usd - 1e-9;
+  const status = succeeded ? "succeeded" : bust ? "bust" : "expired";
+  const endReason = succeeded ? "target" : bust ? "bust" : lossHit ? "loss_limit" : "deadline";
   db.prepare("UPDATE missions SET status = ?, ended_at = ?, final_usd = ?, end_reason = ? WHERE id = ?").run(status, now(), final.totalUsd, endReason, mission.id);
   const summary =
-    `Misión #${mission.id} ${reached ? "CONSEGUIDA" : bust ? "SIN FONDOS (bancarrota)" : lossHit ? "PARADA POR PÉRDIDA MÁXIMA" : "TERMINADA POR TIEMPO"}: ${mission.initial_usd.toFixed(2)} → ${final.totalUsd.toFixed(2)} USD ` +
+    `Misión #${mission.id} ${succeeded ? "CONSEGUIDA" : bust ? "SIN FONDOS (bancarrota)" : lossHit ? "PARADA POR PÉRDIDA MÁXIMA" : "TERMINADA POR TIEMPO"}: ${mission.initial_usd.toFixed(2)} → ${final.totalUsd.toFixed(2)} USD ` +
     `(objetivo ${mission.target_usd} USD)`;
   logJournal({ missionId: mission.id, sessionId: null, kind: "mission", summary, details: { problems } });
   return [summary, ...problems.map((p) => `No se pudo liquidar: ${p}`)];

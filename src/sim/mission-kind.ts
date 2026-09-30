@@ -54,8 +54,65 @@ export function parseMissionClass(cls: string | null | undefined): { market: str
 }
 
 /**
- * Margen sobre el objetivo al calcular la toma de beneficio: cubre la red de la venta y lo que se mueva el precio del
- * nativo (el gas) mientras espera. La renta de la cuenta del token, que se recupera al venderlo todo, no se cuenta.
- * Lo usan enter_with_exits y el gemelo mecánico (shadow.ts), que tiene que poner la misma toma de beneficio.
+ * Colchón sobre el objetivo al calcular la toma de beneficio en el objetivo (takeProfitProceeds): el resto de costes (la
+ * red y la renta de la venta y convertir el gas a estable al cerrar) ya se descuenta aparte, así que esto cubre redondeos
+ * y lo que baje el precio del nativo mientras espera (ver takeProfitProceeds). Cada punto de más en la toma de beneficio
+ * resta aciertos. Lo usan enter_with_exits y el gemelo mecánico (shadow.ts), que tiene que poner la misma.
  */
-export const TP_TARGET_MARGIN = 0.003;
+export const TP_TARGET_MARGIN = 0.001;
+
+/**
+ * Descuento sobre el precio del nativo (el gas que queda en la cartera) al contarlo para el objetivo: lo que cuesta
+ * convertirlo al cerrar (la comisión del pool y la diferencia con el libro de Binance, con el que se valora). Lo aplican
+ * igual la toma de beneficio en el objetivo (restAtCloseUsd) y checkMission (portfolio.ts, closingCostsUsd), así que no
+ * cubre que el nativo baje mientras espera: eso lo cubre TP_TARGET_MARGIN (takeProfitProceeds).
+ */
+export const NATIVE_DRIFT_MARGIN = 0.005;
+
+/**
+ * Una toma de beneficio de tp_ratio que, al saltar, dejaría la cartera por debajo del objetivo pero a menos de esto (en
+ * fracción del objetivo) se sube a la del objetivo: saltar y perder la misión por céntimos es la peor forma de perderla
+ * (en la M3 de la v0.37.0 saltó en 60,91 $ con el gas en 1,46 $: 62,37 frente a 62,50). Más abajo es una decisión del
+ * plan (p. ej. salir antes y reentrar) y se respeta.
+ */
+export const TP_LIFT_BAND = 0.02;
+
+/** La parte de la cartera que no es el token, tal como queda tras venderlo y al cerrar la misión. */
+export interface RestAfterSale {
+  /** Estables y todo lo que no es el token ni el nativo de su cadena, valorado ahora. */
+  otherUsd: number;
+  /** Nativo que queda tras la venta de la toma de beneficio (ya pagada su red y, si toca, su renta). */
+  nativeAfterSale: number;
+  /** Nativo que no llega a convertirse al cerrar la misión: la red de esa última venta. */
+  closeFeeNative: number;
+  /** Precio de venta real del nativo ahora (USD por unidad). */
+  nativeUsd: number;
+}
+
+/**
+ * Lo que vale como mínimo el resto de la cartera cuando se cierra la misión: el nativo, sin la red de convertirlo y con
+ * su precio NATIVE_DRIFT_MARGIN más bajo. Es lo que se puede contar para llegar al objetivo.
+ */
+export const restAtCloseUsd = (r: RestAfterSale) => r.otherUsd + Math.max(0, r.nativeAfterSale - r.closeFeeNative) * r.nativeUsd * (1 - NATIVE_DRIFT_MARGIN);
+
+/**
+ * Lo que tiene que dar la venta de todo el token para que la cartera llegue al objetivo aunque el gas valga algo menos al
+ * cerrar: objetivo × (1 + TP_TARGET_MARGIN) − lo que valdrá como mínimo el resto. checkMission mide el objetivo con las
+ * mismas reglas (portfolio.ts, closingCostsUsd: la red de cada venta y el nativo convertido, con su precio
+ * NATIVE_DRIFT_MARGIN más bajo): al llenarse, lo que quedaría al cerrar es objetivo × (1 + TP_TARGET_MARGIN), y la misión
+ * se cierra conseguida, también tras convertir el gas (NATIVE_DRIFT_MARGIN cubre la comisión de convertirlo). Lo que
+ * aguanta que baje el nativo entre poner la orden y que se llene es TP_TARGET_MARGIN × objetivo / el gas que queda: en
+ * la misión por defecto (50 $ → 62,50 $, 1,5 $ de SOL), ~4 % con los costes de siempre y ~7 % con los realistas (queda
+ * menos gas). Si baja más, se llena y la misión no llega: no se da por conseguida.
+ */
+export const takeProfitProceeds = (targetUsd: number, rest: RestAfterSale) => targetUsd * (1 + TP_TARGET_MARGIN) - restAtCloseUsd(rest);
+
+/**
+ * La toma de beneficio de un tp_ratio, subida a la del objetivo si se queda corta por poco (TP_LIFT_BAND). Devuelve lo que
+ * dará la venta y, si se ha subido, lo que habría dejado la del ratio.
+ */
+export function liftTakeProfit(a: { ratioProceeds: number; targetUsd: number; rest: RestAfterSale }): { proceeds: number; liftedFromUsd?: number } {
+  const after = a.ratioProceeds + restAtCloseUsd(a.rest);
+  if (after < a.targetUsd && after >= a.targetUsd * (1 - TP_LIFT_BAND)) return { proceeds: takeProfitProceeds(a.targetUsd, a.rest), liftedFromUsd: after };
+  return { proceeds: a.ratioProceeds };
+}

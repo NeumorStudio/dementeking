@@ -11,6 +11,8 @@ import { PLAN_BLOCK_SIZE, activePlan, getPlan, markPlanForMission, planBlock, pl
 import { balance, valuation } from "../src/sim/portfolio.js";
 import { sessionBriefing } from "../src/sim/session.js";
 import { TP_TARGET_MARGIN } from "../src/sim/entry.js";
+import { NATIVE_DRIFT_MARGIN } from "../src/sim/mission-kind.js";
+import { config } from "../src/config.js";
 import { CLOCK_NOT_STARTED, runTool } from "../src/tools/index.js";
 import { installFakeMarket, MEME, POOL_FEE, setPrice, tokens } from "./fake-market.js";
 
@@ -175,8 +177,11 @@ test("enter_with_exits: arranca el reloj, compra con todo el efectivo y deja la 
   assert.equal(order.condition, "above");
   assert.equal(order.trigger_asset, MEME);
   assert.deepEqual(JSON.parse(order.action), { input: MEME, output: "USDC", amount: 0, sellAll: true, slippageBps: 300 });
-  const others = v.totalUsd - v.holdings.find((h) => h.asset === MEME)!.usd;
-  assert.ok(Math.abs(order.trigger_price * qty + others - 62.5 * (1 + TP_TARGET_MARGIN)) < 0.02, "precio del objetivo neto");
+  // El resto (solo el SOL: el USDC se ha gastado entero) tal como quedará al cerrar: menos la red de la venta y la de
+  // convertirlo a USDC, y con su precio un 0,5 % más bajo (la renta de la cuenta del USDC y la del token se compensan).
+  const gas = v.holdings.find((h) => h.asset === SOL_MINT)!;
+  const restAtClose = (gas.amount - 2 * config.solanaTxFeeSol) * (gas.usd / gas.amount) * (1 - NATIVE_DRIFT_MARGIN);
+  assert.ok(Math.abs(order.trigger_price * qty + restAtClose - 62.5 * (1 + TP_TARGET_MARGIN)) < 0.001, "precio del objetivo neto");
   assert.ok(out.takeProfit.tpRatio > 1.25 && out.takeProfit.tpRatio < 1.3, `ratio ${out.takeProfit.tpRatio}`);
 
   // Sube lo suficiente: salta la toma de beneficio y la misión se cierra conseguida.

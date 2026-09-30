@@ -17,7 +17,11 @@ const DUST = 1e-12;
 const SOL: TokenRef = { address: SOL_MINT, symbol: "SOL", decimals: 9 };
 const USDC: TokenRef = { address: USDC_MINT, symbol: "USDC", decimals: 6 };
 
-/** Reglas del monedero al ejecutar un swap: fee de red en SOL y renta de las cuentas de token. */
+/**
+ * Reglas del monedero al ejecutar un swap: fee de red en SOL y renta de las cuentas de token. Con los costes de siempre,
+ * la cuenta existe mientras tiene saldo: se abre (renta) al recibir un token y se cierra (se recupera) al vaciarla. Con
+ * costes realistas (w.profile): fee con prioridad, y la renta se paga al crear la cuenta y no vuelve al vender.
+ */
 export function settleSolanaSwap(q: SwapQuote, w: WalletView): Settlement {
   const input = q.input.address;
   const output = q.output.address;
@@ -25,9 +29,10 @@ export function settleSolanaSwap(q: SwapQuote, w: WalletView): Settlement {
   if (q.amountIn > inBalance + DUST) {
     return { ok: false, error: `Saldo insuficiente: tienes ${inBalance} ${q.input.symbol} y quieres vender ${q.amountIn}`, deltas: [], costs: [] };
   }
-  const opensAccount = output !== SOL_MINT && w.balance(output) <= DUST;
-  const closesAccount = input !== SOL_MINT && inBalance - q.amountIn <= DUST;
-  const costs: CostLine[] = [{ kind: "network_fee", asset: SOL_MINT, symbol: "SOL", amount: config.solanaTxFeeSol }];
+  const p = w.profile;
+  const opensAccount = output !== SOL_MINT && (p ? !p.hasAccount(output) : w.balance(output) <= DUST);
+  const closesAccount = (p ? p.rentRefund : true) && input !== SOL_MINT && inBalance - q.amountIn <= DUST;
+  const costs: CostLine[] = [{ kind: "network_fee", asset: SOL_MINT, symbol: "SOL", amount: p ? p.networkFee : config.solanaTxFeeSol }];
   if (opensAccount) costs.push({ kind: "rent", asset: SOL_MINT, symbol: "SOL", amount: TOKEN_ACCOUNT_RENT_SOL });
   if (closesAccount) costs.push({ kind: "rent_refund", asset: SOL_MINT, symbol: "SOL", amount: -TOKEN_ACCOUNT_RENT_SOL });
   const solCost = costs.reduce((s, c) => s + c.amount, 0);
@@ -154,9 +159,9 @@ export const solana: ChainAdapter = {
     return price;
   },
 
-  async quote({ input, output, amountIn, slippageBps }) {
+  async quote({ input, output, amountIn, slippageBps, fresh }) {
     if (input.address === output.address) throw new Error("El token de entrada y salida son el mismo");
-    const q = await getQuote(input.address, output.address, toBaseUnits(amountIn, input.decimals), slippageBps);
+    const q = await getQuote(input.address, output.address, toBaseUnits(amountIn, input.decimals), slippageBps, fresh ? 1 : undefined, { fresh });
     const out = fromBaseUnits(q.outAmount, output.decimals);
     return {
       chain: "solana",
@@ -189,8 +194,9 @@ export const solana: ChainAdapter = {
     try {
       // Valor de liquidación: cuánto USDC darían hoy vendiéndolo todo.
       // Caché de 10 s: el panel, el tick de la misión y las herramientas valoran lo mismo varias veces seguidas.
-      // Con `fresh` (antes de dar por alcanzado el objetivo), la cotización del momento.
-      const q = await getQuote(h.asset, USDC_MINT, toBaseUnits(h.amount, h.decimals), 100, opts?.fresh ? 1 : 10_000);
+      // Con `fresh` (antes de dar por alcanzado el objetivo), la cotización del momento: sin la caché, que si no devolvía
+      // la de la valoración de hace un instante (una ttl corta solo acorta la de la respuesta nueva).
+      const q = await getQuote(h.asset, USDC_MINT, toBaseUnits(h.amount, h.decimals), 100, opts?.fresh ? 1 : 10_000, opts?.fresh ? { fresh: true } : {});
       return { usd: fromBaseUnits(q.outAmount, 6), method: "liquidación Jupiter", reliable: true };
     } catch (err) {
       // Sin ruta de venta: no se puede cobrar, así que vale 0 (si vuelve a haber ruta, volverá a valer).

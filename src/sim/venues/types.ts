@@ -62,6 +62,21 @@ export interface WalletView {
   balance(asset: string): number;
   /** Cadenas EVM: si el monedero ya aprobó al router para gastar este token. */
   approved?(asset: string): boolean;
+  /**
+   * Costes de la misión cuando no son los de la simulación de siempre (misiones con costes realistas, costs.ts). Sin
+   * esto, cada cadena aplica los suyos por defecto.
+   */
+  profile?: CostProfile;
+}
+
+/** Costes realistas de un monedero de Solana (costs.ts): fee con prioridad y renta que no se recupera. */
+export interface CostProfile {
+  /** Fee de red de cada transacción, en el nativo. */
+  networkFee: number;
+  /** Si al vaciar una cuenta de token se recupera su renta. */
+  rentRefund: boolean;
+  /** Si la cuenta del token ya existe (aunque esté a cero): recibirlo no paga renta. */
+  hasAccount(asset: string): boolean;
 }
 
 export type Settlement =
@@ -105,7 +120,8 @@ export interface ChainAdapter extends VenueBase {
   resolveToken(ref: string): Promise<TokenRef>;
   /** Precio en USD de varios tokens (los que no tengan precio no aparecen). */
   priceUsd(assets: string[]): Promise<Record<string, number>>;
-  quote(p: { input: TokenRef; output: TokenRef; amountIn: number; slippageBps: number }): Promise<SwapQuote>;
+  /** Con `fresh`, sin reutilizar una cotización idéntica de hace un momento (la que se pide tras la latencia). */
+  quote(p: { input: TokenRef; output: TokenRef; amountIn: number; slippageBps: number; fresh?: boolean }): Promise<SwapQuote>;
   settle(q: SwapQuote, wallet: WalletView): Settlement;
   entryFeatures(asset: string): Promise<Features>;
   research: {

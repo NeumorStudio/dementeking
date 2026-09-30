@@ -43,7 +43,7 @@ Primero, una llamada a AskUserQuestion con una sola pregunta, **¿Rápida (5-15 
 
    El usuario puede escribir otro valor con "Other". Un plazo de más de 15 minutos ya no es una misión rápida: díselo y pregunta solo si prefiere un plazo de 15 min o menos o una misión normal (entonces, paso 3N). Si el capital o el objetivo no son positivos, vuelve a preguntar solo eso.
 3. Dile en una línea la P de lo que ha elegido y qué significa, con la cifra de `strategy_fit` para ese plazo y ese objetivo. Por ejemplo: "10 min y +25 %: P ≈35 % en los datos medidos (1 de cada 3). Ninguna misión rápida gana dinero de media: el valor esperado es negativo en todas". Con ×2 a 10 min: "≈9 %, 1 de cada 11". No vuelvas a preguntar: decide el usuario.
-4. Crea la misión con `create_mission`: `capital_usd`, `target_pct`, `duration_minutes`, `allocation` `{"solana": 100}` (con el reparto por defecto solo quedarían unos 15 $ en Solana y la compra única sería imposible) y `replace: true` si sustituye a otra. Sin `instructions`: las reglas están en el plan.
+4. Crea la misión con `create_mission`: `capital_usd`, `target_pct`, `duration_minutes`, `allocation` `{"solana": 100}` (con el reparto por defecto solo quedarían unos 15 $ en Solana y la compra única sería imposible) y `replace: true` si sustituye a otra. Sin `instructions`: las reglas están en el plan. Opcional, solo si el usuario pide costes realistas: `costs: "real"` (fee con prioridad de 0,00075 SOL, la renta de la cuenta del token no vuelve y 2 s de latencia entre cotizar y ejecutar, también para su gemelo); sus estadísticas van en una serie aparte.
 
 ### 3N. Misión normal
 

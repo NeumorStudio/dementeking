@@ -6,10 +6,12 @@ import { db, logJournal, now } from "../db.js";
 import * as market from "../market/binance.js";
 import { fetchJson, isTransientError } from "../market/http.js";
 import { SOL_MINT, USDC_MINT } from "../market/jupiter.js";
+import { costModeOf, latencyMs, sleep, solanaCostProfile, solanaTxFee } from "./costs.js";
+import { NATIVE_DRIFT_MARGIN } from "./mission-kind.js";
 import { recordTrade } from "./positions.js";
 import { VENUES, type Allocation, type ChainId, type Holding, type TradeMeta, type VenueId } from "./types.js";
 import { fillMarketOrder } from "./venues/binance.js";
-import { allChains, binance, getChain, getVenue, type CostLine, type Delta } from "./venues/index.js";
+import { allChains, binance, getChain, getVenue, type ChainAdapter, type CostLine, type Delta, type WalletView } from "./venues/index.js";
 
 export type Venue = VenueId;
 export type { Holding };
@@ -60,6 +62,20 @@ function applyAtomically(fn: () => void) {
     db.exec("RELEASE apply");
     throw err;
   }
+}
+
+/** El monedero de la misión en una cadena tal como lo ve settle: saldos, approvals y, con costes realistas, su perfil. */
+export function walletView(missionId: number, chainId: ChainId): WalletView {
+  return {
+    balance: (asset) => balance(missionId, chainId, asset),
+    approved: (asset) => Boolean(db.prepare("SELECT 1 FROM evm_approvals WHERE mission_id = ? AND chain = ? AND token = ?").get(missionId, chainId, asset)),
+    ...(chainId === "solana" ? { profile: solanaCostProfile(missionId) } : {}),
+  };
+}
+
+/** Nativo que se deja sin vender al liquidar: lo que cuesta esa última transacción (en Solana, según los costes de la misión). */
+export function liquidationReserve(missionId: number, chain: ChainAdapter): number {
+  return chain.id === "solana" ? solanaTxFee(costModeOf(missionId)) : chain.liquidationReserve;
 }
 
 /** Aplica cambios de saldo en un sitio de forma atómica (falla si alguno deja un saldo negativo). */
@@ -143,6 +159,22 @@ async function withRetries<T>(fn: () => Promise<T>, attempts = 4, waitMs = LIQUI
 const LIQUIDATION_RETRY_MS = Number(process.env.LIQUIDATION_RETRY_MS ?? 20_000);
 
 /**
+ * Con costes realistas, una venta a mercado que revierte (el precio se movió más que su slippage durante la latencia) se
+ * reenvía al momento, como se haría en la cadena; cada intento paga su red. Con los de siempre no hay latencia. Lo usan el
+ * cierre (liquidateAll) y las órdenes que ejecutan a mercado (stops y órdenes por tiempo, orders.ts).
+ */
+export async function resending<T>(missionId: number, fn: () => Promise<T>, attempts = 3): Promise<T> {
+  if (costModeOf(missionId) !== "real") return fn();
+  for (let i = 1; ; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (i >= attempts || !String((err as Error)?.message).startsWith("El swap revierte")) throw err;
+    }
+  }
+}
+
+/**
  * Vende todo a estables. Con `nativeOnly`, solo el nativo que quede (segundo paso de un cierre por objetivo);
  * con `keepNative`, todo menos el nativo (primer paso: si al final no se cierra, sigue habiendo gas).
  */
@@ -150,7 +182,15 @@ export async function liquidateAll(
   missionId: number,
   sessionId: number | null,
   reasoning: string,
-  opts: { keepNative?: boolean; nativeOnly?: boolean } = {},
+  opts: {
+    keepNative?: boolean;
+    nativeOnly?: boolean;
+    /**
+     * Lo mínimo que tiene que dar la venta de cada token (`<cadena>:<token>` → su estable): el cierre por objetivo, para
+     * que la venta no deje la misión por debajo. Si no llega (tampoco tras la latencia), no se vende ni se paga nada.
+     */
+    floors?: Map<string, number>;
+  } = {},
 ): Promise<string[]> {
   // Primero los futuros: su margen vuelve como efectivo a su cadena.
   const { closeAllPerps } = await import("./perps.js");
@@ -161,18 +201,24 @@ export async function liquidateAll(
   for (const chain of allChains()) {
     const tokens = opts.nativeOnly ? [] : holdings.filter((h) => h.venue === chain.id && !chain.isCash(h.asset) && h.asset !== chain.native.address);
     for (const h of tokens) {
-      await withRetries(() => swap({ missionId, sessionId, chain: chain.id, input: h.asset, output: chain.cash.address, sellAll: true, slippageBps: 300, reasoning, meta })).catch(
-        (err) => problems.push(`${h.symbol} (${chain.label}): ${(err as Error).message}`),
-      );
+      const floor = opts.floors?.get(`${chain.id}:${h.asset}`);
+      const sell = () =>
+        swap({ missionId, sessionId, chain: chain.id, input: h.asset, output: chain.cash.address, sellAll: true, slippageBps: 300, reasoning, meta, ...(floor !== undefined ? { minOut: floor } : {}) });
+      // Con mínimo (el cierre por objetivo), un fallo no se reintenta aquí: la misión sigue con sus órdenes y se vuelve a
+      // comprobar en la vuelta siguiente, en vez de quedarse cerrándose (y sin toma de beneficio) mientras espera.
+      await (floor !== undefined ? sell() : withRetries(() => resending(missionId, sell))).catch((err) => problems.push(`${h.symbol} (${chain.label}): ${(err as Error).message}`));
     }
     // El nativo se vende al final, dejando lo necesario para la fee de esa última transacción.
     // Con dinero real no se vende: hace falta para pagar la red en las siguientes misiones.
-    const nativeLeft = balance(missionId, chain.id, chain.native.address) - chain.liquidationReserve;
+    const nativeLeft = balance(missionId, chain.id, chain.native.address) - liquidationReserve(missionId, chain);
     if (nativeLeft > 0.000001 && !isLiveMission(missionId) && !opts.keepNative) {
-      const amount = Number(nativeLeft.toFixed(chain.native.decimals));
-      await withRetries(() => swap({ missionId, sessionId, chain: chain.id, input: chain.native.address, output: chain.cash.address, amount, slippageBps: 100, reasoning, meta })).catch(
-        (err) => problems.push(`${chain.native.symbol} (${chain.label}): ${(err as Error).message}`),
-      );
+      // La cantidad se calcula en cada intento: uno que revierte ya ha pagado su red.
+      const sell = () => {
+        const left = balance(missionId, chain.id, chain.native.address) - liquidationReserve(missionId, chain);
+        const amount = Number(left.toFixed(chain.native.decimals));
+        return swap({ missionId, sessionId, chain: chain.id, input: chain.native.address, output: chain.cash.address, amount, slippageBps: 100, reasoning, meta });
+      };
+      await withRetries(() => resending(missionId, sell)).catch((err) => problems.push(`${chain.native.symbol} (${chain.label}): ${(err as Error).message}`));
     }
   }
 
@@ -200,14 +246,67 @@ export async function liquidateAll(
   return problems;
 }
 
+/** Una línea de la valoración (valuation().holdings). */
+type ValuedLine = { venue: string; asset: string; symbol: string; amount: number; usd: number };
+
+/**
+ * Lo que la valoración de una misión simulada cuenta de más frente a lo que quedará al cerrarla, con las mismas reglas
+ * que la toma de beneficio en el objetivo (mission-kind.ts, restAtCloseUsd): cada token se vende pagando su red (en
+ * Solana, liquidado en seco con las reglas del monedero y los costes de la misión: la renta que se abre o vuelve) y el
+ * nativo que queda se convierte dejando la red de esa última venta, con su precio NATIVE_DRIFT_MARGIN más bajo. Con los
+ * costes de siempre puede salir negativo: vender todo el token devuelve la renta de su cuenta. Con `sellTokens: false`,
+ * solo la conversión del nativo (los tokens ya se han vendido).
+ */
+export function closingCostsUsd(missionId: number, holdings: ValuedLine[], opts: { sellTokens: boolean }): number {
+  let cost = 0;
+  for (const chain of allChains()) {
+    const nativeLine = holdings.find((h) => h.venue === chain.id && h.asset === chain.native.address);
+    if (!nativeLine || !(nativeLine.amount > 0)) continue;
+    const price = nativeLine.usd / nativeLine.amount;
+    let native = nativeLine.amount;
+    if (opts.sellTokens) {
+      // Los que valen algo: uno sin ruta de venta no se llega a enviar (no paga nada).
+      const tokens = holdings.filter((h) => h.venue === chain.id && h.usd > 0 && !chain.isCash(h.asset) && h.asset !== chain.native.address);
+      if (chain.id === "solana") {
+        const bal = new Map(holdings.filter((h) => h.venue === chain.id).map((h) => [h.asset, h.amount]));
+        const w: WalletView = { ...walletView(missionId, chain.id), balance: (a) => bal.get(a) ?? 0 };
+        for (const t of tokens) {
+          const input = { address: t.asset, symbol: t.symbol, decimals: 0 };
+          const s = chain.settle({ chain: chain.id, input, output: chain.cash, amountIn: t.amount, grossOut: t.usd, amountOut: t.usd, route: [], slippageBps: 300, warnings: [] }, w);
+          if (s.ok) for (const d of s.deltas) bal.set(d.asset, (bal.get(d.asset) ?? 0) + d.amount);
+        }
+        native = bal.get(chain.native.address) ?? 0;
+      } else {
+        // En las EVM, el gas de cada venta depende de la ruta: se cuenta como el de una transacción (como entry.ts).
+        native -= tokens.length * chain.liquidationReserve;
+      }
+    }
+    cost += nativeLine.usd - Math.max(0, native - liquidationReserve(missionId, chain)) * price * (1 - NATIVE_DRIFT_MARGIN);
+  }
+  return cost;
+}
+
 // ─── Swaps en cadenas (agregadores de DEX) ──────────────────────────────────
 
 const describeCosts = (costs: CostLine[]) => costs.map((c) => `${c.kind}: ${Number(c.amount.toPrecision(6))} ${c.symbol}`);
 
-/** Una orden límite no se llena: el precio de ese momento no llega al fijado (no se ha enviado nada). */
-export class LimitNotReached extends Error {
+/** Una orden límite que no se llena: no se ha enviado nada y sigue abierta (orders.ts). */
+export class LimitNotFilled extends Error {}
+
+/** El precio de ese momento no llega al fijado. */
+export class LimitNotReached extends LimitNotFilled {
   constructor(readonly got: number, readonly min: number) {
     super(`El precio no llega al límite: saldrían ${got}, el límite pide ${min}`);
+  }
+}
+
+/**
+ * No hay cotización con la que comprobar el límite (Jupiter falla, tarda o no da ruta): como una orden límite real, que
+ * solo se ejecuta si llega, no se envía nada. El gemelo mecánico hace lo mismo (shadow.ts).
+ */
+export class LimitUnquoted extends LimitNotFilled {
+  constructor(err: unknown) {
+    super(`sin cotización para comprobar el límite (${String((err as Error)?.message ?? err).slice(0, 160)})`);
   }
 }
 
@@ -249,16 +348,27 @@ export async function swap(args: {
   if (!(amount > 0)) throw new Error(args.sellAll ? `No tienes ${input.symbol} en ${chain.label}` : "La cantidad debe ser positiva (o usa sell_all)");
   if (amount > have + DUST) throw new Error(`Saldo insuficiente: tienes ${have} ${input.symbol} y quieres vender ${amount}`);
 
-  let quote = await chain.quote({ input, output, amountIn: amount, slippageBps: args.slippageBps });
+  // Con un límite (minOut), una cotización que falla es una orden que no se llena: no se ha enviado nada (LimitUnquoted).
+  const limitQuote = <T>(q: Promise<T>) => (args.minOut === undefined ? q : q.catch((err): never => { throw new LimitUnquoted(err); }));
+  let quote = await limitQuote(chain.quote({ input, output, amountIn: amount, slippageBps: args.slippageBps }));
   if (args.minOut !== undefined && quote.amountOut < args.minOut) throw new LimitNotReached(quote.amountOut, args.minOut);
+  // Costes realistas (costs.ts): la transacción no entra en el bloque al momento. Se decide con esta cotización, pasa la
+  // latencia y se ejecuta a la de entonces: un swap a mercado, dentro de su slippage respecto a la primera (si no,
+  // revierte más abajo); una toma de beneficio, solo si la nueva sigue llegando al límite (si no, o si esa cotización
+  // falla, sigue abierta).
+  let decided: { amountIn: number; amountOut: number; at: number } | undefined;
+  const latency = chain.id === "solana" ? latencyMs(costModeOf(m)) : 0;
+  if (latency > 0) {
+    decided = { amountIn: amount, amountOut: quote.amountOut, at: Date.now() };
+    await sleep(latency);
+    quote = await limitQuote(chain.quote({ input, output, amountIn: amount, slippageBps: args.slippageBps, fresh: true }));
+    if (args.minOut !== undefined && quote.amountOut < args.minOut) throw new LimitNotReached(quote.amountOut, args.minOut);
+  }
   if (args.fillAtLimit && args.minOut !== undefined && quote.amountOut > args.minOut) {
     const f = args.minOut / quote.amountOut;
     quote = { ...quote, amountOut: args.minOut, grossOut: quote.grossOut * f };
   }
-  const settled = chain.settle(quote, {
-    balance: (asset) => balance(m, chain.id, asset),
-    approved: (asset) => Boolean(db.prepare("SELECT 1 FROM evm_approvals WHERE mission_id = ? AND chain = ? AND token = ?").get(m, chain.id, asset)),
-  });
+  const settled = chain.settle(quote, walletView(m, chain.id));
   // Un approve enviado queda hecho aunque el swap después revierta.
   for (const token of settled.approvals ?? []) {
     db.prepare("INSERT OR IGNORE INTO evm_approvals (mission_id, chain, token, approved_at) VALUES (?, ?, ?, ?)").run(m, chain.id, token, now());
@@ -281,10 +391,14 @@ export async function swap(args: {
 
   // Como al firmar la cotización que viste: si hace poco cotizaste este mismo swap, la ejecución no puede
   // salir peor que esa cotización menos tu slippage. Si sale peor, la transacción revierte y pagas la red.
+  // Con costes realistas y sin cotización previa tuya, la referencia es la cotización con la que se decidió antes de la
+  // latencia (una toma de beneficio no: la protege su límite).
   const key = quoteKey(m, chain.id, input.address, output.address);
-  const ref = lastQuotes.get(key);
+  const stored = lastQuotes.get(key);
   lastQuotes.delete(key);
-  if (ref && Date.now() - ref.at <= QUOTE_TTL_MS && Math.abs(amount - ref.amountIn) <= ref.amountIn * 0.02) {
+  const quoted = stored && Date.now() - stored.at <= QUOTE_TTL_MS && Math.abs(amount - stored.amountIn) <= stored.amountIn * 0.02 ? stored : undefined;
+  const ref = quoted ?? (args.minOut === undefined ? decided : undefined);
+  if (ref) {
     const expected = ref.amountOut * (amount / ref.amountIn);
     const minOut = expected * (1 - args.slippageBps / 10_000);
     if (quote.amountOut < minOut) {
@@ -292,7 +406,7 @@ export async function swap(args: {
       if (burned > 0) applyDeltas(m, chain.id, [{ asset: chain.native.address, symbol: chain.native.symbol, decimals: chain.native.decimals, amount: -burned }]);
       const worse = (1 - quote.amountOut / expected) * 100;
       const error =
-        `El swap revierte: el precio se ha movido más que tu slippage. Cotizaste ${Number(expected.toPrecision(6))} ${output.symbol} y ahora ` +
+        `El swap revierte: el precio se ha movido más que tu slippage. ${quoted ? "Cotizaste" : `Al decidir (antes de ${latency / 1000} s de latencia) salían`} ${Number(expected.toPrecision(6))} ${output.symbol} y ahora ` +
         `saldrían ${Number(quote.amountOut.toPrecision(6))} (${worse.toFixed(1)} % menos; tu límite era ${args.slippageBps / 100} %). ` +
         `Has pagado la red (${Number(burned.toPrecision(3))} ${chain.native.symbol}).`;
       logJournal({ missionId: m, sessionId: args.sessionId, kind: "failed_tx", summary: `Swap fallido en ${chain.label}: slippage superado (${worse.toFixed(1)} % peor que tu cotización)`, reasoning: args.reasoning });
@@ -311,6 +425,8 @@ export async function swap(args: {
     costs: describeCosts(settled.costs),
     ...settled.info,
     ...(quote.warnings.length ? { warnings: quote.warnings } : {}),
+    // Costes realistas: lo que daba la cotización con la que se decidió y lo que dio tras la latencia.
+    ...(decided ? { latency: { ms: latency, quotedOut: decided.amountOut, filledOut: quote.amountOut } } : {}),
   };
   logJournal({
     missionId: m,

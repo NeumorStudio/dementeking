@@ -664,6 +664,8 @@ export const SIM_TOOLS = [
         return summary + (r.stopped ? "" : " Vuelve a llamar a wait_for_signal (con exclude si has descartado alguno a mano).");
       }
       positions.logResearch(ctx.missionId, "wait_for_signal", r.candidate.token);
+      // La hora de la señal queda en la misión: con la de la compra (enter_with_exits), cuánto se tarda en entrar.
+      if (active) mission.recordSignal(active.id, r.candidate.token);
       return toText({
         signal: `${r.candidate.symbol ?? r.candidate.token} pasa los filtros${plan ? ` del plan #${plan.id}` : ""}`,
         ...r.candidate,
@@ -729,7 +731,9 @@ export const SIM_TOOLS = [
       `Necesitas el token nativo de la cadena para pagar la red. input/output: dirección del token o un alias (${TOKEN_ALIASES}). ` +
       "Indica amount (cantidad del token de entrada) o sell_all para vender todo tu saldo de ese token. " +
       "slippage_bps protege la cotización que acabas de ver: si cotizaste este mismo swap con quote_swap hace menos de 60 s y el precio se ha movido " +
-      "más que tu slippage, el swap revierte (pagas solo la red). Sin cotización previa, se ejecuta al precio del momento.",
+      "más que tu slippage, el swap revierte (pagas solo la red). Sin cotización previa, se ejecuta al precio del momento. " +
+      "Con costes realistas (mission_status.costs empieza por \"real\"), en Solana siempre se vuelve a cotizar tras la latencia: sin quote_swap previo, " +
+      "el slippage se mide contra la cotización con la que se decidió y, si ha empeorado más, revierte y pagas la red. En memecoins usa ~300 bps (con 50 revierte a menudo).",
     schema: z.object({
       chain: chainParam,
       input: z.string(),

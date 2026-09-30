@@ -13,6 +13,7 @@ import { db, holdsTickLease, supersededBy } from "./db.js";
 import { keepAwake } from "./keep-awake.js";
 import { endSession, sessionBriefing, startSession } from "./sim/session.js";
 import { DEFAULT_ALLOCATION, VENUES } from "./sim/types.js";
+import { COST_MODES } from "./sim/costs.js";
 import { statusReport } from "./sim/status.js";
 import { SIM_TOOLS, runTool } from "./tools/index.js";
 import { startWatchLoop } from "./sim/watch.js";
@@ -123,6 +124,13 @@ server.registerTool(
       approval: z.enum(["manual", "auto"]).optional().describe("Solo live: manual = el usuario aprueba cada operación; auto = dentro de los límites"),
       max_trade_usd: z.number().positive().optional().describe("Solo live: máximo en USD por operación"),
       max_loss_pct: z.number().positive().max(100).optional().describe("Solo live: pérdida máxima de la misión en %; por debajo, solo se puede vender a estables"),
+      costs: z
+        .enum(COST_MODES)
+        .default("sim")
+        .describe(
+          "Solo sim: 'sim' (por defecto, los costes de siempre) o 'real': en los swaps de Solana (también los de su gemelo), fee con prioridad de " +
+            "0,00075 SOL, la renta de cada cuenta de token nueva no vuelve al venderlo y 2 s de latencia entre cotizar y ejecutar. Sus estadísticas van aparte",
+        ),
       replace: z.boolean().default(false).describe("Cancelar la misión activa si la hay"),
       instructions: z.string().optional().describe("Instrucciones del usuario para esta misión. Vacío = modo libre"),
       allocation: z
@@ -131,7 +139,7 @@ server.registerTool(
         .describe(`Reparto del capital en porcentaje por cadena o exchange (suma 100). Por defecto: ${JSON.stringify(DEFAULT_ALLOCATION)}`),
     },
   },
-  async ({ mode, capital_usd, target_usd, target_pct, duration_minutes, approval, max_trade_usd, max_loss_pct, replace, instructions, allocation }) => {
+  async ({ mode, capital_usd, target_usd, target_pct, duration_minutes, approval, max_trade_usd, max_loss_pct, costs, replace, instructions, allocation }) => {
     const active = getActiveMission();
     if (active && !replace) {
       return {
@@ -142,6 +150,7 @@ server.registerTool(
     try {
       if (mode === "live") {
         if (!target_pct || !approval || !max_trade_usd || !max_loss_pct) throw new Error("En una misión real hacen falta target_pct, approval, max_trade_usd y max_loss_pct");
+        if (costs === "real") throw new Error("costs solo vale en misiones simuladas: una misión real ya paga los costes de verdad");
         const running = await signerStatus();
         if (!running?.status.unlocked || running.status.stopped) throw new Error("La cartera real no está desbloqueada: usa start_wallet y pide al usuario que la desbloquee en su página");
         const snap = await liveWalletSnapshot();
@@ -160,7 +169,7 @@ server.registerTool(
       if (!capital_usd) throw new Error("Falta capital_usd");
       const target = target_usd ?? (target_pct ? capital_usd * (1 + target_pct / 100) : undefined);
       if (!target) throw new Error("Falta target_usd o target_pct");
-      const mission = await createMission(capital_usd, target, duration_minutes, instructions, allocation ?? DEFAULT_ALLOCATION);
+      const mission = await createMission(capital_usd, target, duration_minutes, instructions, allocation ?? DEFAULT_ALLOCATION, { costMode: costs });
       return text(JSON.stringify(mission));
     } catch (err) {
       return { ...text(`Error: ${(err as Error).message}`), isError: true };
