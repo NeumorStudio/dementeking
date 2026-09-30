@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { db, now } from "../src/db.js";
 import * as memory from "../src/sim/memory.js";
-import { createMission } from "../src/sim/mission.js";
+import { createMission, startMissionClock } from "../src/sim/mission.js";
 import { runTool } from "../src/tools/index.js";
 import { installFakeMarket, MEME } from "./fake-market.js";
 
@@ -19,6 +19,7 @@ test("intervalo de Wilson: con pocos casos es ancho", () => {
 });
 
 const mission = await createMission(1000, 1200, 60, undefined, { solana: 100 });
+startMissionClock(mission.id);
 let n = 0;
 const closed = (entry: Record<string, unknown>, pnl: number) =>
   db

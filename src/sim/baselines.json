@@ -1,0 +1,105 @@
+{
+  "about": "Líneas base medidas (30-sep-2026) de las misiones rápidas: la P de llegar al objetivo con una regla mecánica, sin inteligencia. Son mediciones sobre datos históricos, no predicciones. Fuente: C:/tf-tmp/dk-research/results/sintesis.md, secciones 1 y 4.7.",
+  "method": "P por cierre de vela de 1 min, con 10 $ y costes reales: una sola compra con todo y una orden de venta en el objetivo neto de costes; si no salta, venta al acabar el reloj. El simulador mira la orden cada 5-15 s, así que puede dar algo más, hasta la cifra 'tocando mecha'.",
+  "horizons": [5, 10, 15, 30],
+  "targets": [25, 50, 100],
+  "memecoins": {
+    "graduado": {
+      "strategy": "Memecoin recién graduada",
+      "label": "token de pump.fun recién graduado (migrado a su pool de PumpSwap hace 2 min o menos), comprado 1-2 min después de migrar",
+      "sample": "925 tokens en 23 h de un solo día (29-30 sep 2026)",
+      "verified": false,
+      "reliability": "sin repetir con otro día ni fuera de muestra. La P de +25 % en 10 min es estable en los cuatro bloques de 6 h (32, 34, 35 y 38 %; IC95 del total 32-38 %); el EV no lo es (de +3 a −23 % según el bloque). Puede deberse en parte a BOOST de pump.fun: si lo cambian, la cifra desaparece",
+      "evPct": [-24, -12],
+      "p": {
+        "5": { "25": 0.24, "50": 0.11, "100": 0.05 },
+        "10": { "25": 0.35, "50": 0.21, "100": 0.09 },
+        "15": { "25": 0.37, "50": 0.25, "100": 0.14 },
+        "30": { "25": 0.39, "50": 0.26, "100": 0.17 }
+      },
+      "cellEvPct": {
+        "5": { "25": [-12, -12], "50": [-16, -8], "100": [-16, -8] },
+        "10": { "25": [-12, -12], "50": [-17, -17], "100": [-19, -19] },
+        "15": { "25": [-14, -14], "50": [-19, -19], "100": [-22, -22] },
+        "30": { "25": [-14, -14], "50": [-20, -20], "100": [-24, -24] }
+      },
+      "wick": {
+        "5": { "25": 0.39, "100": 0.12 },
+        "10": { "25": 0.51, "100": 0.17 },
+        "15": { "25": 0.52, "100": 0.21 },
+        "30": { "25": 0.53, "100": 0.25 }
+      },
+      "outOfSample": {}
+    },
+    "momentum": {
+      "strategy": "Memecoin con momentum (+25 % en 1 min)",
+      "label": "token de pump.fun comprado en la primera vela de 1 min que sube un 25 % o más en su primera hora de vida",
+      "sample": "95 + 69 tokens en dos ventanas seguidas (la segunda, fuera de muestra, la bajó el verificador)",
+      "verified": true,
+      "reliability": "reimplementado por otro agente y comprobado con una segunda ventana de datos, que rebajó las cifras",
+      "evPct": [-27, -8],
+      "p": {
+        "5": { "25": 0.16, "50": 0.12, "100": 0.06 },
+        "10": { "25": 0.19, "50": 0.13, "100": 0.08 },
+        "15": { "25": 0.2, "50": 0.14, "100": 0.1 },
+        "30": { "25": 0.2, "50": 0.14, "100": 0.11 }
+      },
+      "outOfSample": {
+        "10": { "25": 0.16, "100": 0.07 }
+      }
+    },
+    "lanzamiento": {
+      "strategy": "Lanzamiento de pump.fun al minuto 1",
+      "label": "cualquier lanzamiento de pump.fun comprado en su minuto 1",
+      "sample": "692 + 513 lanzamientos en dos ventanas seguidas (la segunda, fuera de muestra)",
+      "verified": true,
+      "reliability": "comprobado fuera de muestra, que rebajó las cifras",
+      "evPct": [-14, -8],
+      "p": {
+        "5": { "25": 0.06, "50": 0.04, "100": 0.02 },
+        "10": { "25": 0.07, "50": 0.04, "100": 0.03 },
+        "15": { "25": 0.07, "50": 0.05, "100": 0.03 },
+        "30": { "25": 0.07, "50": 0.05, "100": 0.03 }
+      },
+      "outOfSample": {
+        "5": { "25": 0.03, "100": 0.01 },
+        "10": { "25": 0.04, "100": 0.02 }
+      }
+    }
+  },
+  "perps": {
+    "about": "Réplica exacta del simulador (mira los futuros cada 60 s y cobra 0,30 $ + 1 $ fijos por posición), con 6 meses de velas de 1 min (abril-septiembre 2026). Todo el capital (50 $) en una sola cadena y objetivo +25 %. Solo existen en simulación.",
+    "capitalUsd": 50,
+    "targetPct": 25,
+    "x2": "≈0 en todos los plazos de 30 min o menos (1 de cada 1.400 a 14.000 intentos, en la mejor moneda)",
+    "defaultAllocation": "con el reparto por defecto (30/25/25/20) un futuro solo puede usar 13,95 $ de los 50 $, y el +25 % en 15 min cae a ≈0,01 %",
+    "cells": [
+      {
+        "id": "btc-40x",
+        "coin": "BTC",
+        "leverage": 40,
+        "label": "BTC a 40x, sin esperar",
+        "p": { "5": 0.001, "10": 0.003, "15": 0.0067, "30": 0.0195 },
+        "evPct": [-6, -6]
+      },
+      {
+        "id": "btc-40x-vol",
+        "coin": "BTC",
+        "leverage": 40,
+        "label": "BTC a 40x, arrancando solo con la volatilidad de la última hora en su 1 % más alto",
+        "gate": { "sigmaPerMinute": 0.00125, "text": "volatilidad de la última hora ≥ 0,125 % por minuto (su 1 % más alto): apareció 135 h en 121 días, agrupadas en 37 días" },
+        "p": { "5": 0.014, "10": 0.043, "15": 0.076, "30": 0.172 },
+        "ci95": { "15": [0.049, 0.098] },
+        "evPct": [-10, -8],
+        "note": "comprobado fuera de muestra; si el agente tarda 2 min en entrar, el 7,6 % baja a 5,9 %"
+      },
+      {
+        "id": "zec-10x",
+        "coin": "ZEC",
+        "leverage": 10,
+        "label": "futuro de alta volatilidad a 10x (tipo ZEC)",
+        "p": { "5": 0.001, "10": 0.0027, "15": 0.0048, "30": 0.0139 }
+      }
+    ]
+  }
+}

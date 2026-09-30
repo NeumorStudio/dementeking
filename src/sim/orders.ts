@@ -217,8 +217,9 @@ export async function checkOrders(): Promise<string[]> {
     }
   }
 
+  // Solo las de misiones con el reloj en marcha: una orden que saltara antes sería tiempo gratis.
   const open = db
-    .prepare("SELECT o.* FROM orders o JOIN missions m ON m.id = o.mission_id WHERE o.status = 'open' AND m.status = 'active'")
+    .prepare("SELECT o.* FROM orders o JOIN missions m ON m.id = o.mission_id WHERE o.status = 'open' AND m.status = 'active' AND m.started_at IS NOT NULL")
     .all() as unknown as OrderRow[];
   const prices = new Map<string, number>();
   for (const order of open) {

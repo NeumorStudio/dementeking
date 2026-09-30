@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { db, now } from "../src/db.js";
 import * as memory from "../src/sim/memory.js";
-import { createMission } from "../src/sim/mission.js";
+import { createMission, startMissionClock } from "../src/sim/mission.js";
 import { runTool } from "../src/tools/index.js";
 import { installFakeMarket } from "./fake-market.js";
 
@@ -64,6 +64,7 @@ test("una orden que vende el token vigila el precio de venta real (cotización),
   const { placeOrder } = await import("../src/sim/orders.js");
   const { getHoldings } = await import("../src/sim/portfolio.js");
   const { USDC_MINT } = await import("../src/market/jupiter.js");
+  startMissionClock(mission.id);
   const mint = Object.keys(tokens).find((m) => tokens[m]!.symbol !== "USDC" && tokens[m]!.symbol !== "SOL")!;
   setPrice(mint, 2);
   const thesis = { why: "prueba", evidence: "prueba", sources: ["test"], exit_plan: "x", beliefs_applied: [], memory_note: "x", risks_checked: "revisé riskCheck y creencias negativas" };
@@ -100,6 +101,7 @@ test("una orden que vende todo un token del que ya no queda nada se cancela sola
   const { placeOrder, checkOrders } = await import("../src/sim/orders.js");
   const { USDC_MINT } = await import("../src/market/jupiter.js");
   const m2 = await createMission(1000, 1100, 30, undefined, { solana: 100 });
+  startMissionClock(m2.id);
   const c2 = { sessionId: 1, missionId: m2.id };
   const mint = Object.keys(tokens).find((m) => tokens[m]!.symbol !== "USDC" && tokens[m]!.symbol !== "SOL")!;
   setPrice(mint, 2);

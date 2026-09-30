@@ -12,11 +12,16 @@ import * as positions from "../sim/positions.js";
 import * as sim from "../sim/portfolio.js";
 import * as transfers from "../sim/transfers.js";
 import { estimateTokenLaunch } from "../sim/launch.js";
-import { checkBuyAgainstMemory } from "../sim/guard.js";
+import { checkBuyAgainstMemory, memoryBlockers } from "../sim/guard.js";
+import { enterWithExits, prepareEntry } from "../sim/entry.js";
+import * as plans from "../sim/plans.js";
+import { DEFAULT_MAX_ROUND_TRIP_COST_PCT, describeSourceErrors, waitForSignal } from "../sim/signals.js";
+import { baselineForClass } from "../sim/baselines.js";
 import { asset } from "../paths.js";
-import { json, tool, type ToolCtx, type ToolOutput } from "./define.js";
+import { AGENTS, json, MARKET_READERS, OPERATORS, tool, type ToolCtx, type ToolOutput } from "./define.js";
 import { toText } from "./format.js";
 import { recordFeatures, recordRead, recordScan } from "../sim/market-state.js";
+import { WAIT_MIN_MINUTES, waitTiming, watchTick } from "../sim/watch.js";
 
 /** Misión del contexto; las herramientas que la necesitan solo se ejecutan si existe. */
 const mid = (ctx: ToolCtx): number => {
@@ -28,6 +33,15 @@ const mid = (ctx: ToolCtx): number => {
 // Las esperas no pasan de 4,5 minutos: la caché de prompts de los subagentes dura 5, y una espera más
 // larga hace que el turno siguiente relea todo el contexto sin caché (a precio completo).
 const MAX_WAIT_MINUTES = 4.5;
+
+/** Capital con el que wait_for_signal cotiza la ida y vuelta si no hay misión ni plan que lo digan: el de la misión rápida por defecto. */
+const DEFAULT_SIGNAL_USD = 50;
+
+/** Respuesta a cualquier operación antes de arrancar el reloj de la misión (runTool). */
+export const CLOCK_NOT_STARTED = "Arranca el reloj con start_session antes de operar";
+
+/** `wait` no repite la vuelta de vigilancia si alguien hizo una hace menos de esto (menos que su sondeo de 5 s). */
+const WAIT_FRESH_TICK_MS = 4_000;
 
 const FIELD_GUIDE = asset("guia-del-terreno.md", "knowledge/guia-del-terreno.md");
 
@@ -79,6 +93,26 @@ const formatThesis = (t: z.infer<typeof thesis>) =>
   (t.overrides?.length ? `\nIgnora a sabiendas: ${t.overrides.map((o) => `#${o.id} (${o.reason})`).join("; ")}` : "");
 
 const tradeMeta = (t: z.infer<typeof thesis>) => ({ thesis: formatThesis(t), lessonsApplied: t.memory_note, beliefsApplied: t.beliefs_applied });
+
+// Tesis abreviada: en una misión rápida (15 min o menos) cada operación puede citar el plan del cerebro en lugar de
+// escribir la tesis entera, que costaba 1.000-1.300 tokens por decisión con el reloj corriendo. Queda la del plan.
+const planThesis = z
+  .object({
+    plan_ref: z.number().int().describe("Id del plan vigente (get_plan): la tesis, con su risks_checked, se toma del plan"),
+    overrides: thesis.shape.overrides,
+  })
+  .describe("Solo en misiones rápidas (15 min o menos): en lugar de la tesis completa, el plan del cerebro");
+
+const thesisParam = z.union([thesis, planThesis]);
+
+/** La tesis completa de una operación: la escrita o, con plan_ref, la del plan (solo en misiones rápidas). */
+function fullThesis(t: z.infer<typeof thesisParam>, ctx: ToolCtx): z.infer<typeof thesis> {
+  if (!("plan_ref" in t)) return t;
+  const fromPlan = plans.thesisFromPlan(t.plan_ref, mid(ctx));
+  // Las creencias que el revisor haya retirado desde que se escribió el plan ya no cuentan como aplicadas.
+  const gone = fromPlan.beliefs_applied.length ? memory.unknownBeliefs(fromPlan.beliefs_applied) : [];
+  return { ...fromPlan, beliefs_applied: fromPlan.beliefs_applied.filter((id) => !gone.includes(id)), ...(t.overrides ? { overrides: t.overrides } : {}) };
+}
 
 
 // ─── Chequeo de riesgo de token_report ──────────────────────────────────────
@@ -368,6 +402,7 @@ export const SIM_TOOLS = [
   tool({
     name: "scan_market",
     kind: "research",
+    role: MARKET_READERS,
     deliversNews: true,
     researchTarget: () => undefined,
     description:
@@ -396,6 +431,7 @@ export const SIM_TOOLS = [
   tool({
     name: "token_report",
     kind: "research",
+    role: MARKET_READERS,
     deliversNews: true,
     researchTarget: (i) => (i.tokens?.length ? i.tokens : i.token),
     description:
@@ -431,22 +467,46 @@ export const SIM_TOOLS = [
   tool({
     name: "strategy_fit",
     kind: "research",
-    role: "both",
+    role: AGENTS,
     researchTarget: () => undefined,
     description:
       "Encaje de estrategias con la misión: con lo que te falta para el objetivo y el tiempo que queda, la probabilidad estimada de " +
-      "llegar con cada estrategia (cripto grande al contado, futuros con apalancamiento, memecoins jóvenes) y su riesgo de ruina. " +
-      "Usa la volatilidad real de ahora (Binance) y tu propio historial. Sirve para elegir con lógica: no todas encajan con cada misión.",
-    schema: z.object({}),
-    run: async (_i, ctx) => {
-      const { strategyFit } = await import("../sim/fit.js");
-      return toText(await strategyFit(mid(ctx)));
+      "llegar con cada estrategia (memecoins según las líneas base medidas y tu historial, cripto grande al contado, futuros: estos, llegar " +
+      "ANTES de liquidarse) y su riesgo de ruina. Trae la frontera: en cada plazo medido (5/10/15/30 min), el objetivo más alto con P ≥10, " +
+      "≥25 y ≥50 %. Con duration_minutes y target_pct (o market), solo la tabla medida para esa clase de misión, sin mirar ninguna cartera " +
+      "(la P base de mercado × plazo × objetivo, la misma casilla en los otros mercados y lo medido con futuros): sirve antes de crear la misión.",
+    schema: z.object({
+      market: z
+        .string()
+        .regex(/^[a-z0-9_]+$/)
+        .optional()
+        .describe("Mercado de la clase: graduado (por defecto), momentum o lanzamiento son los medidos"),
+      duration_minutes: z.number().positive().optional().describe("Plazo de la clase (por defecto, el de la misión)"),
+      target_pct: z.number().positive().optional().describe("Objetivo de la clase en % (por defecto, el de la misión)"),
+    }),
+    run: async (i, ctx) => {
+      const { strategyFit, tableFit } = await import("../sim/fit.js");
+      if ((i.duration_minutes === undefined) !== (i.target_pct === undefined)) {
+        throw new Error("Indica duration_minutes y target_pct juntos (o ninguno, para los de la misión)");
+      }
+      const m = ctx.missionId !== null ? mission.getMission(ctx.missionId) : undefined;
+      // Sin misión o preguntando por una clase: la tabla medida, sin cartera.
+      if (!m || i.duration_minutes !== undefined || i.market) {
+        return toText(
+          tableFit({
+            market: i.market,
+            minutes: i.duration_minutes ?? (m ? mission.missionDurationMinutes(m) : undefined),
+            targetPct: i.target_pct ?? (m ? ((m.target_usd - m.initial_usd) / m.initial_usd) * 100 : undefined),
+          }),
+        );
+      }
+      return toText(await strategyFit(m));
     },
   }),
   tool({
     name: "field_guide",
     kind: "research",
-    role: "both",
+    role: AGENTS,
     description:
       "Guía del terreno: qué mercados puede ejecutar el simulador y cómo los simula, cómo funciona pump.fun " +
       "(curva, comisiones, graduación) y qué APIs públicas de datos responden, con sus URLs y campos. Hechos, no recomendaciones. " +
@@ -470,6 +530,7 @@ export const SIM_TOOLS = [
   tool({
     name: "mission_status",
     kind: "misc",
+    role: MARKET_READERS,
     // Sin novedades del briefing: también la usa la sesión del usuario para ver si la misión sigue, y se las
     // quedaba (marcándolas como vistas) antes de que llegaran al trader. Le llegan con el resto de sus herramientas.
     description:
@@ -483,16 +544,22 @@ export const SIM_TOOLS = [
     kind: "misc",
     deliversNews: true,
     description:
-      `Deja pasar tiempo real (1-${MAX_WAIT_MINUTES} minutos) vigilando tu cartera. Vuelve antes si la misión termina, si pasa algo ` +
+      `Deja pasar tiempo real (1-${MAX_WAIT_MINUTES} minutos; en una misión de ${mission.FAST_MISSION_MAX_MINUTES} min o menos, desde ${String(WAIT_MIN_MINUTES).replace(".", ",")}) ` +
+      "vigilando tu cartera. Vuelve antes si la misión termina, si pasa algo " +
       "(se dispara una orden, llega una transferencia, un futuro se cierra) o si una posición se mueve wake_on_move_pct o más. " +
       "Devuelve solo lo que ha cambiado: las novedades, cómo se han movido tus posiciones y el estado de la misión (no hace falta " +
       "pedir portfolio ni mission_status después). El tiempo también pasa mientras investigas u operas.",
     schema: z.object({
-      minutes: z.number().min(1).max(MAX_WAIT_MINUTES),
+      minutes: z.number().min(WAIT_MIN_MINUTES).max(MAX_WAIT_MINUTES),
       wake_on_move_pct: z.number().min(3).max(100).default(15).describe("Vuelve antes si una posición sube o baja este % desde que empezaste a esperar"),
     }),
-    run: async ({ minutes, wake_on_move_pct }, ctx) => {
+    run: async ({ minutes: requested, wake_on_move_pct }, ctx) => {
       const m = mid(ctx);
+      // En una misión rápida se mira cada 5 s y se admiten esperas de 15 s; en una larga, desde 1 min y cada 20 s.
+      const row = mission.getMission(m);
+      const timing = waitTiming(requested, !!row && mission.isShortMission(row));
+      const pollMs = timing.pollMs;
+      let minutes = timing.minutes;
       // Parado en efectivo y lejos del objetivo: no se deja pasar más de un minuto seguido.
       const before = await mission.missionStatus(m);
       const idle = "warning" in before && before.warning;
@@ -504,9 +571,9 @@ export const SIM_TOOLS = [
       let current = base;
       let wake = "";
       while (Date.now() < until && !wake) {
-        await new Promise((r) => setTimeout(r, Math.min(20_000, until - Date.now())));
-        await orders.checkOrders().catch(() => []);
-        await mission.checkMission(m).catch(() => []);
+        await new Promise((r) => setTimeout(r, Math.min(pollMs, until - Date.now())));
+        // La misma vuelta que la vigilancia de fondo; si otro proceso acaba de hacerla, no se repite (Jupiter).
+        await watchTick({ skipIfFresherMs: WAIT_FRESH_TICK_MS });
         if (mission.getMission(m)?.status !== "active") wake = "la misión ha terminado";
         else if ((db.prepare("SELECT COUNT(*) AS n FROM journal WHERE mission_id = ? AND ts > ?").get(m, startIso) as { n: number }).n) wake = "hay novedades";
         else {
@@ -531,8 +598,86 @@ export const SIM_TOOLS = [
     },
   }),
   tool({
+    name: "wait_for_signal",
+    kind: "misc",
+    description:
+      `Espera sin gastar turnos (hasta ${MAX_WAIT_MINUTES} min por llamada) a la señal de entrada del plan: mira su fuente de eventos cada 5 s y ` +
+      "devuelve el primer token que pasa sus filtros mecánicos y tiene cotización de compra y de venta en Jupiter, con la ida y vuelta calculada " +
+      "para tu capital (por defecto, liquidez de 1.000 $ o más e ida y vuelta del 10 % o menos: fuera los pools vaciados; el plan puede cambiarlos), " +
+      "y que tu memoria no frenaría al entrar. Si la fuente no responde (p. ej. GeckoTerminal con 429), lo dice. Fuente graduado (por defecto): tokens de pump.fun recién migrados a PumpSwap (pool de 2 min o menos), vistos en " +
+      "GeckoTerminal, que los publica con 10-70 s de retraso; shortlist: solo la lista corta del plan, cuando se gradúa. Funciona antes de arrancar " +
+      "el reloj: esperar al evento es legítimo, operar no. Sin candidato, vuelve a llamarla; con candidato, entra con enter_with_exits.",
+    schema: z.object({
+      plan_ref: z.number().int().optional().describe("Plan cuyos filtros aplica (por defecto, el de la misión o el vigente de su clase)"),
+      source: z.enum(plans.SIGNAL_SOURCES).optional().describe("Por defecto, la del plan (o graduado)"),
+      max_minutes: z.number().min(0.25).max(MAX_WAIT_MINUTES).default(MAX_WAIT_MINUTES),
+      usd_amount: z.number().positive().optional().describe("Con cuánto cotizar la ida y vuelta (por defecto, el importe del plan o todo tu efectivo en Solana)"),
+      exclude: z.array(z.string()).max(100).optional().describe("Tokens que ya has descartado: no los devuelve"),
+    }),
+    run: async (i, ctx) => {
+      const m = ctx.missionId !== null ? mission.getMission(ctx.missionId) : undefined;
+      const active = m?.status === "active" ? m : undefined;
+      const plan = i.plan_ref !== undefined ? plans.getPlan(i.plan_ref) : active ? plans.planForMission(active.id) : plans.latestActivePlan();
+      if (i.plan_ref !== undefined && !plan) throw new Error(`No existe el plan #${i.plan_ref}`);
+      const source = i.source ?? plan?.body.source ?? "graduado";
+      const shortlist = plan?.body.shortlist?.map((s) => s.mint) ?? [];
+      if (source === "shortlist" && !shortlist.length) throw new Error("El plan no tiene lista corta (shortlist): usa la fuente graduado");
+      const cash = active ? Math.max(0, ...getChain("solana").stables.map((s) => sim.balance(active.id, "solana", s.address))) : 0;
+      // Antes del reloj, la misión queda marcada con el plan con el que se prepara: si no llega ningún candidato y se
+      // cancela a los 60 min, el bloque del plan lo cuenta (get_plan) y el planner puede ver que sus filtros no dejan pasar nada.
+      if (active && plan && !active.started_at && plan.class === active.class) plans.markPlanForMission(active.id, plan.id);
+      // Con lo que entraría enter_with_exits: el importe del plan, recortado al efectivo.
+      const usdAmount = i.usd_amount ?? (cash >= 1 ? Math.min(plan?.body.usd_amount ?? cash, cash) : (plan?.body.usd_amount ?? DEFAULT_SIGNAL_USD));
+      const r = await waitForSignal({
+        source,
+        filters: plan?.body.filters ?? {},
+        shortlist,
+        usdAmount,
+        maxMinutes: i.max_minutes,
+        exclude: i.exclude,
+        shouldStop: () => (active && mission.getMission(active.id)?.status !== "active" ? "la misión ya no está activa" : null),
+        // Un candidato que la memoria va a rechazar al entrar no sirve: enter_with_exits lo frenaría con el evento ya pasado.
+        accept: async (c) => {
+          const token = await getChain("solana").resolveToken(c.token).catch(() => null);
+          const blocking = token ? await memoryBlockers({ chain: "solana", token, missionId: active?.id, amountUsd: usdAmount }) : [];
+          return blocking.length ? `tu memoria lo desaconseja (creencia${blocking.length > 1 ? "s" : ""} #${blocking.map((b) => b.id).join(", #")})` : null;
+        },
+      });
+      const waited = { waitedSeconds: r.waitedSeconds, polls: r.polls };
+      const sourceNote = describeSourceErrors(r.sourceErrors);
+      if (!r.candidate) {
+        const rejected = Object.entries(r.rejected).map(([reason, n]) => `${reason} ×${n}`).join("; ");
+        const summary =
+          (r.stopped ? `Espera cortada: ${r.stopped}. ` : `Sin señal en ${r.waitedSeconds} s (${r.polls} vueltas). `) +
+          `Tokens frescos vistos: ${r.seen}${rejected ? `; descartes: ${rejected}` : ""}.` +
+          (sourceNote ? ` ${sourceNote}` : "");
+        // Antes del reloj queda en el diario de la misión: si se cancela sin candidato, el planner ve por qué (journal_history).
+        if (active && !active.started_at) {
+          logJournal({
+            missionId: active.id,
+            sessionId: ctx.sessionId,
+            kind: "signal",
+            summary: `wait_for_signal${plan ? ` (plan #${plan.id})` : ""}: ${summary}`,
+            details: { rejected: r.rejected, seen: r.seen, sourceErrors: r.sourceErrors },
+          });
+        }
+        return summary + (r.stopped ? "" : " Vuelve a llamar a wait_for_signal (con exclude si has descartado alguno a mano).");
+      }
+      positions.logResearch(ctx.missionId, "wait_for_signal", r.candidate.token);
+      return toText({
+        signal: `${r.candidate.symbol ?? r.candidate.token} pasa los filtros${plan ? ` del plan #${plan.id}` : ""}`,
+        ...r.candidate,
+        ...waited,
+        ...(sourceNote ? { sourceErrors: sourceNote } : {}),
+        ...(plan?.body.manual_filters ? { checkByHand: plan.body.manual_filters } : {}),
+        next: `enter_with_exits con token ${r.candidate.token}${plan ? ` y thesis { plan_ref: ${plan.id} }` : ""}`,
+      });
+    },
+  }),
+  tool({
     name: "http_get",
     kind: "research",
+    role: MARKET_READERS,
     researchTarget: (i) => i.url,
     description: "Hace una petición HTTP GET y devuelve la respuesta en texto (útil para APIs públicas en JSON).",
     schema: z.object({ url: z.string() }),
@@ -548,6 +693,7 @@ export const SIM_TOOLS = [
   tool({
     name: "portfolio",
     kind: "misc",
+    role: MARKET_READERS,
     deliversNews: true,
     description:
       "Muestra tu cartera simulada y su valor en USD a precio de liquidación real ahora mismo, " +
@@ -558,6 +704,7 @@ export const SIM_TOOLS = [
   tool({
     name: "quote_swap",
     kind: "research",
+    role: MARKET_READERS,
     researchTarget: (i) => i.output,
     description:
       "Cotiza un swap en una cadena sin ejecutarlo, con el agregador de DEX real de esa cadena (en Solana, Jupiter). " +
@@ -590,11 +737,12 @@ export const SIM_TOOLS = [
       amount: z.number().positive().optional(),
       sell_all: z.boolean().optional().describe("Vende todo tu saldo del token de entrada (en lugar de amount)"),
       slippage_bps: z.number().int().min(1).max(5000).default(50),
-      thesis,
+      thesis: thesisParam,
     }),
     run: async (i, ctx) => {
+      const t = fullThesis(i.thesis, ctx);
       if (sim.isLiveMission(mid(ctx))) throw new Error("Esta misión es REAL: usa execute_swap (opera con dinero de verdad). simulate_swap solo sirve en misiones simuladas.");
-      await checkBuyAgainstMemory({ chain: i.chain, output: i.output, overrides: i.thesis.overrides, risksChecked: i.thesis.risks_checked, missionId: mid(ctx), input: i.input, amount: i.amount });
+      await checkBuyAgainstMemory({ chain: i.chain, output: i.output, overrides: t.overrides, risksChecked: t.risks_checked, missionId: mid(ctx), input: i.input, amount: i.amount });
       return json(
         await sim.swap({
           missionId: mid(ctx),
@@ -605,8 +753,8 @@ export const SIM_TOOLS = [
           amount: i.amount,
           sellAll: i.sell_all,
           slippageBps: i.slippage_bps,
-          reasoning: formatThesis(i.thesis),
-          meta: tradeMeta(i.thesis),
+          reasoning: formatThesis(t),
+          meta: tradeMeta(t),
         }),
       );
     },
@@ -628,11 +776,12 @@ export const SIM_TOOLS = [
       amount: z.number().positive().optional(),
       sell_all: z.boolean().optional().describe("Vende todo tu saldo del token de entrada (en lugar de amount)"),
       slippage_bps: z.number().int().min(1).max(5000).default(100),
-      thesis,
+      thesis: thesisParam,
     }),
     run: async (i, ctx) => {
+      const t = fullThesis(i.thesis, ctx);
       if (!sim.isLiveMission(mid(ctx))) throw new Error("Esta misión es simulada: usa simulate_swap. execute_swap solo existe en misiones reales.");
-      await checkBuyAgainstMemory({ chain: i.chain, output: i.output, overrides: i.thesis.overrides, risksChecked: i.thesis.risks_checked, missionId: mid(ctx), input: i.input, amount: i.amount });
+      await checkBuyAgainstMemory({ chain: i.chain, output: i.output, overrides: t.overrides, risksChecked: t.risks_checked, missionId: mid(ctx), input: i.input, amount: i.amount });
       return json(
         await sim.swap({
           missionId: mid(ctx),
@@ -643,8 +792,8 @@ export const SIM_TOOLS = [
           amount: i.amount,
           sellAll: i.sell_all,
           slippageBps: i.slippage_bps,
-          reasoning: formatThesis(i.thesis),
-          meta: tradeMeta(i.thesis),
+          reasoning: formatThesis(t),
+          meta: tradeMeta(t),
         }),
       );
     },
@@ -657,9 +806,11 @@ export const SIM_TOOLS = [
       "Ejecuta en simulación una orden de mercado en Binance spot contra el order book real (precio medio y slippage reales, " +
       "comisión taker incluida). BUY: amount = cantidad del activo quote a gastar. SELL: amount = cantidad del activo base a vender. " +
       "symbol: par de Binance, p. ej. BTCUSDC.",
-    schema: z.object({ symbol: z.string(), side: z.enum(["BUY", "SELL"]), amount: z.number().positive(), thesis }),
-    run: async (i, ctx) =>
-      json(await sim.binanceMarketOrder({ missionId: mid(ctx), sessionId: ctx.sessionId, symbol: i.symbol, side: i.side, amount: i.amount, reasoning: formatThesis(i.thesis), meta: tradeMeta(i.thesis) })),
+    schema: z.object({ symbol: z.string(), side: z.enum(["BUY", "SELL"]), amount: z.number().positive(), thesis: thesisParam }),
+    run: async (i, ctx) => {
+      const t = fullThesis(i.thesis, ctx);
+      return json(await sim.binanceMarketOrder({ missionId: mid(ctx), sessionId: ctx.sessionId, symbol: i.symbol, side: i.side, amount: i.amount, reasoning: formatThesis(t), meta: tradeMeta(t) }));
+    },
   }),
   tool({
     name: "simulate_transfer",
@@ -711,10 +862,11 @@ export const SIM_TOOLS = [
       token_out: z.string().describe("Token que quieres recibir en la cadena de destino (dirección o alias)"),
       amount: z.number().positive(),
       slippage_bps: z.number().int().min(1).max(5000).default(50),
-      thesis,
+      thesis: thesisParam,
     }),
-    run: async (i, ctx) =>
-      json(
+    run: async (i, ctx) => {
+      const t = fullThesis(i.thesis, ctx);
+      return json(
         await transfers.bridge({
           missionId: mid(ctx),
           sessionId: ctx.sessionId,
@@ -724,10 +876,11 @@ export const SIM_TOOLS = [
           tokenOut: i.token_out,
           amount: i.amount,
           slippageBps: i.slippage_bps,
-          reasoning: formatThesis(i.thesis),
-          meta: tradeMeta(i.thesis),
+          reasoning: formatThesis(t),
+          meta: tradeMeta(t),
         }),
-      ),
+      );
+    },
   }),
   tool({
     name: "execute_bridge",
@@ -745,9 +898,10 @@ export const SIM_TOOLS = [
       token_out: z.string().describe("Estable o nativo que quieres recibir en la cadena de destino"),
       amount: z.number().positive(),
       slippage_bps: z.number().int().min(1).max(5000).default(50),
-      thesis,
+      thesis: thesisParam,
     }),
     run: async (i, ctx) => {
+      const t = fullThesis(i.thesis, ctx);
       if (!sim.isLiveMission(mid(ctx))) throw new Error("Esta misión es simulada: usa simulate_bridge. execute_bridge solo existe en misiones reales.");
       const { liveBridge } = await import("../live/bridge.js");
       return json(
@@ -760,7 +914,7 @@ export const SIM_TOOLS = [
           tokenOut: i.token_out,
           amount: i.amount,
           slippageBps: i.slippage_bps,
-          reasoning: formatThesis(i.thesis),
+          reasoning: formatThesis(t),
         }),
       );
     },
@@ -784,9 +938,10 @@ export const SIM_TOOLS = [
       from_chain: chainParam.optional().describe("De qué cadena sale el margen (por defecto, la que más efectivo tenga)"),
       take_profit: z.number().positive().optional(),
       stop_loss: z.number().positive().optional(),
-      thesis,
+      thesis: thesisParam,
     }),
     run: async (i, ctx) => {
+      const t = fullThesis(i.thesis, ctx);
       const { openPerp } = await import("../sim/perps.js");
       return json(
         await openPerp({
@@ -799,8 +954,8 @@ export const SIM_TOOLS = [
           fromChain: i.from_chain,
           takeProfit: i.take_profit,
           stopLoss: i.stop_loss,
-          reasoning: formatThesis(i.thesis),
-          meta: tradeMeta(i.thesis),
+          reasoning: formatThesis(t),
+          meta: tradeMeta(t),
         }),
       );
     },
@@ -845,7 +1000,7 @@ export const SIM_TOOLS = [
       "vender esa cantidad a un estable, ya con el impacto de precio (currentPrice te lo da así al crearla). " +
       "Una toma de beneficios (above, vendiendo a un estable) es una orden límite: se llena exactamente a ese precio (como en Jupiter, aunque el mercado esté por encima); si al ir a vender " +
       "el precio ya ha bajado, no se llena y sigue esperando. Un stop (below) vende a mercado, al precio que haya. " +
-      "Funciona aunque no estés en sesión. Se comprueba cada 15 s, así que un pico de pocos segundos puede no dispararla. " +
+      "Funciona aunque no estés en sesión. Se comprueba cada 15 s (cada 5 s en una misión rápida), así que un pico de pocos segundos puede no dispararla. " +
       "El saldo no se bloquea: si al dispararse no hay saldo suficiente, la orden falla. Con sell_all vende todo el saldo que tengas en ese momento. " +
       "Con condition: time se ejecuta dentro de in_minutes pase lo que pase con el precio (sin trigger_asset ni trigger_price): sirve para cumplir tu plan " +
       "(\"si a los 3 min no ha saltado la toma de beneficio, vendo\") aunque no estés pendiente. Cancela la que sobre cuando se ejecute la otra.",
@@ -861,11 +1016,12 @@ export const SIM_TOOLS = [
       sell_all: z.boolean().optional().describe("Vender todo el saldo del token de entrada al dispararse (en lugar de amount)"),
       slippage_bps: z.number().int().min(1).max(5000).default(100),
       expires_hours: z.number().positive().optional(),
-      thesis,
+      thesis: thesisParam,
     }),
     run: async (i, ctx) => {
+      const t = fullThesis(i.thesis, ctx);
       if (!i.sell_all && i.amount === undefined) throw new Error("Indica amount o sell_all");
-      await checkBuyAgainstMemory({ chain: i.chain, output: i.output, overrides: i.thesis.overrides, risksChecked: i.thesis.risks_checked, missionId: mid(ctx), input: i.input, amount: i.amount });
+      await checkBuyAgainstMemory({ chain: i.chain, output: i.output, overrides: t.overrides, risksChecked: t.risks_checked, missionId: mid(ctx), input: i.input, amount: i.amount });
       return json(
         await orders.placeOrder({
           missionId: mid(ctx),
@@ -877,9 +1033,73 @@ export const SIM_TOOLS = [
           inMinutes: i.in_minutes,
           action: { input: i.input, output: i.output, amount: i.amount ?? 0, sellAll: i.sell_all || undefined, slippageBps: i.slippage_bps },
           expiresHours: i.expires_hours,
-          reasoning: formatThesis(i.thesis),
+          reasoning: formatThesis(t),
         }),
       );
+    },
+  }),
+  tool({
+    name: "enter_with_exits",
+    kind: "trade",
+    startsClock: true,
+    journaled: true,
+    description:
+      "Entrada de una misión rápida en UNA llamada: si el reloj no ha arrancado, lo arranca (igual que start_session), compra el token con todo tu " +
+      "efectivo de la cadena (el nativo se queda para la red) o con usd_amount, y deja puesta la toma de beneficio: una orden límite que vende todo " +
+      "el token a un precio fijo. Ese precio sale de tp_ratio (× el precio de compra), del plan citado o, si no, del objetivo de la misión (el que " +
+      "la deja cumplida neta de costes; también con tp_at_target, p. ej. en una reentrada). Devuelve la compra, la orden y el plazo del reloj. " +
+      "Antes de arrancar el reloj lo comprueba todo (tesis o plan, efectivo, token, una cotización de ida y vuelta —más del 10 % es un pool " +
+      "vaciado— y tu memoria): si algo falla, no compra ni arranca el reloj. " +
+      "Con thesis { plan_ref } la tesis es la del plan. Solo en misiones simuladas.",
+    schema: z.object({
+      chain: chainParam.default("solana"),
+      token: z.string().describe("Dirección del token (la que da wait_for_signal)"),
+      usd_amount: z.number().positive().optional().describe("Cuánto gastar (por defecto, el importe del plan o todo el efectivo de la cadena)"),
+      tp_ratio: z.number().min(1.01).max(20).optional().describe("Toma de beneficio = precio de compra × tp_ratio (por defecto, la del plan o la del objetivo)"),
+      tp_at_target: z.boolean().optional().describe("Toma de beneficio en el precio que deja el objetivo cumplido, aunque el plan tenga tp_ratio"),
+      slippage_bps: z.number().int().min(1).max(5000).default(300),
+      thesis: thesisParam,
+    }),
+    // Todo lo que puede fallar sin operar se comprueba antes de arrancar el reloj (runTool): si falla, el reloj sigue
+    // parado y el executor espera al siguiente candidato gratis.
+    preflight: async (i, ctx) => {
+      const m = mid(ctx);
+      if (sim.isLiveMission(m)) throw new Error("enter_with_exits solo existe en misiones simuladas");
+      const t = fullThesis(i.thesis, ctx);
+      const plan = "plan_ref" in i.thesis ? plans.getPlan(i.thesis.plan_ref) : undefined;
+      // El importe fijo del plan se recorta al efectivo (la clase no dice el capital); uno pedido aquí tiene que caber.
+      const entry = await prepareEntry({
+        missionId: m,
+        chain: i.chain,
+        token: i.token,
+        usdAmount: i.usd_amount,
+        planUsdAmount: plan?.body.usd_amount,
+        slippageBps: i.slippage_bps,
+        // El plan puede subir el tope mecánico de la ida y vuelta, no bajarlo aquí: esto es la red contra un pool vaciado.
+        maxRoundTripCostPct: Math.max(DEFAULT_MAX_ROUND_TRIP_COST_PCT, plan?.body.filters.max_round_trip_cost_pct ?? 0),
+      });
+      await checkBuyAgainstMemory({ chain: i.chain, output: entry.token.address, overrides: t.overrides, risksChecked: t.risks_checked, missionId: m, input: entry.stable.address, amount: entry.amount });
+      return { thesis: t, plan, entry };
+    },
+    run: async (i, ctx, { thesis: t, plan, entry }) => {
+      const m = mid(ctx);
+      const tpRatio = i.tp_ratio ?? (i.tp_at_target ? undefined : plan?.body.tp_ratio);
+      const out = await enterWithExits({
+        missionId: m,
+        sessionId: ctx.sessionId,
+        chain: i.chain,
+        token: entry.token.address,
+        usdAmount: entry.amount,
+        tpRatio,
+        tpRatioFrom: i.tp_ratio !== undefined ? "parámetro" : plan ? `plan #${plan.id}` : undefined,
+        slippageBps: i.slippage_bps,
+        reasoning: formatThesis(t),
+        meta: tradeMeta(t),
+      });
+      // Con plan_ref, la misión queda con ese plan (su P y la de la línea base) para compararla después. Solo con la
+      // compra hecha: una entrada rechazada no asigna nada.
+      if (plan && mission.getMission(m)?.plan_id !== plan.id) plans.attachPlan(m, plan);
+      return json({ ...out, roundTripAtEntry: { quotedBackUsd: Number(entry.roundTrip.backUsd.toFixed(2)), costPct: entry.roundTrip.costPct } });
     },
   }),
   tool({
@@ -900,10 +1120,11 @@ export const SIM_TOOLS = [
       side: z.enum(["BUY", "SELL"]),
       amount: z.number().positive().describe("BUY: cantidad de quote a gastar. SELL: cantidad base a vender"),
       expires_hours: z.number().positive().optional(),
-      thesis,
+      thesis: thesisParam,
     }),
-    run: async (i, ctx) =>
-      json(
+    run: async (i, ctx) => {
+      const t = fullThesis(i.thesis, ctx);
+      return json(
         await orders.placeOrder({
           missionId: mid(ctx),
           sessionId: ctx.sessionId,
@@ -914,9 +1135,10 @@ export const SIM_TOOLS = [
           inMinutes: i.in_minutes,
           action: { symbol: i.symbol, side: i.side, amount: i.amount },
           expiresHours: i.expires_hours,
-          reasoning: formatThesis(i.thesis),
+          reasoning: formatThesis(t),
         }),
-      ),
+      );
+    },
   }),
   tool({
     name: "list_orders",
@@ -975,6 +1197,7 @@ export const SIM_TOOLS = [
   tool({
     name: "journal_history",
     kind: "memory",
+    role: MARKET_READERS,
     researchTarget: () => undefined,
     description:
       "Devuelve las últimas entradas de tu diario de operaciones. Por defecto, de la misión actual; " +
@@ -987,11 +1210,149 @@ export const SIM_TOOLS = [
     },
   }),
 
+  // ─── Plan del cerebro (misiones rápidas): lo escribe el planner antes del reloj; lo leen todos ─
+  tool({
+    name: "write_plan",
+    kind: "memory",
+    role: "planner",
+    journaled: true,
+    description:
+      "Guarda el plan de una clase de misión (plazo × objetivo × mercado, p. ej. graduado-10m-+25%) y lo deja vigente: las reglas con las que " +
+      `el executor opera las próximas ${plans.PLAN_BLOCK_SIZE} misiones de esa clase. Son reglas, no una lista de tokens (caducan en minutos): el evento, ` +
+      "los filtros mecánicos (wait_for_signal los comprueba sin LLM) y los que hay que mirar a mano, el tamaño, el ratio de la toma de beneficio " +
+      "calculado con quote_swap para el capital, la regla de reentrada, risks_checked ya validado, la P que esperas y la de la línea base, y " +
+      "opcionalmente una lista corta de curvas de pump.fun llenas al 90 % o más. Queda fijo durante su bloque: si la clase ya tiene un plan que no " +
+      "lo ha terminado, se rechaza salvo que des replace_reason. Sin duration_minutes ni target_pct, la clase es la de la misión activa. Solo " +
+      `misiones rápidas (simuladas de ${mission.FAST_MISSION_MAX_MINUTES} min o menos), y el mercado de la clase es el de la fuente: graduado.`,
+    schema: z.object({
+      duration_minutes: z.number().positive().optional().describe("Plazo de la clase (por defecto, el de la misión activa)"),
+      target_pct: z.number().positive().optional().describe("Objetivo de la clase en % sobre el capital (por defecto, el de la misión activa)"),
+      market: z
+        .string()
+        .regex(/^[a-z0-9_]+$/)
+        .optional()
+        .describe(
+          `Mercado de la clase: el de los eventos que da la fuente (${mission.DEFAULT_FAST_MARKET}, con graduado y con shortlist). Otro mercado se rechaza: ` +
+            "wait_for_signal no sabe esperar sus eventos, y la misión se compararía con la línea base de otro mercado y sin gemelo",
+        ),
+      event: z.string().min(1).describe("El evento que dispara la entrada, p. ej. 'token de pump.fun migrado a PumpSwap hace 2 min o menos'"),
+      source: z.enum(plans.SIGNAL_SOURCES).default("graduado").describe("Fuente de wait_for_signal: graduado o shortlist (solo la lista corta)"),
+      filters: z
+        .object({
+          max_pool_age_minutes: z.number().positive().max(60).optional().describe("Edad máxima del pool o de la graduación (por defecto, 2)"),
+          launchpads: z.array(z.string()).optional().describe('Launchpads de origen según Jupiter (por defecto en graduado, ["pump.fun"]; [] = cualquiera)'),
+          min_liquidity_usd: z.number().min(0).optional(),
+          max_liquidity_usd: z.number().positive().optional(),
+          min_fdv_usd: z.number().min(0).optional(),
+          max_fdv_usd: z.number().positive().optional(),
+          min_buys_5m: z.number().int().min(0).optional(),
+          min_buyers_5m: z.number().int().min(0).optional(),
+          min_buy_sell_ratio_5m: z.number().min(0).optional(),
+          min_volume_5m_usd: z.number().min(0).optional(),
+          min_price_change_5m_pct: z.number().optional(),
+          max_price_change_5m_pct: z.number().optional(),
+          max_round_trip_cost_pct: z.number().min(0).max(100).optional().describe("Coste máximo de comprar y vender al momento con el capital"),
+        })
+        .default({})
+        .describe("Filtros mecánicos propios (los datos del pool de GeckoTerminal y las cotizaciones de Jupiter)"),
+      manual_filters: z.string().optional().describe("Filtros propios que no se pueden comprobar sin mirar: el executor los revisa antes de entrar"),
+      sizing: z.string().min(1).default("todo el capital menos el gas"),
+      usd_amount: z.number().positive().optional().describe("Importe fijo de cada entrada (por defecto, todo el efectivo de la cadena)"),
+      tp_ratio: z.number().min(1.01).max(20).optional().describe("Toma de beneficio = precio de compra × tp_ratio (sin él, en el precio que da el objetivo neto)"),
+      reentry: z.string().min(1).describe("Regla de reentrada (o por qué no la hay)"),
+      reentry_allowed: z.boolean(),
+      risks_checked: z.string().min(15).describe("Lo comprobado en contra (creencias negativas, riskCheck): vale para cada compra que cite el plan"),
+      why: z.string().min(1),
+      evidence: z.string().min(1).describe("Datos que lo respaldan (tus misiones, las tasas medidas)"),
+      sources: z.array(z.string().min(1)).min(1),
+      beliefs_applied: z.array(z.number().int()).optional(),
+      memory_note: z.string().optional(),
+      predicted_p: z.number().min(0).max(1).describe("P de llegar al objetivo con este plan (0-1)"),
+      baseline_p: z
+        .number()
+        .min(0)
+        .max(1)
+        .optional()
+        .describe("P de la línea base: la regla mecánica sin tus filtros (0-1). Por defecto, la de la tabla medida para la clase (strategy_fit)"),
+      shortlist: z
+        .array(z.object({ mint: z.string().min(32), note: z.string().optional() }))
+        .max(10)
+        .optional()
+        .describe("Curvas de pump.fun llenas al 90 % o más (las siguientes en graduarse)"),
+      replace_reason: z.string().min(20).optional().describe("Solo para sustituir un plan que no ha terminado su bloque: por qué no sirve"),
+    }),
+    run: async (i, ctx) => {
+      const { duration_minutes, target_pct, market: asked, predicted_p, baseline_p, replace_reason, ...body } = i;
+      if (body.source === "shortlist" && !body.shortlist?.length) throw new Error("Con source: shortlist, el plan necesita la lista corta (shortlist)");
+      // El mercado de la clase es el de lo que de verdad se opera: el de la fuente. Una etiqueta distinta cambiaría la
+      // línea base con la que se compara la misión y la dejaría sin gemelo.
+      const market = plans.SOURCE_MARKET[body.source];
+      if (asked && asked !== market) {
+        throw new Error(
+          `El mercado de un plan es el de su fuente: con source ${body.source}, wait_for_signal espera tokens recién graduados (${market}). ` +
+            `Para ${asked} no hay fuente de eventos mecánica: su casilla de strategy_fit sirve de referencia, pero no se puede planificar`,
+        );
+      }
+      const unknown = body.beliefs_applied?.length ? memory.unknownBeliefs(body.beliefs_applied) : [];
+      if (unknown.length) throw new Error(`Las creencias #${unknown.join(", #")} no existen o ya no están activas`);
+      let cls: string;
+      if (duration_minutes !== undefined && target_pct !== undefined) {
+        if (!mission.isFastMinutes(duration_minutes)) throw new Error(`Los planes son de misiones rápidas: ${mission.FAST_MISSION_MAX_MINUTES} min o menos`);
+        cls = mission.missionClass({ durationMinutes: duration_minutes, initialUsd: 100, targetUsd: 100 * (1 + target_pct / 100), market });
+      } else if (duration_minutes === undefined && target_pct === undefined) {
+        const m = mission.getActiveMission();
+        if (!m) throw new Error("No hay misión activa: indica duration_minutes y target_pct de la clase");
+        if (!mission.isFastMission(m)) throw new Error("La misión activa no es rápida (simulada de 15 min o menos): la opera el trader, sin plan");
+        cls = mission.missionClass({ durationMinutes: mission.missionDurationMinutes(m), initialUsd: m.initial_usd, targetUsd: m.target_usd, market });
+      } else {
+        throw new Error("Indica duration_minutes y target_pct juntos (o ninguno, para usar los de la misión activa)");
+      }
+      const baselineP = baseline_p ?? baselineForClass(cls)?.p;
+      if (baselineP === undefined) throw new Error(`Indica baseline_p: la tabla medida no tiene el mercado de ${cls} (strategy_fit dice cuáles tiene)`);
+      const r = plans.writePlan({ cls, body, predictedP: predicted_p, baselineP, missionId: ctx.missionId, sessionId: ctx.sessionId, replaceReason: replace_reason });
+      return (
+        `Plan #${r.id} vigente para ${cls}${r.replaced ? ` (sustituye al #${r.replaced})` : ""}: queda fijo durante las próximas ${plans.PLAN_BLOCK_SIZE} misiones ` +
+        `de esta clase. El executor lo lee con get_plan y lo cita con plan_ref.`
+      );
+    },
+  }),
+  tool({
+    name: "get_plan",
+    kind: "memory",
+    role: AGENTS,
+    description:
+      "El plan del cerebro: las reglas de las misiones rápidas de una clase (evento, filtros, tamaño, toma de beneficio, reentrada, P esperada y " +
+      "de la línea base, lista corta) y cómo va su bloque. Por defecto, el de la misión activa (o el vigente de su clase); con mission_class, el " +
+      "vigente de esa clase; con plan_id, ese. Sin misión activa, el vigente más reciente.",
+    schema: z.object({
+      plan_id: z.number().int().optional(),
+      mission_class: z.string().optional().describe("Clase de misión, p. ej. graduado-10m-+25%"),
+    }),
+    run: async ({ plan_id, mission_class }, ctx) => {
+      const active = ctx.missionId !== null && mission.getMission(ctx.missionId)?.status === "active";
+      const plan =
+        plan_id !== undefined
+          ? plans.getPlan(plan_id)
+          : mission_class
+            ? plans.activePlan(mission_class)
+            : active
+              ? plans.planForMission(ctx.missionId!)
+              : plans.latestActivePlan();
+      if (!plan) {
+        if (plan_id !== undefined) throw new Error(`No existe el plan #${plan_id}`);
+        const cls = mission_class ?? (active ? mission.getMission(ctx.missionId!)?.class : undefined);
+        return `No hay plan vigente${cls ? ` para ${cls}` : ""}: lo escribe el planner con write_plan.`;
+      }
+      const current = plan.active ? undefined : plans.activePlan(plan.class);
+      return toText({ ...plans.describePlan(plan), ...(current ? { note: `Ya no está vigente: el de ${plan.class} es el #${current.id}` } : {}) });
+    },
+  }),
+
   // ─── Memoria entre misiones (el agente que opera la lee; la escribe el revisor) ─
   tool({
     name: "recall_memory",
     kind: "memory",
-    role: "trader",
+    role: MARKET_READERS,
     researchTarget: () => undefined,
     description:
       "Tu memoria entre misiones, ordenada por parecido con la misión actual. La escribe un agente revisor a partir de lo que pasó " +
@@ -1011,7 +1372,7 @@ export const SIM_TOOLS = [
   tool({
     name: "trade_history",
     kind: "memory",
-    role: "trader",
+    role: MARKET_READERS,
     researchTarget: () => undefined,
     description:
       "Tus posiciones: coste, resultado real, tiempo mantenida, motivo de cierre, datos del token al entrar (antigüedad, liquidez, " +
@@ -1040,7 +1401,7 @@ export const SIM_TOOLS = [
   tool({
     name: "report_observation",
     kind: "memory",
-    role: "trader",
+    role: OPERATORS,
     journaled: true,
     description:
       "Deja una observación para el revisor, que decidirá si pasa a tu memoria: algo que has descubierto sobre cómo se hace algo, " +
@@ -1054,7 +1415,7 @@ export const SIM_TOOLS = [
   tool({
     name: "request_capability",
     kind: "memory",
-    role: "both",
+    role: AGENTS,
     journaled: true,
     description:
       "Anota una capacidad que no tienes y que necesitarías para intentar algo: una cuenta (X, Instagram, Telegram, un exchange…), " +
@@ -1079,7 +1440,7 @@ export const SIM_TOOLS = [
   tool({
     name: "exploration_map",
     kind: "memory",
-    role: "both",
+    role: AGENTS,
     description:
       "Mapa de lo que has probado: operaciones cerradas por cadena, por edad y liquidez del token al entrar (contado) y por moneda (futuros), " +
       "con ganadas, perdidas y resultado medio. Las casillas \"sin probar\" son zonas en las que nunca has operado.",
@@ -1092,7 +1453,9 @@ export const SIM_TOOLS = [
     role: "reviewer",
     description:
       "Lo que tienes pendiente como revisor: misiones terminadas sin retrospectiva, la misión activa (actividad desde tu última revisión, " +
-      "cada cuánto conviene revisarla y si tiene briefing), observaciones del agente sin procesar, errores repetidos sin howto y creencias sin condición.",
+      "cada cuánto conviene revisarla y si tiene briefing), observaciones del agente sin procesar, errores repetidos sin howto y creencias sin condición. " +
+      "missionClasses: por clase de misión, aciertos con su IC de Wilson, la suma de las P predichas frente a los aciertos (calibración), la " +
+      "línea base, los aciertos del gemelo mecánico y la comparación misión a misión con él.",
     schema: z.object({}),
     run: async () => toText(memory.reviewQueue()),
   }),
@@ -1105,7 +1468,8 @@ export const SIM_TOOLS = [
       "y resultado), diario, registro de trabajo del agente, notas, observaciones, errores, briefing y tus revisiones anteriores. " +
       "Con since (fecha ISO) solo lo posterior a esa fecha (útil a mitad de misión). Sin since incluye `counterfactuals`: para cada " +
       "operación cerrada, con el precio real minuto a minuto, cuánto llegó a subir mientras la tenía y qué habría dado mantenerla 15 o " +
-      "30 min más. Sirve para distinguir una mala entrada de una mala salida.",
+      "30 min más (en una misión rápida, 1, 3 y 5). Sirve para distinguir una mala entrada de una mala salida. En una misión rápida, twin es " +
+      "su gemelo mecánico (los eventos siguientes con la regla sin inteligencia, en la misma franja) y missionClass, cómo va su clase.",
     schema: z.object({ mission_id: z.number().int(), since: z.string().optional() }),
     run: async ({ mission_id, since }) => {
       const data = memory.missionReviewData(mission_id, since);
@@ -1426,10 +1790,16 @@ ${steps}` : ""),
   const parsed = def.schema.safeParse(rawInput);
   if (!parsed.success) return fail(`Entrada no válida: ${parsed.error.message}`);
   const trading = def.kind === "trade";
+  const notActive = async () => ({
+    content: `Error: no hay ninguna misión activa. ${(await mission.missionStatus(ctx.missionId ?? undefined)).message ?? ""}`,
+    isError: true,
+  });
   const current = ctx.missionId !== null ? mission.getMission(ctx.missionId) : undefined;
-  if (trading && current?.status !== "active") {
-    return { content: `Error: no hay ninguna misión activa. ${(await mission.missionStatus(ctx.missionId ?? undefined)).message ?? ""}`, isError: true };
-  }
+  if (trading && current?.status !== "active") return notActive();
+  const clockStopped = trading && !!current && !current.started_at;
+  // Antes del reloj se puede preparar y esperar, pero no operar: sería tiempo gratis. Las herramientas con
+  // startsClock (enter_with_exits) arrancan el reloj ellas mismas, igual que start_session, y operan después.
+  if (clockStopped && !def.startsClock) return { content: `Error: ${CLOCK_NOT_STARTED}`, isError: true };
   const beliefs = (parsed.data as { thesis?: { beliefs_applied?: number[] } }).thesis?.beliefs_applied;
   if (beliefs?.length) {
     const unknown = memory.unknownBeliefs(beliefs);
@@ -1437,12 +1807,32 @@ ${steps}` : ""),
   }
   // Antes de operar o de mirar la cartera, lo que ya ha llegado de una transferencia está disponible.
   if (trading || def.deliversNews) await transfers.settleTransfers({ missionId: ctx.missionId ?? undefined }).catch(() => []);
+  const rejected = (message: string) => {
+    if (trading) logJournal({ missionId: ctx.missionId, sessionId: ctx.sessionId, kind: "rejected", summary: `${name} rechazada: ${message}`, details: rawInput });
+    return fail(message);
+  };
+  // Todo lo que se puede comprobar sin operar va antes del reloj: si falla, el reloj sigue parado (el executor espera
+  // al siguiente evento gratis, en vez de con el reloj corriendo y sin posición).
+  let prepared: unknown;
+  if (def.preflight) {
+    try {
+      prepared = await (def.preflight as (i: unknown, c: ToolCtx) => Promise<unknown>)(parsed.data, ctx);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return rejected(clockStopped ? `${message} (el reloj no ha arrancado)` : message);
+    }
+  }
+  if (clockStopped) {
+    if (ctx.startClock) ctx = { ...ctx, sessionId: await ctx.startClock() };
+    else mission.startMissionClock(current.id);
+    if (mission.getMission(current.id)?.status !== "active") return notActive();
+  }
   if (def.researchTarget) {
     const target = (def.researchTarget as (i: unknown) => string | string[] | undefined)(parsed.data);
     for (const t of Array.isArray(target) ? target : [target]) positions.logResearch(ctx.missionId, name, t?.trim() || undefined);
   }
   try {
-    let content = await (def.run as (i: unknown, c: typeof ctx) => Promise<ToolOutput>)(parsed.data, ctx);
+    let content = await (def.run as (i: unknown, c: typeof ctx, p: unknown) => Promise<ToolOutput>)(parsed.data, ctx, prepared);
     if (trading) {
       // Tras cada operación se comprueba si ya se ha alcanzado el objetivo.
       const ended = await mission.checkMission(ctx.missionId ?? undefined).catch(() => []);
@@ -1451,10 +1841,6 @@ ${steps}` : ""),
     if (trading || def.deliversNews) content = withNews(content, ctx.missionId);
     return { content, isError: false };
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    if (trading) {
-      logJournal({ missionId: ctx.missionId, sessionId: ctx.sessionId, kind: "rejected", summary: `${name} rechazada: ${message}`, details: rawInput });
-    }
-    return fail(message);
+    return rejected(err instanceof Error ? err.message : String(err));
   }
 }

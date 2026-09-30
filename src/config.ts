@@ -24,6 +24,8 @@ export const config = {
   maxStepsPerSession: num("MAX_STEPS_PER_SESSION", 80),
   loopPauseMinutes: num("LOOP_PAUSE_MINUTES", 30),
   watchIntervalSeconds: num("WATCH_INTERVAL_SECONDS", 60),
+  // Con una misión rápida en marcha (15 min o menos), órdenes, futuros y misión se miran así de a menudo.
+  fastWatchIntervalSeconds: num("FAST_WATCH_INTERVAL_SECONDS", 5),
   browserHeadful: process.env.BROWSER_HEADFUL === "true",
   // DATA_DIR permite usar otra base de datos (p. ej. para pruebas) sin tocar la simulación principal.
   dataDir: resolveDataDir(),

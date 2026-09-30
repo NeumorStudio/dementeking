@@ -14,10 +14,12 @@ Datos verificados el 27 y el 28 de septiembre de 2026; las plataformas cambian, 
 | Cualquier token de **Base** con ruta en KyberSwap (o ParaSwap) | Swap al precio de cotización del agregador en ese instante | `simulate_swap` (chain: base) |
 | Cualquier token de **BNB Chain** con ruta en KyberSwap (o ParaSwap) | Igual que en Base | `simulate_swap` (chain: bsc) |
 | Binance spot | Orden de mercado contra el order book real | `simulate_binance_market_order` |
-| Órdenes condicionales | Por precio (se disparan con el precio real, comprobado cada ~60 s) o por tiempo (se ejecutan a los minutos que indiques, pase lo que pase) | `place_*_trigger_order` |
+| Órdenes condicionales | Por precio (se disparan con el precio de venta real, comprobado cada 15 s; cada 5 s en una misión rápida) o por tiempo (se ejecutan a los minutos que indiques, pase lo que pase) | `place_*_trigger_order` |
+| Futuros perpetuos, largos o cortos, con apalancamiento | Precio y funding reales de Hyperliquid (sección 6); el margen sale del efectivo de una cadena | `open_perp`, `close_perp`, `set_perp_exits` |
+| Entrada de una misión rápida | Compra con todo el efectivo de la cadena y deja puesta la toma de beneficio en una llamada; si el reloj no ha arrancado, lo arranca, pero solo si antes pasa todas las comprobaciones (plan, efectivo, token, una ida y vuelta de más del 10 %, memoria): si falla, el reloj sigue parado (sección 7) | `enter_with_exits` |
 
 **No ejecutable** (solo se puede anotar con `record_hypothetical_action`): crear tokens, publicar en redes,
-otras blockchains (Ethereum, Arbitrum…), futuros, préstamos, staking, airdrops. Si necesitas algo que no
+otras blockchains (Ethereum, Arbitrum…), préstamos, staking, airdrops. Los futuros sí se ejecutan, pero solo en simulación. Si necesitas algo que no
 tienes para intentarlo, pídelo con `request_capability`.
 
 **Lanzar un token propio**: `estimate_token_launch` calcula lo que costaría con el gas y los precios de ahora
@@ -81,7 +83,8 @@ BNB Chain.
 - La cartera se valora a precio de **liquidación**: lo que obtendrías vendiéndolo todo ahora. En tokens con poca
   liquidez ese valor puede quedar muy por debajo del precio "de pantalla".
 - Al terminar la misión se vende todo a mercado; en tokens ilíquidos eso también tiene coste.
-- Tiempo: cada paso tuyo (decidir, llamar a una herramienta, leer el resultado) tarda del orden de 15 a 30 segundos.
+- Tiempo: cada paso tuyo (decidir, llamar a una herramienta, leer el resultado) también cuenta. Medido en misiones anteriores: 11 s de mediana por paso, 28-57 s cuando se redacta una tesis, y 84-111 s entre `start_session` y la primera operación. Una sola decisión tarda unos 17 s con esfuerzo medio, unos 60 s con esfuerzo alto y 5-7 min con el máximo.
+- El reloj de la misión arranca con el primer `start_session` o `enter_with_exits`, no al crearla. Antes se puede preparar y esperar, pero no operar; si no arranca en 60 min desde que se creó, la misión se cancela.
 
 ## 3. pump.fun
 
@@ -173,3 +176,31 @@ Solo datos, sin veredicto: qué significan para tus resultados lo decides tú co
 - **Take profit y stop loss.** Son opcionales y se vigilan solos. Se pueden fijar al abrir o después con `set_perp_exits` (con el precio de entrada real; 0 quita la salida).
 - **Lo que no se simula:** el slippage exacto en momentos de mucha volatilidad ni las cascadas de liquidaciones. En misiones reales no están disponibles.
 - **Cuándo encaja.** `strategy_fit` calcula, para tu objetivo y el tiempo que queda, la probabilidad de llegar con cada apalancamiento y el riesgo de liquidación, con la volatilidad real de ahora.
+
+## 7. Misiones rápidas (15 minutos o menos)
+
+Mediciones con datos reales (29-30 de septiembre de 2026), no predicciones. `strategy_fit` trae la tabla y la frontera: en cada plazo, el objetivo más alto con una P de al menos el 10, el 25 y el 50 %.
+
+- **Cómo se juegan.** Las planifica un agente (el planner) antes del reloj, con un plan de reglas fijo durante 20 misiones de la misma clase (mercado × plazo × objetivo; `get_plan`). Otro (el executor) espera el evento con `wait_for_signal` sin arrancar el reloj y entra con `enter_with_exits`: una compra con todo y la toma de beneficio en el objetivo en la misma llamada. Si no salta, se vende al acabar el reloj.
+- **Por qué una sola compra con todo y la venta puesta.** En un juego desfavorable, la probabilidad de llegar a una meta es máxima apostando fuerte y pocas veces (Dubins y Savage), también con tiempo límite. Lo confirman los datos: operar a trozos de ±10 % no llegó nunca a ×2 en 5-15 min con memecoins; repartir en dos tokens con +25 % cada uno exige que acierten los dos (≈12 %); un stop mejora el valor esperado menos de 1 punto y solo puede bajar la P.
+- **P medida** de llegar al objetivo con un token de pump.fun recién graduado (migrado a PumpSwap hace 2 min o menos), comprado 1-2 min después de migrar:
+
+| Plazo | +25 % | +50 % | ×2 |
+|---|---|---|---|
+| 5 min | 24 % | 11 % | 5 % |
+| 10 min | 35 % | 21 % | 9 % |
+| 15 min | 37 % | 25 % | 14 % |
+| 30 min | 39 % | 26 % | 17 % |
+
+- **Qué dice y qué no.**
+  - Son 925 tokens de un solo día, sin repetir fuera de muestra. Lo verificado dos veces (momentum: la primera vela de 1 min que sube un 25 % o más) da la mitad: +25 % en 10 min, 16-19 %. Comprar cualquier lanzamiento en su minuto 1: 4-7 %.
+  - El valor esperado es negativo en todas las casillas: con costes reales, entre −7 y −28 % por misión.
+  - Futuros (réplica del simulador, 50 $ en una cadena): ×2 en 30 min o menos ≈0; +25 % en 15 min, 0,6 % (7,6 % solo con la volatilidad de la última hora en su 1 % más alto).
+  - Los aciertos llegan a los 4 min de mediana, y cada minuto de retraso al entrar resta 3-4 puntos de P (comprando 1, 2 o 3 min después de la migración: 35, 32 y 28 %).
+- **Optimismos del simulador** que más pesan en misiones de 5-15 min, de más a menos:
+  1. Sin latencia ni MEV en los primeros minutos de un token, que es cuando más mandan los bots.
+  2. La toma de beneficio (una orden límite) se llena exactamente a su precio y se mira cada 5 s, así que la P puede acercarse a la de tocar la mecha dentro del minuto: +25 % en 10 min, hasta ≈51 %; ×2, ≈17 %. En pump.fun y PumpSwap no hay órdenes límite nativas.
+  3. Costes: cobra 0,0001 SOL de red por transacción (en real, 0,0005-0,001) y devuelve la renta de la cuenta del token. Son ≈3,4 puntos por ida y vuelta con 10 $ y ≈0,7 con 50 $.
+  4. El impacto en el precio: el coste real de ida y vuelta medido fue del 1,6 al 10,2 %, mientras Jupiter decía 0,02 %.
+  5. El suelo de la curva de pump.fun no existe para ~22 % de los tokens: no siempre se puede vender "en el suelo".
+- **La línea base.** Cada misión rápida guarda la P que esperaba el plan y la de la tabla, y un gemelo mecánico hace la misma compra con la misma toma de beneficio en los 3 eventos siguientes, en la misma franja y solo con los filtros mecánicos (los de `wait_for_signal` por defecto: liquidez de 1.000 $ o más e ida y vuelta del 10 % o menos): así se mide si el agente aporta algo. Sus 3 gemelos comparten franja, así que su intervalo se calcula por misión, no por gemelo. Con menos de 20 misiones por clase no se distingue la suerte de la habilidad (7 aciertos de 20 dejan un intervalo del 18 al 57 %).

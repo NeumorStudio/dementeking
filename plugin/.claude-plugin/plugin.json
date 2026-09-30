@@ -1,6 +1,6 @@
 {
   "name": "dementeking",
-  "version": "0.36.2",
+  "version": "0.37.0",
   "description": "Agente autónomo de trading cripto en simulación: dinero ficticio, precios, liquidez y comisiones reales en Solana (Jupiter, pump.fun), Base y BNB Chain (monedero tipo MetaMask) y Binance, con transferencias y puentes. Un agente revisor escribe su memoria entre misiones. Panel en directo.",
   "author": {
     "name": "NeumorStudio"

@@ -12,6 +12,7 @@ import path from "node:path";
 process.env.DATA_DIR = mkdtempSync(path.join(os.tmpdir(), "dementeking-install-"));
 const { buildPrompt, REVIEWER_PROMPT_PATH, TRADER_PROMPT_PATH } = await import("../src/prompt.js");
 const { SIM_TOOLS } = await import("../src/tools/index.js");
+const { toolRoles } = await import("../src/tools/define.js");
 
 const root = path.resolve(import.meta.dirname, "..");
 const home = os.homedir();
@@ -45,18 +46,17 @@ else config.mcp = { ...(config.mcp ?? {}), [MCP]: { ...server, enabled: true } }
 writeFileSync(configFile, JSON.stringify(config, null, 2) + "\n");
 
 // ── 3. Agentes ──────────────────────────────────────────────────────────────
-// Herramientas definidas en mcp.ts (fuera de SIM_TOOLS) y de quién son.
-const MCP_ONLY: Record<string, "trader" | "user"> = {
-  start_session: "trader",
-  end_session: "trader",
-  create_mission: "user",
-  stop_mission: "user",
-  status_report: "user",
-  start_dashboard: "user",
+// Herramientas definidas en mcp.ts (fuera de SIM_TOOLS) y de quién son. En OpenCode solo hay trader y revisor.
+const MCP_ONLY: Record<string, readonly string[]> = {
+  start_session: ["trader", "executor"],
+  end_session: ["trader", "executor"],
+  create_mission: ["user"],
+  stop_mission: ["user"],
+  status_report: ["user"],
+  start_dashboard: ["user"],
 };
-const roles = new Map<string, string>([...SIM_TOOLS.map((t) => [t.name, t.role ?? "trader"] as [string, string]), ...Object.entries(MCP_ONLY)]);
-const deniedFor = (agent: "trader" | "reviewer") =>
-  [...roles].filter(([, role]) => role !== agent && role !== "both").map(([name]) => `${MCP}_${name}`);
+const roles = new Map<string, readonly string[]>([...SIM_TOOLS.map((t) => [t.name, toolRoles(t)] as const), ...Object.entries(MCP_ONLY)]);
+const deniedFor = (agent: "trader" | "reviewer") => [...roles].filter(([, r]) => !r.includes(agent)).map(([name]) => `${MCP}_${name}`);
 
 const ENV = (agent: "trader" | "reviewer") =>
   [
@@ -98,11 +98,12 @@ description: Lanza una misión de dementeking (trading simulado con precios real
 Vas a lanzar una misión de dementeking. Habla en español. Tú no operas ni escribes memoria: preparas la misión y lanzas a los agentes. ${ASK}
 
 Argumentos del usuario: $ARGUMENTS
-(Formato orientativo: capital, objetivo y minutos, p. ej. "20 40 5" = 20 $ de capital, llegar a 40 $, en 5 minutos. Un objetivo en % se aplica sobre el capital.)
+(Formato orientativo: capital, objetivo y minutos, p. ej. "20 40 60" = 20 $ de capital, llegar a 40 $, en 60 minutos. Un objetivo en % se aplica sobre el capital.)
+En OpenCode solo hay misiones normales, las que opera el trader. Una simulada de 15 minutos o menos es una misión rápida, y esas solo existen en Claude Code (las prepara un cerebro y las ejecuta otro agente): si el usuario pide 15 minutos o menos en simulado, díselo y pídele un plazo mayor. Una real puede durar lo que quiera.
 
 1. Llama a \`cryptosim_mission_status\`. Si hay una misión activa, pregunta si continuarla (salta al paso 5 sin crearla), reemplazarla (crea la nueva con \`replace: true\`) o detenerla (\`cryptosim_stop_mission\`, preguntando si cerrar posiciones, y termina).
 2. Primero pregunta el modo: simulado (dinero ficticio, por defecto) o real (dinero de verdad de la cartera de la IA).
-3. Simulado: completa lo que falte en los argumentos preguntando al usuario: capital (por defecto 1000 $), objetivo (por defecto +5 %), minutos (por defecto 60), instrucciones (por defecto ninguna: modo libre) y reparto:
+3. Simulado: completa lo que falte en los argumentos preguntando al usuario: capital (por defecto 1000 $), objetivo (por defecto +5 %), minutos (por defecto 60; más de 15), instrucciones (por defecto ninguna: modo libre) y reparto:
    - con menos de 100 $ de capital, por defecto todo en Solana: {"solana":100};
    - si no, repartido: {"solana":30,"base":25,"bsc":25,"binance":20}.
    Crea la misión con \`cryptosim_create_mission\` (capital_usd, target_usd en valor absoluto, duration_minutes, allocation e instructions si las hay).

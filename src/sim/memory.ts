@@ -8,9 +8,13 @@
 // El que opera deja observaciones (report_observation) y el revisor decide qué pasa a la memoria.
 import { db, logActivity, now } from "../db.js";
 import { getActiveMission, getLastMission, getMission, type Mission } from "./mission.js";
+import { isFastMission } from "./mission-kind.js";
 import { listPositions } from "./positions.js";
 import { DUPLICATE_THRESHOLD, fingerprint, similarity } from "./text.js";
 import { launchpadOf } from "./launchpads.js";
+import { wilson } from "./stats.js";
+import { classStats, missionComparison, twinCounts } from "./class-stats.js";
+import { shadowSummary } from "./shadow.js";
 
 // ─── Parecido entre misiones ────────────────────────────────────────────────
 
@@ -203,19 +207,8 @@ interface BeliefRow {
   legacy_evidence: string | null;
 }
 
-/**
- * Intervalo de Wilson al 95 % de un porcentaje de acierto: con pocos casos es ancho y no deja concluir
- * nada. Con 3 de 3 va del 44 % al 100 %; con 17 de 18, del 74 % al 99 %.
- */
-export function wilson(successes: number, n: number): { low: number; high: number } {
-  if (!n) return { low: 0, high: 100 };
-  const z = 1.96;
-  const p = successes / n;
-  const denom = 1 + (z * z) / n;
-  const center = (p + (z * z) / (2 * n)) / denom;
-  const half = (z * Math.sqrt((p * (1 - p)) / n + (z * z) / (4 * n * n))) / denom;
-  return { low: Math.round(Math.max(0, center - half) * 100), high: Math.round(Math.min(1, center + half) * 100) };
-}
+// Intervalo de Wilson al 95 % (stats.ts): lo comparten las creencias y el seguimiento por clase de misión.
+export { wilson };
 
 /** Etapa de una creencia según cuántas operaciones decisivas la respaldan o la refutan. */
 export type BeliefStage = "hypothesis" | "provisional" | "rule";
@@ -450,7 +443,9 @@ export function recall(missionId?: number | null, limit?: number) {
         instructions: m.instructions ?? undefined,
         result:
           m.status === "cancelled"
-            ? "cancelada por el usuario"
+            ? m.end_reason === "prep_timeout"
+              ? "cancelada: el reloj no llegó a arrancar"
+              : "cancelada por el usuario"
             : `${m.status === "succeeded" ? "objetivo conseguido" : "no llegó al objetivo"}: ${m.initial_usd} → ${m.final_usd?.toFixed(2)} USD (${(
                 ((m.final_usd! - m.initial_usd) / m.initial_usd) *
                 100
@@ -908,6 +903,7 @@ export function recentApproach(count = 8) {
     .prepare("SELECT * FROM missions WHERE status IN ('succeeded', 'expired', 'bust', 'cancelled') AND final_usd IS NOT NULL ORDER BY id DESC LIMIT ?")
     .all(count) as unknown as Mission[];
   if (!missions.length) return null;
+  const twins = twinCounts();
   const perMission = missions.reverse().map((m) => {
     const ps = listPositions(m.id).filter((p) => p.status !== "moved");
     const ages = ps.map((p) => p.entry.ageMinutes).filter((a): a is number => typeof a === "number").sort((a, b) => a - b);
@@ -940,6 +936,9 @@ export function recentApproach(count = 8) {
       tokenAgeMinutes: ages.length ? ages[Math.floor(ages.length / 2)] : null,
       closedByDeadline: ps.filter((p) => String(p.exitReason ?? "").startsWith("Cierre automático")).length,
       orders,
+      // Su clase y cómo quedó frente a lo que predijo el plan, a la línea base y a su gemelo mecánico.
+      ...(m.class ? { missionClass: m.class } : {}),
+      ...(m.status !== "cancelled" && m.started_at ? comparedToTwin(m, twins) : {}),
     };
   });
   const n = perMission.length;
@@ -965,6 +964,12 @@ export function recentApproach(count = 8) {
   };
 }
 
+/** La comparación de una misión con su predicción y su gemelo, sin lo que recentApproach ya dice (resultado y éxito). */
+function comparedToTwin(m: Mission, twins: ReturnType<typeof twinCounts>) {
+  const { hit: _hit, resultPct: _result, ...rest } = missionComparison(m, twins);
+  return rest;
+}
+
 /** Lo que tiene pendiente el revisor. */
 export function reviewQueue() {
   const active = getActiveMission();
@@ -976,6 +981,8 @@ export function reviewQueue() {
       | undefined;
     activeMission = {
       missionId: active.id,
+      // rápida (simulada de 15 min o menos: planner y executor, sin briefing) o normal (el trader, con briefing).
+      missionKind: isFastMission(active) ? "rápida" : "normal",
       profile: describe(profile(active)),
       instructions: active.instructions ?? undefined,
       deadline: active.deadline,
@@ -990,6 +997,8 @@ export function reviewQueue() {
     pendingFinalReviews: pendingReviews(),
     activeMission,
     recentApproach: recentApproach(),
+    // Por clase de misión: aciertos con su IC de Wilson, calibración del cerebro, línea base y gemelo mecánico.
+    missionClasses: classStats({ perMissionLimit: 20 }),
     memoryHygiene: memoryHygiene(),
     pendingObservations: db.prepare("SELECT id, ts, mission_id, kind, text FROM observations WHERE status = 'pending' ORDER BY id").all(),
     errorsWithoutHowto: recurringErrors().filter((e: any) => !e.howtoId),
@@ -1017,9 +1026,14 @@ export function missionReviewData(missionId: number, since?: string) {
         .filter((p) => p.status === "open" || p.openedAt > from || (p.closedAt ?? "") > from)
         .map((p) => (p.openedAt > from ? p : { ...p, thesis: undefined, lessonsApplied: undefined, entry: undefined, research: undefined, note: "abierta antes de tu última revisión" }))
     : allPositions;
+  // El gemelo, solo con la misión terminada: a mitad de misión podría llegarle al agente por el briefing.
+  const twin = m.status === "active" || m.status === "closing" ? null : shadowSummary(missionId);
   return {
     mission: { ...mission, profile: describe(profile(m)) },
     stats: missionStats(missionId),
+    // Misión rápida: su gemelo mecánico (los eventos siguientes con la regla sin inteligencia) y cómo va su clase.
+    ...(twin ? { twin } : {}),
+    ...(m.class && !since ? { missionClass: classStats({ cls: m.class, perMissionLimit: 10 })[0] ?? `${m.class}: aún sin misiones terminadas` } : {}),
     briefing: !briefing
       ? null
       : since && briefing.updated_at <= from

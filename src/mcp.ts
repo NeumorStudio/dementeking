@@ -9,13 +9,14 @@ import { checkOrders } from "./sim/orders.js";
 import { openInBrowser, startDashboard, stopDashboard } from "./dashboard/server.js";
 import { checkMission, createLiveMission, createMission, getActiveMission, getLastMission, startMissionClock, stopMission } from "./sim/mission.js";
 import { liveWalletSnapshot } from "./live/sync.js";
-import { config } from "./config.js";
 import { db, holdsTickLease, supersededBy } from "./db.js";
 import { keepAwake } from "./keep-awake.js";
 import { endSession, sessionBriefing, startSession } from "./sim/session.js";
 import { DEFAULT_ALLOCATION, VENUES } from "./sim/types.js";
 import { statusReport } from "./sim/status.js";
 import { SIM_TOOLS, runTool } from "./tools/index.js";
+import { startWatchLoop } from "./sim/watch.js";
+import { shadowsRunning } from "./sim/shadow.js";
 import { walletBalances } from "./live/chain.js";
 import { ensureSigner, signerStatus, walletUrl } from "./live/client.js";
 import { readWalletPublic } from "./live/keystore.js";
@@ -47,21 +48,34 @@ const sessionFor = (missionId: number | null) => {
   return sessions.get(missionId)!;
 };
 
+/**
+ * Lo que hace start_session salvo el briefing: pone al día órdenes y misión, arranca el reloj de la misión (solo
+ * la primera vez) y abre una sesión de trabajo. Lo reutilizan las herramientas que arrancan el reloj ellas mismas
+ * (ToolDef.startsClock, p. ej. enter_with_exits).
+ */
+async function openWorkSession(): Promise<{ missionId: number | null; sessionId: number }> {
+  await checkOrders().catch(() => []);
+  await checkMission().catch(() => []);
+  const missionId = currentMission();
+  startMissionClock(missionId);
+  const sessionId = startSession(missionId);
+  sessions.set(missionId, sessionId);
+  return { missionId, sessionId };
+}
+
 server.registerTool(
   "start_session",
   {
     description:
-      "Empieza una sesión de trabajo. Llámala antes que cualquier otra herramienta: devuelve la hora, tu cartera, tus notas y el diario reciente.",
+      "Arranca el reloj de la misión (solo la primera vez) y abre una sesión de trabajo; devuelve el briefing: la hora, la misión, tu cartera, " +
+      "tus notas y el diario reciente. Antes del reloj no se puede operar, pero sí investigar y esperar sin que cuente el tiempo: llámala cuando " +
+      "vayas a operar, no antes. En una misión rápida no hace falta: enter_with_exits arranca el reloj con la compra. Si el reloj no arranca en " +
+      "60 min desde que se creó la misión, esta se cancela.",
     inputSchema: {},
   },
   async () => {
     try {
-      await checkOrders().catch(() => []);
-      await checkMission().catch(() => []);
-      const missionId = currentMission();
-      startMissionClock(missionId);
-      const sessionId = startSession(missionId);
-      sessions.set(missionId, sessionId);
+      const { missionId, sessionId } = await openWorkSession();
       return text(await sessionBriefing(sessionId, missionId));
     } catch (err) {
       return { ...text(`Error: ${(err as Error).message}`), isError: true };
@@ -302,7 +316,8 @@ for (const tool of SIM_TOOLS) {
   server.registerTool(tool.name, { description: tool.description, inputSchema: tool.schema.shape as z.ZodRawShape }, async (input: Record<string, unknown>) => {
     try {
       const missionId = currentMission();
-      const { content, isError } = await runTool(tool.name, input, { sessionId: sessionFor(missionId), missionId });
+      const startClock = async () => (await openWorkSession()).sessionId;
+      const { content, isError } = await runTool(tool.name, input, { sessionId: sessionFor(missionId), missionId, startClock });
       return { ...text(typeof content === "string" ? content : JSON.stringify(content)), isError };
     } catch (err) {
       return { ...text(`Error: ${(err as Error).message}`), isError: true };
@@ -316,28 +331,21 @@ const send = transport.send.bind(transport);
 transport.send = (message) => send(slimToolList(message));
 await server.connect(transport);
 
-// Mientras Claude Code está abierto, este proceso también vigila las órdenes condicionales
-// y la misión (el reclamo atómico evita ejecutar dos veces si además corre `npm run watcher`).
-setInterval(async () => {
-  if (supersededBy() || !holdsTickLease()) return;
-  await checkOrders().catch((err) => console.error(`Error revisando órdenes: ${(err as Error).message}`));
-  await checkMission().catch((err) => console.error(`Error revisando la misión: ${(err as Error).message}`));
-}, config.watchIntervalSeconds * 1000);
+// Mientras Claude Code está abierto, este proceso también vigila las órdenes condicionales, los futuros y la
+// misión (el reclamo atómico evita ejecutar dos veces si además corre `npm run watcher`). Cada cuánto, en
+// sim/watch.ts: cada minuto; las órdenes por precio cada 15 s; todo cada 5 s en una misión rápida.
+startWatchLoop({
+  canRun: () => !supersededBy() && holdsTickLease(),
+  log: (line) => {
+    if (line.startsWith("Error")) console.error(line);
+  },
+});
 
 // Con una misión en marcha, el equipo no se duerme (keep-awake.ts). Lo pide cada servidor abierto: si hay
-// varios, da igual; al acabar la misión todos lo sueltan.
-const missionRunning = () => !!db.prepare("SELECT 1 FROM missions WHERE status IN ('active', 'closing') LIMIT 1").get();
+// varios, da igual; al acabar la misión todos lo sueltan. También mientras quede un gemelo mecánico en marcha: puede
+// seguir unos minutos después de la misión, y dormido no se le seguiría el precio.
+const missionRunning = () => !!db.prepare("SELECT 1 FROM missions WHERE status IN ('active', 'closing') LIMIT 1").get() || shadowsRunning();
 setInterval(() => {
   if (supersededBy()) return keepAwake(false);
   keepAwake(missionRunning());
 }, 20_000);
-
-// Con órdenes por precio abiertas, se miran cada 15 s: un pico de un memecoin dura segundos y con la revisión
-// de cada minuto la toma de beneficios no llegaba a saltar (en las órdenes reales vigilan bots sin pausa).
-setInterval(async () => {
-  if (supersededBy() || !holdsTickLease()) return;
-  const open = db
-    .prepare("SELECT 1 FROM orders o JOIN missions m ON m.id = o.mission_id WHERE o.status = 'open' AND o.condition != 'time' AND m.status = 'active' LIMIT 1")
-    .get();
-  if (open) await checkOrders().catch((err) => console.error(`Error revisando órdenes: ${(err as Error).message}`));
-}, 15_000);

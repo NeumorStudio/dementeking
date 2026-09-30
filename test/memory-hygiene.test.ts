@@ -4,13 +4,14 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { db, now } from "../src/db.js";
 import * as memory from "../src/sim/memory.js";
-import { createMission } from "../src/sim/mission.js";
+import { createMission, startMissionClock } from "../src/sim/mission.js";
 import { runTool } from "../src/tools/index.js";
 import { installFakeMarket, MEME } from "./fake-market.js";
 
 installFakeMarket();
 
 const mission = await createMission(1000, 1200, 60, undefined, { solana: 100 });
+startMissionClock(mission.id);
 const ctx = { sessionId: 1, missionId: mission.id };
 let n = 0;
 function closed(entry: Record<string, unknown>, pnlPct: number) {
@@ -77,6 +78,7 @@ test("creencias contradichas por los datos y límite de howtos", () => {
 
 test("parado en efectivo, lejos del objetivo y con tiempo por delante: mission_status avisa", async () => {
   const m = await createMission(100, 150, 60, undefined, { solana: 100 });
+  startMissionClock(m.id);
   const status = () => runTool("mission_status", {}, { sessionId: 1, missionId: m.id }).then((r) => String(r.content));
   assert.doesNotMatch(await status(), /sin operar/);
   // Lleva 15 min sin hacer nada (más del 15 % de 60 min).
@@ -88,6 +90,7 @@ test("parado en efectivo, lejos del objetivo y con tiempo por delante: mission_s
 test("sin fondos: por debajo del 5 % del capital (o de 2 $) la misión termina sola como bancarrota", async () => {
   const { checkMission, getMission, missionHistory } = await import("../src/sim/mission.js");
   const m = await createMission(50, 100, 60, undefined, { solana: 100 });
+  startMissionClock(m.id);
   // Se queda con 1,6 $ (menos del 5 % de 50 = 2,5 $): no es cero, pero ya no da para operar.
   db.prepare("UPDATE holdings SET amount = CASE WHEN symbol = 'USDC' THEN 1.6 ELSE 0 END WHERE mission_id = ?").run(m.id);
   const log = await checkMission(m.id);

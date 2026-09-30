@@ -9,6 +9,9 @@ interface Token {
   symbol: string;
   decimals: number;
   price: number;
+  /** Lo que Jupiter dice de su origen: launchpad y cuándo se graduó (ISO). */
+  launchpad?: string;
+  graduatedAt?: string;
 }
 
 export const tokens: Record<string, Token> = {
@@ -59,14 +62,24 @@ const EVM_HOSTS: Record<EvmChain, string> = { base: "mainnet.base.org", bsc: "bs
 export const EVM_GAS = 200_000;
 export const EVM_GAS_PRICE: Record<EvmChain, number> = { base: 10_000_000, bsc: 50_000_000 };
 
+/** Rutas extra de un test (p. ej. GeckoTerminal): si devuelve una respuesta, se usa esa. */
+let extraRoutes: ((url: URL) => Response | undefined) | null = null;
+export function setExtraRoutes(fn: ((url: URL) => Response | undefined) | null) {
+  extraRoutes = fn;
+  installFakeMarket();
+}
+
 function handle(url: URL, body?: unknown): Response {
+  const extra = extraRoutes?.(url);
+  if (extra) return extra;
   if (url.host === "lite-api.jup.ag") {
     if (url.pathname === "/tokens/v2/search") {
       const t = tokens[url.searchParams.get("query")!];
       const id = url.searchParams.get("query");
       // MEME lo lanzó un creador "en serie" (40 tokens, ninguno graduado).
       const creator = id === MEME ? { dev: MEME_DEV, audit: { devMints: 40, devMigrations: 0, devBalancePercentage: 8 } } : {};
-      return json(t ? [{ id, symbol: t.symbol, name: t.symbol, decimals: t.decimals, usdPrice: t.price, ...creator }] : []);
+      const origin = t ? { launchpad: t.launchpad, graduatedAt: t.graduatedAt } : {};
+      return json(t ? [{ id, symbol: t.symbol, name: t.symbol, decimals: t.decimals, usdPrice: t.price, ...creator, ...origin }] : []);
     }
     if (url.pathname === "/price/v3") {
       const ids = url.searchParams.get("ids")!.split(",");

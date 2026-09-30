@@ -5,7 +5,7 @@ import { test } from "node:test";
 import { config } from "../src/config.js";
 import { db, now } from "../src/db.js";
 import { SOL_MINT, USDC_MINT } from "../src/market/jupiter.js";
-import { createMission } from "../src/sim/mission.js";
+import { createMission, startMissionClock } from "../src/sim/mission.js";
 import { checkOrders, placeOrder } from "../src/sim/orders.js";
 import { binanceMarketOrder, getHoldings, liquidateAll, quoteSwap, swap, valuation } from "../src/sim/portfolio.js";
 import { cexTransfer, settleTransfers } from "../src/sim/transfers.js";
@@ -20,6 +20,7 @@ const bal = (missionId: number, venue: string, asset: string) =>
 const close = (a: number, b: number, eps = 1e-6) => assert.ok(Math.abs(a - b) < eps, `${a} ≠ ${b}`);
 
 const mission = await createMission(1000, 5000, 60, undefined, { solana: 100 });
+startMissionClock(mission.id);
 const m = mission.id;
 
 test("la misión empieza con USDC y un poco de SOL en Solana", () => {

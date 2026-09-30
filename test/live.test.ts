@@ -7,7 +7,7 @@ import { after, test } from "node:test";
 import { Keypair, PublicKey, SystemProgram, TransactionMessage, VersionedTransaction, TransactionInstruction } from "@solana/web3.js";
 import { checkEvmTx, checkLimits, checkSolanaSpend, checkSolanaTx, JUPITER_PROGRAM, type AccountState } from "../src/live/policy.js";
 import { createSignerServer } from "../src/live/signer/server.js";
-import { createLiveMission, type Mission } from "../src/sim/mission.js";
+import { createLiveMission, startMissionClock, type Mission } from "../src/sim/mission.js";
 import { runTool } from "../src/tools/index.js";
 import { db } from "../src/db.js";
 import { valuation } from "../src/sim/portfolio.js";
@@ -236,6 +236,7 @@ test("parar todo rechaza lo pendiente y bloquea la firma", async () => {
 
 test("las herramientas no mezclan modos: en una misión real no se simula ni se usa Binance", async () => {
   const m = liveMission("auto");
+  startMissionClock(m.id);
   const ctx = { sessionId: 1, missionId: m.id };
   const sim = await runTool("simulate_swap", { chain: "solana", input: "USDC", output: "SOL", amount: 1, thesis: { why: "x", evidence: "x", sources: ["x"], exit_plan: "x", beliefs_applied: [], memory_note: "x" } }, ctx);
   assert.equal(sim.isError, true);

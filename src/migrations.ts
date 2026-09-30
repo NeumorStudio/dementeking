@@ -7,6 +7,7 @@
 import { mkdirSync, readdirSync, rmSync } from "node:fs";
 import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
+import { missionClass, missionDurationMinutes } from "./sim/mission-kind.js";
 import { fingerprint, lessonRefs } from "./sim/text.js";
 
 export interface Migration {
@@ -153,6 +154,104 @@ export const MIGRATIONS: Migration[] = [
         research.hourUtc = new Date(r.opened_at).getUTCHours();
         update.run(JSON.stringify(research), r.id);
       }
+    },
+  },
+  {
+    version: 10,
+    description: "Misiones rápidas: clase de misión, P predicha y de la línea base, plan, gemelo mecánico y motivo de cierre",
+    up: (db) => {
+      db.exec(`
+        ALTER TABLE missions ADD COLUMN class TEXT;           -- '<mercado>-<minutos>m-+<objetivo>%', p. ej. 'graduado-10m-+25%'
+        ALTER TABLE missions ADD COLUMN predicted_p REAL;     -- P de llegar al objetivo según el plan vigente al arrancar el reloj (0-1)
+        ALTER TABLE missions ADD COLUMN baseline_p REAL;      -- P de la línea base (regla mecánica) para esa clase (0-1)
+        ALTER TABLE missions ADD COLUMN plan_id INTEGER;      -- plan vigente al arrancar el reloj
+        ALTER TABLE missions ADD COLUMN shadow_hits INTEGER;  -- aciertos del gemelo mecánico
+        ALTER TABLE missions ADD COLUMN shadow_return REAL;   -- resultado medio del gemelo (fracción: -0.12 = -12 %)
+        -- 'target' | 'deadline' | 'bust' | 'loss_limit' | 'user' | 'replaced' | 'prep_timeout'
+        ALTER TABLE missions ADD COLUMN end_reason TEXT;
+      `);
+      // Las misiones que ya existían reciben su clase con el mismo criterio que las nuevas.
+      const rows = db.prepare("SELECT id, created_at, deadline, initial_usd, target_usd, mode FROM missions").all() as Array<{
+        id: number;
+        created_at: string;
+        deadline: string;
+        initial_usd: number;
+        target_usd: number;
+        mode: string | null;
+      }>;
+      const update = db.prepare("UPDATE missions SET class = ? WHERE id = ?");
+      for (const m of rows) {
+        update.run(missionClass({ durationMinutes: missionDurationMinutes(m), initialUsd: m.initial_usd, targetUsd: m.target_usd, live: m.mode === "live" }), m.id);
+      }
+    },
+  },
+  {
+    version: 11,
+    description: "Planes del cerebro (planner): reglas fijas para un bloque de misiones de una misma clase",
+    up: (db) =>
+      db.exec(`
+        CREATE TABLE plans (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          created_at TEXT NOT NULL,
+          class TEXT NOT NULL,               -- clase de misión a la que se aplica, p. ej. 'graduado-10m-+25%'
+          body TEXT NOT NULL,                -- JSON: evento, filtros, tamaño, toma de beneficio, reentrada, riesgos, lista corta
+          predicted_p REAL,                  -- P de llegar al objetivo siguiendo el plan (0-1)
+          baseline_p REAL,                   -- P de la línea base (la regla mecánica) para esa clase (0-1)
+          active INTEGER NOT NULL DEFAULT 1  -- 1 = vigente; como mucho uno por clase
+        );
+        CREATE INDEX plans_class ON plans (class, active);
+      `),
+  },
+  {
+    version: 12,
+    description: "Gemelo mecánico de las misiones rápidas: posiciones en papel en los eventos siguientes, sin tocar la cartera",
+    up: (db) =>
+      db.exec(`
+        CREATE TABLE shadow_runs (
+          mission_id INTEGER PRIMARY KEY,
+          started_at TEXT NOT NULL,          -- cuando arrancó el reloj de la misión
+          detect_until TEXT NOT NULL,        -- hasta cuándo abre gemelos: el plazo de la misión
+          horizon_minutes REAL NOT NULL,     -- plazo de cada gemelo desde que entra (la duración de la misión)
+          source TEXT NOT NULL,              -- fuente de eventos, la misma que wait_for_signal: 'graduado'
+          size_usd REAL NOT NULL,            -- lo que compra cada gemelo (lo que compraría el agente)
+          tp_usd REAL NOT NULL,              -- acierta si vender sus tokens da esto o más (la toma de beneficio del plan)
+          tp_basis TEXT NOT NULL,
+          target_count INTEGER NOT NULL,     -- cuántos gemelos abre como mucho
+          status TEXT NOT NULL DEFAULT 'running',  -- running | done | abandoned
+          note TEXT,
+          ended_at TEXT
+        );
+        CREATE TABLE shadow_positions (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          mission_id INTEGER NOT NULL,
+          token TEXT NOT NULL,
+          symbol TEXT,
+          pool TEXT,
+          opened_at TEXT NOT NULL,
+          expires_at TEXT NOT NULL,
+          usd_in REAL NOT NULL,
+          tokens_raw TEXT NOT NULL,          -- tokens comprados en unidades base (lo que se cotiza al venderlos)
+          decimals INTEGER NOT NULL,
+          entry_value_usd REAL NOT NULL,     -- lo que daba venderlos al entrar (tras la ida y vuelta)
+          last_value_usd REAL,
+          best_value_usd REAL,
+          last_quote_at TEXT,
+          quotes INTEGER NOT NULL DEFAULT 0,
+          status TEXT NOT NULL DEFAULT 'open',  -- open | hit | expired | abandoned
+          closed_at TEXT,
+          exit_usd REAL,
+          note TEXT,
+          UNIQUE (mission_id, token)
+        );
+        CREATE INDEX shadow_positions_open ON shadow_positions (status, mission_id);
+      `),
+  },
+  {
+    version: 13,
+    description: "Una misión real nunca es rápida: su clase va en el mercado libre aunque dure 15 min o menos",
+    // La migración 10 les daba el mercado de las rápidas (graduado) a las reales cortas, y el flujo rápido solo existe en simulación.
+    up: (db) => {
+      db.exec("UPDATE missions SET class = 'libre' || substr(class, instr(class, '-')) WHERE mode = 'live' AND class IS NOT NULL AND class NOT LIKE 'libre-%'");
     },
   },
 ];

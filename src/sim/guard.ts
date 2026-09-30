@@ -3,6 +3,7 @@
 // thesis.overrides. No hay reglas fijas: un honeypot o un creador que ya le costó dinero son datos (el
 // simulador hace que un honeypot no se pueda vender), y aprender de ellos es cosa de su memoria.
 import type { ChainId } from "./types.js";
+import type { TokenRef } from "./venues/types.js";
 import { getChain } from "./venues/index.js";
 import { blockingBeliefs } from "./memory.js";
 import { creatorHistory, decisionContext } from "./positions.js";
@@ -10,6 +11,25 @@ import { creatorHistory, decisionContext } from "./positions.js";
 export interface BeliefOverride {
   id: number;
   reason: string;
+}
+
+/**
+ * Creencias negativas fuertes que frenarían comprar este token (sin contar las que se ignoran a sabiendas). La usan
+ * checkBuyAgainstMemory y wait_for_signal, que no ofrece un candidato que la memoria va a rechazar al entrar.
+ */
+export async function memoryBlockers(a: {
+  chain: ChainId;
+  token: TokenRef;
+  /** Para las creencias sobre cómo decide (tamaño, reentrada, tiempo): la misión y lo que se paga en USD. */
+  missionId?: number;
+  amountUsd?: number;
+}) {
+  const chain = getChain(a.chain);
+  const features = await chain.entryFeatures(a.token.address).catch(() => null);
+  if (!features) return [];
+  const decision = a.missionId !== undefined ? decisionContext(a.missionId, chain.id, a.token.address, a.amountUsd ?? 0, false) : {};
+  const entry = { ...features, ...creatorHistory(features.creator) } as unknown as Record<string, unknown>;
+  return blockingBeliefs(chain.id, entry, a.token.address, decision);
 }
 
 /** Comprueba una compra (lo que se recibe no es efectivo ni el nativo). Lanza un error si hay que frenarla. */
@@ -33,25 +53,19 @@ export async function checkBuyAgainstMemory(a: {
         "los datos de riskCheck en token_report, y por qué no descartan la compra.",
     );
   }
-  const features = await chain.entryFeatures(out.address).catch(() => null);
-  if (!features) return [];
   const overridden = new Map((a.overrides ?? []).map((o) => [o.id, o]));
-  const reasons: string[] = [];
   // Lo que se paga en USD, si se paga con un estable (lo normal al comprar un memecoin).
   let amountUsd = 0;
   if (a.input && a.amount) {
     const input = await chain.resolveToken(a.input).catch(() => null);
     if (input && chain.isCash(input.address)) amountUsd = a.amount;
   }
-  const decision = a.missionId !== undefined ? decisionContext(a.missionId, chain.id, out.address, amountUsd, false) : {};
-  const entry = { ...features, ...creatorHistory(features.creator) } as unknown as Record<string, unknown>;
-  const blocking = blockingBeliefs(chain.id, entry, out.address, decision);
-  for (const b of blocking.filter((x) => !overridden.has(x.id))) reasons.push(`- #${b.id}: ${b.statement} (evidencia: ${b.verdict})`);
-  if (reasons.length) {
-    const ids = blocking.filter((x) => !overridden.has(x.id)).map((b) => b.id);
+  const blocking = (await memoryBlockers({ chain: chain.id, token: out, missionId: a.missionId, amountUsd })).filter((b) => !overridden.has(b.id));
+  if (blocking.length) {
+    const reasons = blocking.map((b) => `- #${b.id}: ${b.statement} (evidencia: ${b.verdict})`);
     throw new Error(
       `Tu memoria desaconseja esta compra de ${out.symbol}:\n${reasons.join("\n")}\n` +
-        `Si aun así quieres comprarlo, repite la operación con thesis.overrides = [${ids.map((id) => `{ id: ${id}, reason: "por qué esta vez es distinto" }`).join(", ")}].`,
+        `Si aun así quieres comprarlo, repite la operación con thesis.overrides = [${blocking.map((b) => `{ id: ${b.id}, reason: "por qué esta vez es distinto" }`).join(", ")}].`,
     );
   }
   return [...overridden.values()];

@@ -3,13 +3,14 @@
 import type Anthropic from "@anthropic-ai/sdk";
 import { z } from "zod";
 import { BROWSER_TOOLS, closeBrowser } from "./browser-tools.js";
-import type { ToolCtx } from "./define.js";
+import { toolRoles, type ToolCtx } from "./define.js";
 import { runTool as runSimTool, SIM_TOOLS } from "./index.js";
 
 export type AgentRole = "trader" | "reviewer";
 
-// Cada agente ve solo las herramientas de su rol (en el plugin lo decide disallowedTools).
-const forRole = (role: AgentRole) => SIM_TOOLS.filter((t) => (t.role ?? "trader") === role || t.role === "both");
+// Cada agente ve solo las herramientas de su rol (en el plugin lo decide disallowedTools). El runner por API solo
+// lanza el trader y el revisor: el planner y el executor son de las misiones rápidas del plugin.
+const forRole = (role: AgentRole) => SIM_TOOLS.filter((t) => toolRoles(t).includes(role));
 
 const TOOLS: Record<AgentRole, ReadonlyArray<{ name: string; description: string; schema: z.ZodObject }>> = {
   trader: [...BROWSER_TOOLS, ...forRole("trader")],

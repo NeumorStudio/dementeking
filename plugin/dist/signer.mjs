@@ -7282,10 +7282,32 @@ var init_config = __esm({
       maxStepsPerSession: num("MAX_STEPS_PER_SESSION", 80),
       loopPauseMinutes: num("LOOP_PAUSE_MINUTES", 30),
       watchIntervalSeconds: num("WATCH_INTERVAL_SECONDS", 60),
+      // Con una misión rápida en marcha (15 min o menos), órdenes, futuros y misión se miran así de a menudo.
+      fastWatchIntervalSeconds: num("FAST_WATCH_INTERVAL_SECONDS", 5),
       browserHeadful: process.env.BROWSER_HEADFUL === "true",
       // DATA_DIR permite usar otra base de datos (p. ej. para pruebas) sin tocar la simulación principal.
       dataDir: resolveDataDir()
     };
+  }
+});
+
+// src/sim/mission-kind.ts
+function missionDurationMinutes(m) {
+  return (new Date(m.deadline).getTime() - new Date(m.created_at).getTime()) / 6e4;
+}
+function missionClass(a) {
+  const market = a.market?.trim() || (!a.live && isFastMinutes(a.durationMinutes) ? DEFAULT_FAST_MARKET : FREE_MARKET);
+  const num3 = (x) => String(Number(x.toFixed(1)));
+  return `${market}-${num3(a.durationMinutes)}m-+${num3((a.targetUsd - a.initialUsd) / a.initialUsd * 100)}%`;
+}
+var FAST_MISSION_MAX_MINUTES, DEFAULT_FAST_MARKET, FREE_MARKET, isFastMinutes;
+var init_mission_kind = __esm({
+  "src/sim/mission-kind.ts"() {
+    "use strict";
+    FAST_MISSION_MAX_MINUTES = 15;
+    DEFAULT_FAST_MARKET = "graduado";
+    FREE_MARKET = "libre";
+    isFastMinutes = (minutes) => minutes <= FAST_MISSION_MAX_MINUTES + 1e-3;
   }
 });
 
@@ -7532,6 +7554,7 @@ var MIGRATIONS, MAX_BACKUPS, schemaVersion;
 var init_migrations = __esm({
   "src/migrations.ts"() {
     "use strict";
+    init_mission_kind();
     init_text();
     MIGRATIONS = [
       {
@@ -7665,6 +7688,94 @@ var init_migrations = __esm({
             research.hourUtc = new Date(r.opened_at).getUTCHours();
             update.run(JSON.stringify(research), r.id);
           }
+        }
+      },
+      {
+        version: 10,
+        description: "Misiones r\xE1pidas: clase de misi\xF3n, P predicha y de la l\xEDnea base, plan, gemelo mec\xE1nico y motivo de cierre",
+        up: (db2) => {
+          db2.exec(`
+        ALTER TABLE missions ADD COLUMN class TEXT;           -- '<mercado>-<minutos>m-+<objetivo>%', p. ej. 'graduado-10m-+25%'
+        ALTER TABLE missions ADD COLUMN predicted_p REAL;     -- P de llegar al objetivo seg\xFAn el plan vigente al arrancar el reloj (0-1)
+        ALTER TABLE missions ADD COLUMN baseline_p REAL;      -- P de la l\xEDnea base (regla mec\xE1nica) para esa clase (0-1)
+        ALTER TABLE missions ADD COLUMN plan_id INTEGER;      -- plan vigente al arrancar el reloj
+        ALTER TABLE missions ADD COLUMN shadow_hits INTEGER;  -- aciertos del gemelo mec\xE1nico
+        ALTER TABLE missions ADD COLUMN shadow_return REAL;   -- resultado medio del gemelo (fracci\xF3n: -0.12 = -12 %)
+        -- 'target' | 'deadline' | 'bust' | 'loss_limit' | 'user' | 'replaced' | 'prep_timeout'
+        ALTER TABLE missions ADD COLUMN end_reason TEXT;
+      `);
+          const rows = db2.prepare("SELECT id, created_at, deadline, initial_usd, target_usd, mode FROM missions").all();
+          const update = db2.prepare("UPDATE missions SET class = ? WHERE id = ?");
+          for (const m of rows) {
+            update.run(missionClass({ durationMinutes: missionDurationMinutes(m), initialUsd: m.initial_usd, targetUsd: m.target_usd, live: m.mode === "live" }), m.id);
+          }
+        }
+      },
+      {
+        version: 11,
+        description: "Planes del cerebro (planner): reglas fijas para un bloque de misiones de una misma clase",
+        up: (db2) => db2.exec(`
+        CREATE TABLE plans (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          created_at TEXT NOT NULL,
+          class TEXT NOT NULL,               -- clase de misi\xF3n a la que se aplica, p. ej. 'graduado-10m-+25%'
+          body TEXT NOT NULL,                -- JSON: evento, filtros, tama\xF1o, toma de beneficio, reentrada, riesgos, lista corta
+          predicted_p REAL,                  -- P de llegar al objetivo siguiendo el plan (0-1)
+          baseline_p REAL,                   -- P de la l\xEDnea base (la regla mec\xE1nica) para esa clase (0-1)
+          active INTEGER NOT NULL DEFAULT 1  -- 1 = vigente; como mucho uno por clase
+        );
+        CREATE INDEX plans_class ON plans (class, active);
+      `)
+      },
+      {
+        version: 12,
+        description: "Gemelo mec\xE1nico de las misiones r\xE1pidas: posiciones en papel en los eventos siguientes, sin tocar la cartera",
+        up: (db2) => db2.exec(`
+        CREATE TABLE shadow_runs (
+          mission_id INTEGER PRIMARY KEY,
+          started_at TEXT NOT NULL,          -- cuando arranc\xF3 el reloj de la misi\xF3n
+          detect_until TEXT NOT NULL,        -- hasta cu\xE1ndo abre gemelos: el plazo de la misi\xF3n
+          horizon_minutes REAL NOT NULL,     -- plazo de cada gemelo desde que entra (la duraci\xF3n de la misi\xF3n)
+          source TEXT NOT NULL,              -- fuente de eventos, la misma que wait_for_signal: 'graduado'
+          size_usd REAL NOT NULL,            -- lo que compra cada gemelo (lo que comprar\xEDa el agente)
+          tp_usd REAL NOT NULL,              -- acierta si vender sus tokens da esto o m\xE1s (la toma de beneficio del plan)
+          tp_basis TEXT NOT NULL,
+          target_count INTEGER NOT NULL,     -- cu\xE1ntos gemelos abre como mucho
+          status TEXT NOT NULL DEFAULT 'running',  -- running | done | abandoned
+          note TEXT,
+          ended_at TEXT
+        );
+        CREATE TABLE shadow_positions (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          mission_id INTEGER NOT NULL,
+          token TEXT NOT NULL,
+          symbol TEXT,
+          pool TEXT,
+          opened_at TEXT NOT NULL,
+          expires_at TEXT NOT NULL,
+          usd_in REAL NOT NULL,
+          tokens_raw TEXT NOT NULL,          -- tokens comprados en unidades base (lo que se cotiza al venderlos)
+          decimals INTEGER NOT NULL,
+          entry_value_usd REAL NOT NULL,     -- lo que daba venderlos al entrar (tras la ida y vuelta)
+          last_value_usd REAL,
+          best_value_usd REAL,
+          last_quote_at TEXT,
+          quotes INTEGER NOT NULL DEFAULT 0,
+          status TEXT NOT NULL DEFAULT 'open',  -- open | hit | expired | abandoned
+          closed_at TEXT,
+          exit_usd REAL,
+          note TEXT,
+          UNIQUE (mission_id, token)
+        );
+        CREATE INDEX shadow_positions_open ON shadow_positions (status, mission_id);
+      `)
+      },
+      {
+        version: 13,
+        description: "Una misi\xF3n real nunca es r\xE1pida: su clase va en el mercado libre aunque dure 15 min o menos",
+        // La migración 10 les daba el mercado de las rápidas (graduado) a las reales cortas, y el flujo rápido solo existe en simulación.
+        up: (db2) => {
+          db2.exec("UPDATE missions SET class = 'libre' || substr(class, instr(class, '-')) WHERE mode = 'live' AND class IS NOT NULL AND class NOT LIKE 'libre-%'");
         }
       }
     ];
@@ -7862,7 +7973,7 @@ var init_db = __esm({
       }
     }
     runMigrations(db, config.dataDir);
-    CODE_VERSION = "0.36.2";
+    CODE_VERSION = "0.37.0";
     semver = (v) => v.split(".").map((n3) => Number.parseInt(n3, 10) || 0);
     newer = (a, b) => {
       const [x, y] = [semver(a), semver(b)];
@@ -7892,6 +8003,18 @@ async function pace(host) {
   const slot = next_at - interval;
   if (slot > nowMs) await sleep(slot - nowMs);
 }
+async function paceLow(host, maxWaitMs) {
+  const interval = MIN_INTERVAL_MS[host];
+  if (!interval) return;
+  const until = Date.now() + maxWaitMs;
+  for (; ; ) {
+    const nowMs = Date.now();
+    if (takeFreeStmt.get(host, nowMs + interval, nowMs)) return;
+    const next = nextAtStmt.get(host)?.next_at ?? nowMs;
+    if (next > until) throw new HostBusyError(`${host} est\xE1 ocupado con otras peticiones: la de baja prioridad se deja para la siguiente vuelta`);
+    await sleep(Math.max(20, next - nowMs));
+  }
+}
 async function acquire(host) {
   if ((active.get(host) ?? 0) >= MAX_PARALLEL_PER_HOST) {
     await new Promise((resolve) => {
@@ -7914,7 +8037,8 @@ async function request(url, opts) {
       const hora = new Date(blocked).toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
       throw new Error(`${host} ha bloqueado temporalmente esta IP por exceso de peticiones (hasta las ${hora}); no se le llama hasta entonces`);
     }
-    await pace(host);
+    if (opts.lowPriority) await paceLow(host, LOW_PRIORITY_MAX_WAIT_MS);
+    else await pace(host);
     await acquire(host);
     let res;
     let body;
@@ -7942,7 +8066,8 @@ async function request(url, opts) {
       const retryAfter = Number(res.headers.get("retry-after"));
       const wait2 = Number.isFinite(retryAfter) && retryAfter > 0 ? Math.min(retryAfter, 15) * 1e3 : COOLDOWN_MS;
       if (MIN_INTERVAL_MS[host]) cooldownStmt.run(host, Date.now() + wait2);
-      else await sleep(wait2);
+      if (opts.lowPriority) return { status: res.status, body };
+      if (!MIN_INTERVAL_MS[host]) await sleep(wait2);
       continue;
     }
     return { status: res.status, body };
@@ -7978,7 +8103,7 @@ async function fetchJson(url, a = {}, ttlMs) {
   if (status < 200 || status >= 300) throw new Error(`HTTP ${status} en ${url}: ${body.slice(0, 300)}`);
   return JSON.parse(body);
 }
-var DEFAULT_TTL_MS, MAX_PARALLEL_PER_HOST, MAX_RETRIES, MIN_INTERVAL_MS, DEFAULT_BAN_MS, COOLDOWN_MS, reserveStmt, cooldownStmt, blockedStmt, blockStmt, MAX_CACHE_ENTRIES, cache, active, waiting, sleep, fetchImpl, budgetStmt;
+var DEFAULT_TTL_MS, MAX_PARALLEL_PER_HOST, MAX_RETRIES, MIN_INTERVAL_MS, DEFAULT_BAN_MS, COOLDOWN_MS, reserveStmt, takeFreeStmt, nextAtStmt, cooldownStmt, blockedStmt, blockStmt, LOW_PRIORITY_MAX_WAIT_MS, HostBusyError, MAX_CACHE_ENTRIES, cache, active, waiting, sleep, fetchImpl, budgetStmt;
 var init_http = __esm({
   "src/market/http.ts"() {
     "use strict";
@@ -8005,6 +8130,11 @@ var init_http = __esm({
       `INSERT INTO http_pacing (host, next_at) VALUES (?, ?) ON CONFLICT(host) DO UPDATE SET next_at = max(next_at, ?) + ?
    RETURNING next_at`
     );
+    takeFreeStmt = db.prepare(
+      `INSERT INTO http_pacing (host, next_at) VALUES (?, ?) ON CONFLICT(host) DO UPDATE SET next_at = excluded.next_at WHERE http_pacing.next_at <= ?
+   RETURNING next_at`
+    );
+    nextAtStmt = db.prepare("SELECT next_at FROM http_pacing WHERE host = ?");
     cooldownStmt = db.prepare(
       "INSERT INTO http_pacing (host, next_at) VALUES (?, ?) ON CONFLICT(host) DO UPDATE SET next_at = max(next_at, excluded.next_at)"
     );
@@ -8013,6 +8143,9 @@ var init_http = __esm({
     blockStmt = db.prepare(
       "INSERT INTO http_blocked (host, until) VALUES (?, ?) ON CONFLICT(host) DO UPDATE SET until = max(until, excluded.until)"
     );
+    LOW_PRIORITY_MAX_WAIT_MS = 3e3;
+    HostBusyError = class extends Error {
+    };
     MAX_CACHE_ENTRIES = 2e3;
     cache = /* @__PURE__ */ new Map();
     active = /* @__PURE__ */ new Map();
@@ -8049,9 +8182,9 @@ async function getTokenInfo(mint) {
   tokenCache.set(mint, info);
   return info;
 }
-async function getQuote(inputMint, outputMint, amountBase, slippageBps, ttlMs = 2e3) {
+async function getQuote(inputMint, outputMint, amountBase, slippageBps, ttlMs = 2e3, opts = {}) {
   const url = `${BASE}/swap/v1/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountBase.toString()}&slippageBps=${slippageBps}`;
-  const quote2 = await fetchJson(url, 15e3, ttlMs);
+  const quote2 = await fetchJson(url, { timeoutMs: 15e3, ttlMs, lowPriority: opts.lowPriority });
   if (quote2.error) throw new Error(`Jupiter: ${quote2.error}`);
   return quote2;
 }
@@ -9196,6 +9329,165 @@ var init_paths2 = __esm({
   }
 });
 
+// src/sim/baselines.json
+var baselines_default;
+var init_baselines = __esm({
+  "src/sim/baselines.json"() {
+    baselines_default = {
+      about: "L\xEDneas base medidas (30-sep-2026) de las misiones r\xE1pidas: la P de llegar al objetivo con una regla mec\xE1nica, sin inteligencia. Son mediciones sobre datos hist\xF3ricos, no predicciones. Fuente: C:/tf-tmp/dk-research/results/sintesis.md, secciones 1 y 4.7.",
+      method: "P por cierre de vela de 1 min, con 10 $ y costes reales: una sola compra con todo y una orden de venta en el objetivo neto de costes; si no salta, venta al acabar el reloj. El simulador mira la orden cada 5-15 s, as\xED que puede dar algo m\xE1s, hasta la cifra 'tocando mecha'.",
+      horizons: [5, 10, 15, 30],
+      targets: [25, 50, 100],
+      memecoins: {
+        graduado: {
+          strategy: "Memecoin reci\xE9n graduada",
+          label: "token de pump.fun reci\xE9n graduado (migrado a su pool de PumpSwap hace 2 min o menos), comprado 1-2 min despu\xE9s de migrar",
+          sample: "925 tokens en 23 h de un solo d\xEDa (29-30 sep 2026)",
+          verified: false,
+          reliability: "sin repetir con otro d\xEDa ni fuera de muestra. La P de +25 % en 10 min es estable en los cuatro bloques de 6 h (32, 34, 35 y 38 %; IC95 del total 32-38 %); el EV no lo es (de +3 a \u221223 % seg\xFAn el bloque). Puede deberse en parte a BOOST de pump.fun: si lo cambian, la cifra desaparece",
+          evPct: [-24, -12],
+          p: {
+            "5": { "25": 0.24, "50": 0.11, "100": 0.05 },
+            "10": { "25": 0.35, "50": 0.21, "100": 0.09 },
+            "15": { "25": 0.37, "50": 0.25, "100": 0.14 },
+            "30": { "25": 0.39, "50": 0.26, "100": 0.17 }
+          },
+          cellEvPct: {
+            "5": { "25": [-12, -12], "50": [-16, -8], "100": [-16, -8] },
+            "10": { "25": [-12, -12], "50": [-17, -17], "100": [-19, -19] },
+            "15": { "25": [-14, -14], "50": [-19, -19], "100": [-22, -22] },
+            "30": { "25": [-14, -14], "50": [-20, -20], "100": [-24, -24] }
+          },
+          wick: {
+            "5": { "25": 0.39, "100": 0.12 },
+            "10": { "25": 0.51, "100": 0.17 },
+            "15": { "25": 0.52, "100": 0.21 },
+            "30": { "25": 0.53, "100": 0.25 }
+          },
+          outOfSample: {}
+        },
+        momentum: {
+          strategy: "Memecoin con momentum (+25 % en 1 min)",
+          label: "token de pump.fun comprado en la primera vela de 1 min que sube un 25 % o m\xE1s en su primera hora de vida",
+          sample: "95 + 69 tokens en dos ventanas seguidas (la segunda, fuera de muestra, la baj\xF3 el verificador)",
+          verified: true,
+          reliability: "reimplementado por otro agente y comprobado con una segunda ventana de datos, que rebaj\xF3 las cifras",
+          evPct: [-27, -8],
+          p: {
+            "5": { "25": 0.16, "50": 0.12, "100": 0.06 },
+            "10": { "25": 0.19, "50": 0.13, "100": 0.08 },
+            "15": { "25": 0.2, "50": 0.14, "100": 0.1 },
+            "30": { "25": 0.2, "50": 0.14, "100": 0.11 }
+          },
+          outOfSample: {
+            "10": { "25": 0.16, "100": 0.07 }
+          }
+        },
+        lanzamiento: {
+          strategy: "Lanzamiento de pump.fun al minuto 1",
+          label: "cualquier lanzamiento de pump.fun comprado en su minuto 1",
+          sample: "692 + 513 lanzamientos en dos ventanas seguidas (la segunda, fuera de muestra)",
+          verified: true,
+          reliability: "comprobado fuera de muestra, que rebaj\xF3 las cifras",
+          evPct: [-14, -8],
+          p: {
+            "5": { "25": 0.06, "50": 0.04, "100": 0.02 },
+            "10": { "25": 0.07, "50": 0.04, "100": 0.03 },
+            "15": { "25": 0.07, "50": 0.05, "100": 0.03 },
+            "30": { "25": 0.07, "50": 0.05, "100": 0.03 }
+          },
+          outOfSample: {
+            "5": { "25": 0.03, "100": 0.01 },
+            "10": { "25": 0.04, "100": 0.02 }
+          }
+        }
+      },
+      perps: {
+        about: "R\xE9plica exacta del simulador (mira los futuros cada 60 s y cobra 0,30 $ + 1 $ fijos por posici\xF3n), con 6 meses de velas de 1 min (abril-septiembre 2026). Todo el capital (50 $) en una sola cadena y objetivo +25 %. Solo existen en simulaci\xF3n.",
+        capitalUsd: 50,
+        targetPct: 25,
+        x2: "\u22480 en todos los plazos de 30 min o menos (1 de cada 1.400 a 14.000 intentos, en la mejor moneda)",
+        defaultAllocation: "con el reparto por defecto (30/25/25/20) un futuro solo puede usar 13,95 $ de los 50 $, y el +25 % en 15 min cae a \u22480,01 %",
+        cells: [
+          {
+            id: "btc-40x",
+            coin: "BTC",
+            leverage: 40,
+            label: "BTC a 40x, sin esperar",
+            p: { "5": 1e-3, "10": 3e-3, "15": 67e-4, "30": 0.0195 },
+            evPct: [-6, -6]
+          },
+          {
+            id: "btc-40x-vol",
+            coin: "BTC",
+            leverage: 40,
+            label: "BTC a 40x, arrancando solo con la volatilidad de la \xFAltima hora en su 1 % m\xE1s alto",
+            gate: { sigmaPerMinute: 125e-5, text: "volatilidad de la \xFAltima hora \u2265 0,125 % por minuto (su 1 % m\xE1s alto): apareci\xF3 135 h en 121 d\xEDas, agrupadas en 37 d\xEDas" },
+            p: { "5": 0.014, "10": 0.043, "15": 0.076, "30": 0.172 },
+            ci95: { "15": [0.049, 0.098] },
+            evPct: [-10, -8],
+            note: "comprobado fuera de muestra; si el agente tarda 2 min en entrar, el 7,6 % baja a 5,9 %"
+          },
+          {
+            id: "zec-10x",
+            coin: "ZEC",
+            leverage: 10,
+            label: "futuro de alta volatilidad a 10x (tipo ZEC)",
+            p: { "5": 1e-3, "10": 27e-4, "15": 48e-4, "30": 0.0139 }
+          }
+        ]
+      }
+    };
+  }
+});
+
+// src/sim/baselines.ts
+var BASELINE_HORIZONS, BASELINE_TARGETS, MARKETS, PERP_CELLS, PERP_BASELINE_INFO;
+var init_baselines2 = __esm({
+  "src/sim/baselines.ts"() {
+    "use strict";
+    init_baselines();
+    init_mission_kind();
+    BASELINE_HORIZONS = baselines_default.horizons;
+    BASELINE_TARGETS = baselines_default.targets;
+    MARKETS = baselines_default.memecoins;
+    PERP_CELLS = baselines_default.perps.cells;
+    PERP_BASELINE_INFO = {
+      about: baselines_default.perps.about,
+      capitalUsd: baselines_default.perps.capitalUsd,
+      targetPct: baselines_default.perps.targetPct,
+      x2: baselines_default.perps.x2,
+      defaultAllocation: baselines_default.perps.defaultAllocation
+    };
+  }
+});
+
+// src/sim/stats.ts
+var init_stats = __esm({
+  "src/sim/stats.ts"() {
+    "use strict";
+  }
+});
+
+// src/sim/class-stats.ts
+var init_class_stats = __esm({
+  "src/sim/class-stats.ts"() {
+    "use strict";
+    init_db();
+    init_baselines2();
+    init_stats();
+  }
+});
+
+// src/sim/plans.ts
+var init_plans = __esm({
+  "src/sim/plans.ts"() {
+    "use strict";
+    init_db();
+    init_mission_kind();
+  }
+});
+
 // src/sim/market-state.ts
 var MAX_AGE_MS, READS_MAX_AGE_MS, DECIDED_MAX_AGE_MS;
 var init_market_state = __esm({
@@ -9262,6 +9554,38 @@ var init_transfers = __esm({
   }
 });
 
+// src/sim/signals.ts
+var init_signals = __esm({
+  "src/sim/signals.ts"() {
+    "use strict";
+    init_http();
+    init_jupiter();
+  }
+});
+
+// src/sim/shadow.ts
+var SHADOW_TIMING;
+var init_shadow = __esm({
+  "src/sim/shadow.ts"() {
+    "use strict";
+    init_config();
+    init_db();
+    init_http();
+    init_jupiter();
+    init_mission_kind();
+    init_plans();
+    init_portfolio();
+    init_signals();
+    init_venues();
+    SHADOW_TIMING = {
+      quoteEveryMs: config.fastWatchIntervalSeconds * 1e3,
+      jupiterPerTick: 6,
+      lateMs: 15e3,
+      unobservedMs: 3e4
+    };
+  }
+});
+
 // src/sim/mission.ts
 function getMission(id) {
   return db.prepare("SELECT * FROM missions WHERE id = ?").get(id);
@@ -9270,10 +9594,16 @@ var init_mission = __esm({
   "src/sim/mission.ts"() {
     "use strict";
     init_db();
+    init_mission_kind();
+    init_baselines2();
+    init_class_stats();
+    init_plans();
     init_portfolio();
     init_types();
     init_transfers();
+    init_shadow();
     init_venues();
+    init_mission_kind();
   }
 });
 

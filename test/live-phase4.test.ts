@@ -8,7 +8,7 @@ import { config } from "../src/config.js";
 import { db, logJournal, now } from "../src/db.js";
 import { exportTaxes } from "../src/live/taxes.js";
 import { createSignerServer, MAX_OPS_PER_MINUTE } from "../src/live/signer/server.js";
-import { checkMission, createLiveMission, getMission } from "../src/sim/mission.js";
+import { checkMission, createLiveMission, getMission, startMissionClock } from "../src/sim/mission.js";
 import { installFakeMarket } from "./fake-market.js";
 
 installFakeMarket();
@@ -52,6 +52,7 @@ test("al llegar a la pérdida máxima, la misión real se para sola", async () =
     JSON.stringify({ version: 1, createdAt: now(), evm: "0x695e7aE1E234bff3B0D0668240Fdf52D50b9a5bf", solana: "2pWz5Gymx8Voz6JM3nbWUScxXdvyNaKBW3NcgAgG3wsQ" }),
   );
   const m = mission(60);
+  startMissionClock(m.id);
   const log = await checkMission(m.id);
   assert.match(log.join("\n"), /PARADA POR PÉRDIDA MÁXIMA/);
   assert.equal(getMission(m.id)!.status, "expired");

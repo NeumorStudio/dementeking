@@ -1,7 +1,7 @@
 // Resumen de la misión en texto, pensado para leerse en el chat (también desde el móvil con Remote Control).
 import { db } from "../db.js";
 import { listCapabilityRequests } from "./memory.js";
-import { getActiveMission, getLastMission, getMission } from "./mission.js";
+import { getActiveMission, getLastMission, getMission, missionDurationMinutes, PREP_TIMEOUT_MINUTES } from "./mission.js";
 import { listOrders } from "./orders.js";
 import { valuation } from "./portfolio.js";
 import { listPositions } from "./positions.js";
@@ -25,8 +25,12 @@ export async function statusReport(missionId?: number): Promise<string> {
   const progress = ((current - m.initial_usd) / (m.target_usd - m.initial_usd)) * 100;
   const statusText =
     m.status === "active"
-      ? `en curso, quedan ${timeLeft(m.deadline)}`
-      : m.status === "succeeded"
+      ? m.started_at
+        ? `en curso, quedan ${timeLeft(m.deadline)}`
+        : `preparándose: el reloj (${Math.round(missionDurationMinutes(m))} min) aún no ha arrancado`
+      : m.end_reason === "prep_timeout"
+        ? `cancelada: el reloj no arrancó en ${PREP_TIMEOUT_MINUTES} min`
+        : m.status === "succeeded"
         ? "CONSEGUIDA"
         : m.status === "expired"
           ? "terminada sin llegar al objetivo"

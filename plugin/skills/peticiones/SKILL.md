@@ -1,6 +1,6 @@
 ---
 name: peticiones
-description: Muestra las capacidades que ha pedido el agente trader (cuentas, herramientas, datos, mercados que el simulador no permite) y deja que el usuario las acepte, rechace o marque como hechas.
+description: Muestra las capacidades que han pedido los agentes (cuentas, herramientas, datos, mercados que el simulador no permite) y deja que el usuario las acepte, rechace o marque como hechas.
 disable-model-invocation: true
 allowed-tools: mcp__plugin_dementeking_cryptosim__capability_requests, mcp__plugin_dementeking_cryptosim__resolve_capability_request
 ---

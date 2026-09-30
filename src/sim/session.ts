@@ -1,7 +1,8 @@
 import { db, now } from "../db.js";
 import { getBriefing, markBriefingSeen, recallSummary } from "./memory.js";
-import { getMission, missionStatus } from "./mission.js";
+import { getMission, isFastMission, missionStatus, type Mission } from "./mission.js";
 import { listOrders } from "./orders.js";
+import { describePlan, planForMission } from "./plans.js";
 import { valuation } from "./portfolio.js";
 import { toText } from "../tools/format.js";
 
@@ -15,6 +16,7 @@ export async function sessionBriefing(sessionId: number, missionId: number | nul
   if (missionId === null) return [header, "", toText(await missionStatus())].join("\n");
 
   const mission = getMission(missionId)!;
+  if (isFastMission(mission)) return fastBriefing(header, mission);
   const portfolio = await valuation(missionId, true);
   const notes = db.prepare("SELECT id, ts, text FROM notes WHERE mission_id = ? ORDER BY id").all(missionId) as Array<{ id: number; ts: string; text: string }>;
   const openOrders = listOrders(missionId, "open");
@@ -68,6 +70,30 @@ export async function sessionBriefing(sessionId: number, missionId: number | nul
     recent.length
       ? "Últimas entradas del diario:\n" + recent.reverse().map((j) => `- ${j.ts} [${j.kind}] ${j.summary}`).join("\n")
       : "El diario está vacío: es tu primera sesión.",
+  ].join("\n");
+}
+
+/**
+ * Briefing de una misión rápida (15 min o menos): solo el reloj, el plan y la cartera (y las órdenes abiertas, si
+ * hay). Sin el resumen de memoria ni recalcular strategy_fit: lo pensó el cerebro antes del reloj, y cada token de
+ * más se relee en cada turno con el reloj corriendo.
+ */
+async function fastBriefing(header: string, mission: Mission): Promise<string> {
+  const plan = planForMission(mission.id);
+  const openOrders = listOrders(mission.id, "open");
+  return [
+    header,
+    "",
+    "Misión rápida:",
+    toText(await missionStatus(mission.id)),
+    "",
+    plan
+      ? `Plan vigente (cítalo con plan_ref: ${plan.id}):\n${toText(describePlan(plan))}`
+      : `No hay plan vigente para ${mission.class ?? "esta clase"}: lo escribe el planner con write_plan antes del reloj.`,
+    "",
+    "Cartera:",
+    toText(await valuation(mission.id, true)),
+    ...(openOrders.length ? ["", "Órdenes condicionales abiertas:\n" + toText(openOrders)] : []),
   ].join("\n");
 }
 

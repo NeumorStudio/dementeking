@@ -5,7 +5,7 @@ import { test } from "node:test";
 import { db, now } from "../src/db.js";
 import { USDC_MINT } from "../src/market/jupiter.js";
 import * as memory from "../src/sim/memory.js";
-import { createMission } from "../src/sim/mission.js";
+import { createMission, startMissionClock } from "../src/sim/mission.js";
 import { decisionContext, listPositions } from "../src/sim/positions.js";
 import { runTool } from "../src/tools/index.js";
 import { installFakeMarket, setPrice, tokens } from "./fake-market.js";
@@ -13,6 +13,7 @@ import { installFakeMarket, setPrice, tokens } from "./fake-market.js";
 installFakeMarket();
 
 const mission = await createMission(100, 120, 60, undefined, { solana: 100 });
+startMissionClock(mission.id);
 const ctx = { sessionId: 1, missionId: mission.id };
 const mint = Object.keys(tokens).find((m) => tokens[m]!.symbol !== "USDC" && tokens[m]!.symbol !== "SOL")!;
 const thesis = { why: "prueba", evidence: "prueba", sources: ["test"], exit_plan: "x", beliefs_applied: [], memory_note: "x", risks_checked: "revisé riskCheck y creencias negativas" };

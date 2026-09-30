@@ -1,6 +1,6 @@
 ---
 name: parar
-description: Detiene la misión activa del agente trader antes de que termine el plazo.
+description: Detiene la misión activa (del trader o, si es rápida, del ejecutor) antes de que termine el plazo.
 disable-model-invocation: true
 allowed-tools: mcp__plugin_dementeking_cryptosim__mission_status, mcp__plugin_dementeking_cryptosim__stop_mission, mcp__plugin_dementeking_cryptosim__stop_dashboard
 ---
@@ -20,7 +20,7 @@ Vas a detener la misión activa. Habla con el usuario en español.
 
 3. Llama a `stop_mission` con `close_positions` según la respuesta.
 
-4. Si en esta sesión hay un agente `dementeking:trader` trabajando en segundo plano, detenlo con TaskStop. No detengas al revisor (`dementeking:reviewer`): verá que la misión ha terminado y hará su retrospectiva. Si no hay ningún revisor trabajando y la misión llegó a operar, lánzalo en segundo plano con la herramienta Agent (`subagent_type` `dementeking:reviewer`, `description` `Revisor de la misión`, `run_in_background` `true`, `prompt` exactamente `Vigila la misión.`).
+4. Si en esta sesión hay un agente `dementeking:trader`, `dementeking:executor` o `dementeking:planner` trabajando, detenlo con TaskStop. No detengas al revisor (`dementeking:reviewer`): verá que la misión ha terminado y hará su retrospectiva. Si no hay ningún revisor trabajando y la misión llegó a operar, lánzalo en segundo plano con la herramienta Agent (`subagent_type` `dementeking:reviewer`, `description` `Revisor de la misión`, `run_in_background` `true`), sin pasar `model` y con el `prompt` exactamente `Revisa la misión.` si la misión duraba 15 minutos o menos, o `Vigila la misión.` si era más larga.
 
 5. Cierra el panel web local con `stop_dashboard` (deja de escuchar en localhost). Si el usuario quiere volver a verlo, se abre con `/dementeking:trading` o con la herramienta `start_dashboard`.
 

@@ -51,12 +51,20 @@ export interface JupiterQuote {
   contextSlot?: number;
 }
 
-export async function getQuote(inputMint: string, outputMint: string, amountBase: bigint, slippageBps: number, ttlMs = 2_000): Promise<JupiterQuote> {
+export async function getQuote(
+  inputMint: string,
+  outputMint: string,
+  amountBase: bigint,
+  slippageBps: number,
+  ttlMs = 2_000,
+  opts: { lowPriority?: boolean } = {},
+): Promise<JupiterQuote> {
   const url =
     `${BASE}/swap/v1/quote?inputMint=${inputMint}&outputMint=${outputMint}` +
     `&amount=${amountBase.toString()}&slippageBps=${slippageBps}`;
   // Determina el precio de ejecución: caché muy corta (solo agrupa peticiones idénticas casi simultáneas).
-  const quote = await fetchJson<JupiterQuote & { error?: string }>(url, 15_000, ttlMs);
+  // Con lowPriority (el gemelo mecánico), solo turnos libres de Jupiter: el agente va por delante.
+  const quote = await fetchJson<JupiterQuote & { error?: string }>(url, { timeoutMs: 15_000, ttlMs, lowPriority: opts.lowPriority });
   if (quote.error) throw new Error(`Jupiter: ${quote.error}`);
   return quote;
 }

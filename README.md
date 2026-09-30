@@ -11,6 +11,9 @@ Solana a través de Jupiter (incluidos los tokens de pump.fun), Base y BNB Chain
 
 - **Misiones**: capital inicial, objetivo y plazo real. La misión termina sola al alcanzar el objetivo
   o al acabarse el tiempo, y entonces se venden todas las posiciones a mercado.
+- **Misiones rápidas** (5-15 min, simuladas): un cerebro escribe antes del reloj un plan de reglas y otro agente lo
+  ejecuta: una sola compra con todo en un memecoin recién graduado, con la venta puesta en el objetivo. Se comparan
+  con una línea base medida y con un gemelo mecánico para saber si el agente aporta algo ([más abajo](#misiones-rápidas)).
 - **Agente libre**: decide qué investigar y qué hacer. Opcionalmente le das instrucciones por misión.
 - **Memoria entre misiones, escrita por un revisor**: un segundo agente analiza lo que hace el que opera y escribe su memoria.
   Tiene tres partes: howtos (cómo se hace algo y qué errores evitar), creencias sobre el mercado cuya evidencia calcula el
@@ -44,8 +47,9 @@ Este repositorio es a la vez el código fuente y el marketplace (`.claude-plugin
 
 ## Usar
 
-- `/dementeking:trading`: te pregunta capital, objetivo, tiempo, enfoque y si abrir el panel; crea la misión
-  y lanza el agente en segundo plano. Si ya hay una misión activa, te deja continuarla, reemplazarla o detenerla.
+- `/dementeking:trading`: te pregunta primero si la misión es rápida (5-15 min) o normal, y después capital, objetivo,
+  tiempo y si abrir el panel; crea la misión y lanza los agentes. Si ya hay una misión activa, te deja continuarla,
+  reemplazarla o detenerla.
 - `/dementeking:estado`: resumen de la misión en el chat (progreso, posiciones, últimos movimientos con su motivo
   y la última nota del agente). Pensado también para consultarlo desde el móvil con Remote Control.
 - `/dementeking:parar`: detiene la misión activa (cerrando posiciones o no).
@@ -57,6 +61,74 @@ No inicies sesión en exchanges ni redes sociales dentro del navegador de la app
 
 Los datos (misiones, diario, lecciones) se guardan en `~/.dementeking`, fuera del plugin: se conservan al
 actualizar o reinstalar, y son los mismos se instale desde la app o desde la CLI.
+
+## Misiones rápidas
+
+Una misión de 15 minutos o menos no da tiempo a pensar dentro del reloj: cada minuto de retraso al entrar resta 3-4
+puntos de probabilidad. Por eso, si es simulada, se reparte entre dos agentes (una real siempre la opera el trader, aunque
+sea corta):
+
+1. **El cerebro** (`planner`) piensa antes de que arranque el reloj, que es tiempo gratis. Escribe un plan de **reglas**, no
+   una lista de tokens: qué evento esperar (por defecto, un token de pump.fun recién migrado a PumpSwap), qué filtros tiene
+   que pasar, la toma de beneficio, si hay reentrada y qué probabilidad espera frente a la línea base. El plan queda fijo
+   durante un bloque de 20 misiones de la misma clase (mercado × plazo × objetivo, p. ej. `graduado-10m-+25%`): si cambiara
+   en cada misión, no se mediría nada.
+2. **El ejecutor** (`executor`) espera el evento sin arrancar el reloj y, en cuanto llega un candidato, arranca el reloj,
+   compra con todo y deja puesta la venta en el objetivo en una sola llamada. Todo lo que puede fallar sin operar (el plan,
+   el efectivo, el token, un pool vaciado, la memoria) se comprueba antes de arrancar el reloj: si falla, sigue parado. Después solo espera: sin rotar, promediar,
+   poner stops ni investigar. Es la "jugada audaz": en un juego desfavorable, la forma de maximizar la probabilidad de
+   llegar a una meta es apostar fuerte y pocas veces.
+3. **El revisor** (`reviewer`) revisa cada misión al terminar: la compara con su gemelo mecánico (la misma compra con la
+   misma venta en los 3 eventos siguientes) y lleva la cuenta por clase, con su intervalo de confianza.
+
+El reloj arranca con la entrada, no al crear la misión; si no arranca en 60 minutos, la misión se cancela sola. Mientras
+dura, órdenes, futuros y misión se miran cada 5 s, y no hay revisor a mitad.
+
+**Qué esperar.** Probabilidad medida de llegar al objetivo con un recién graduado (datos reales de un solo día, 925 tokens):
+
+| Plazo | +25 % | +50 % | ×2 |
+|---|---|---|---|
+| 5 min | 24 % | 11 % | 5 % |
+| 10 min | 35 % | 21 % | 9 % |
+| 15 min | 37 % | 25 % | 14 % |
+
+Ninguna configuración rápida gana dinero de media: con costes reales se pierde entre un 7 y un 28 % por misión, y el
+simulador es algo optimista (sin latencia ni MEV, la venta límite se llena justo a su precio). La misión por defecto es
+50 $, +25 %, 10 minutos y todo en Solana. Con menos de 20 misiones por clase no se puede saber si el agente aporta algo:
+0 aciertos de 20 son compatibles con una tasa real de hasta el 16 %. Detalle en la sección 7 de la
+[guía del terreno](knowledge/guia-del-terreno.md).
+
+### Qué modelo usa cada agente
+
+| Agente | Papel | Modelo | Esfuerzo | Cuándo corre |
+|---|---|---|---|---|
+| `planner` | Cerebro de las rápidas: el plan de reglas | `claude-opus-5-5` | `max` | Antes del reloj, una vez por bloque de 20 misiones |
+| `executor` | Ejecuta las rápidas | `claude-sonnet-5-5` | `medium` | Dentro del reloj (~17 s por decisión) |
+| `trader` | Opera las normales (1 hora a 3 días) | `claude-sonnet-5-5` | `xhigh` | Dentro del reloj, sin prisa |
+| `reviewer` | Memoria, retrospectivas y línea base | `claude-opus-5-5` | `xhigh` | Antes y durante las normales; después de cada rápida |
+
+El modelo y el esfuerzo van en la cabecera de cada agente (`plugin/agents/*.md`), con el identificador completo. La skill
+no pasa `model` al lanzarlos, porque lo pisaría. Tampoco definas `CLAUDE_CODE_EFFORT_LEVEL`: pisa el esfuerzo de la cabecera.
+
+### Sin interfaz (headless)
+
+Primero hay que crear la misión (con `/dementeking:trading` o con la herramienta `create_mission` del servidor MCP).
+Después, cada agente con su prompt exacto:
+
+```bash
+claude -p "Prepara el plan." --agent dementeking:planner --allowedTools "mcp__plugin_dementeking_cryptosim,ToolSearch"
+claude -p "Ejecuta el plan vigente." --agent dementeking:executor --allowedTools "mcp__plugin_dementeking_cryptosim,ToolSearch"
+claude -p "Revisa la misión." --agent dementeking:reviewer --allowedTools "mcp__plugin_dementeking_cryptosim,ToolSearch"
+```
+
+- El cerebro solo hace falta si la clase no tiene un plan vigente (o si el suyo ya ha jugado sus 20 misiones).
+- Para una misión normal, el revisor usa `"Prepara la misión."` antes y `"Vigila la misión."` durante, y el trader,
+  `"Trabaja en tu misión."` con `--agent dementeking:trader`.
+- Para probar el repositorio sin instalar el plugin, añade `--plugin-dir ./plugin`.
+- **Versión del CLI.** Con el CLI 2.1.272, los alias caen en la generación anterior y `claude-sonnet-5-5` da
+  `unrecognized_model`: los agentes no usarían los modelos 5.5. Actualiza el CLI o usa el `claude.exe` de la app de
+  escritorio, que sí los reconoce (en Windows, `%APPDATA%\Claude\claude-code\<versión>\claude.exe`, 2.1.284 o
+  posterior). Con `--output-format json` puedes comprobar en `modelUsage` qué modelo ha corrido de verdad.
 
 ## Usar en OpenCode
 
@@ -151,7 +223,8 @@ Es un registro de apoyo, no asesoramiento fiscal. En España cada permuta entre 
 | Orden de mercado en Binance | Se recorre el order book real + comisión taker + tamaño mínimo |
 | Depósito o retirada de Binance | Por la red de cada cadena: gas al depositar, comisión y mínimo reales de Binance al retirar; llega en 1-3 min |
 | Puente entre cadenas | Cotización real de Li.Fi (coste, gas y duración); si se agota su cupo gratuito, una estimación |
-| Orden condicional | Se dispara cuando el precio real cruza el umbral (comprobado cada ~60 s) |
+| Orden condicional | Se dispara cuando el precio de venta real cruza el umbral (comprobado cada 15 s; cada 5 s en una misión rápida) |
+| Futuros perpetuos | Precio y funding reales de Hyperliquid, con su comisión, depósito, retirada y liquidación; solo en simulación |
 | Valoración | Precio de liquidación: cuánto se obtendría vendiéndolo todo ahora |
 | Acciones hipotéticas | Solo se anotan (crear tokens, publicar…); no afectan a la cartera |
 
@@ -164,8 +237,10 @@ El agente tiene una guía con estos detalles y las APIs de datos disponibles: [k
 plugin/                           el plugin que se instala
   .claude-plugin/plugin.json      manifiesto y versión
   .mcp.json                       servidor MCP del simulador
-  agents/trader.md                el agente que opera
-  agents/reviewer.md              el revisor: escribe la memoria y prepara cada misión
+  agents/trader.md                el agente que opera las misiones normales
+  agents/planner.md               el cerebro de las misiones rápidas: escribe el plan de reglas
+  agents/executor.md              el que ejecuta las misiones rápidas
+  agents/reviewer.md              el revisor: escribe la memoria, prepara y revisa cada misión
   skills/                         los comandos (trading, estado, parar, peticiones)
   dist/                           servidor MCP empaquetado (generado, se sube al repo)
 src/                              código fuente del simulador, el panel y el runner por API

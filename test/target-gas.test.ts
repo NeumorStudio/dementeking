@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { SOL_MINT } from "../src/market/jupiter.js";
-import { createMission } from "../src/sim/mission.js";
+import { createMission, startMissionClock } from "../src/sim/mission.js";
 import { balance, liquidateAll } from "../src/sim/portfolio.js";
 import { runTool } from "../src/tools/index.js";
 import { installFakeMarket, MEME, setPrice } from "./fake-market.js";
@@ -13,6 +13,7 @@ installFakeMarket();
 test("el cierre por objetivo vende primero todo menos el gas, y el gas solo cuando la misión se cierra", async () => {
   setPrice(MEME, 1);
   const m = await createMission(100, 110, 60, undefined, { solana: 100 });
+  startMissionClock(m.id);
   const thesis = { why: "x", evidence: "x", sources: ["t"], exit_plan: "x", beliefs_applied: [], memory_note: "x", risks_checked: "revisé riskCheck" };
   const r = await runTool("simulate_swap", { chain: "solana", input: "USDC", output: MEME, amount: 90, slippage_bps: 300, thesis }, { sessionId: 1, missionId: m.id });
   assert.ok(!r.isError, String(r.content));

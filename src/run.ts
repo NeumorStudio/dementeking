@@ -1,8 +1,7 @@
 import { runSession } from "./agent.js";
-import { config } from "./config.js";
 import { lastReviewAt, reviewIntervalMinutes } from "./sim/memory.js";
 import { checkMission, getActiveMission } from "./sim/mission.js";
-import { checkOrders } from "./sim/orders.js";
+import { startWatchLoop } from "./sim/watch.js";
 import { closeTools } from "./tools/runner.js";
 
 process.on("SIGINT", async () => {
@@ -16,13 +15,8 @@ if (!getActiveMission()) {
   process.exit(1);
 }
 
-const watcher = setInterval(async () => {
-  try {
-    for (const line of [...(await checkOrders()), ...(await checkMission())]) console.log(`[vigilante] ${line}`);
-  } catch (err) {
-    console.error(`[vigilante] ${(err as Error).message}`);
-  }
-}, config.watchIntervalSeconds * 1000);
+// Órdenes, futuros y misión: cada minuto, las órdenes por precio cada 15 s y todo cada 5 s en una misión rápida.
+const stopWatcher = startWatchLoop({ log: (line) => (line.startsWith("Error") ? console.error : console.log)(`[vigilante] ${line}`) });
 
 // El agente trabaja sin parar mientras la misión siga activa: si una sesión termina
 // (por límite de pasos o porque el agente respondió sin herramientas), se abre otra.
@@ -47,6 +41,6 @@ try {
   await review("Prepara la misión.");
   console.log("La misión ha terminado. Ejecuta `npm run report` para ver el resultado.");
 } finally {
-  clearInterval(watcher);
+  stopWatcher();
   await closeTools();
 }

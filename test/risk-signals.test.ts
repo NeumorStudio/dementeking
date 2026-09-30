@@ -5,13 +5,14 @@ import { test } from "node:test";
 import { db, now } from "../src/db.js";
 import { bscLaunchpad } from "../src/sim/launchpads.js";
 import * as memory from "../src/sim/memory.js";
-import { createMission } from "../src/sim/mission.js";
+import { createMission, startMissionClock } from "../src/sim/mission.js";
 import { runTool } from "../src/tools/index.js";
 import { installFakeMarket, MEME, MEME_DEV } from "./fake-market.js";
 
 installFakeMarket();
 
 const mission = await createMission(1000, 1200, 60, undefined, { solana: 100 });
+startMissionClock(mission.id);
 const ctx = { sessionId: 1, missionId: mission.id };
 const thesis = { why: "prueba", evidence: "prueba", sources: ["test"], exit_plan: "x", beliefs_applied: [], memory_note: "x", risks_checked: "revisé riskCheck y creencias negativas" };
 

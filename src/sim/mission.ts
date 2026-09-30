@@ -2,10 +2,17 @@
 // llega al objetivo o se acaba el tiempo; entonces se cierran todas las posiciones a mercado.
 // Cada misión tiene su propia cartera, órdenes, diario y posiciones.
 import { db, logJournal, now } from "../db.js";
+import { isFastMission, missionClass, missionDurationMinutes, PREP_TIMEOUT_MINUTES } from "./mission-kind.js";
+import { baselineForClass } from "./baselines.js";
+import { missionComparison, twinCounts } from "./class-stats.js";
+import { attachPlanForMission } from "./plans.js";
 import { liquidateAll, planPortfolio, resetPortfolio, validateAllocation, valuation } from "./portfolio.js";
 import { DEFAULT_ALLOCATION, type Allocation, type ChainId, type Holding } from "./types.js";
 import { settleTransfers } from "./transfers.js";
+import { startShadowRun } from "./shadow.js";
 import { allChains, getVenue } from "./venues/index.js";
+
+export * from "./mission-kind.js";
 
 export interface Mission {
   id: number;
@@ -31,6 +38,20 @@ export interface Mission {
   approval: "manual" | "auto" | null;
   /** Solo live: JSON de MissionLimits. */
   limits: string | null;
+  /** '<mercado>-<minutos>m-+<objetivo>%' (mission-kind.ts): las misiones de la misma clase se comparan entre sí. */
+  class: string | null;
+  /** P de llegar al objetivo según el plan vigente al arrancar el reloj (0-1). */
+  predicted_p: number | null;
+  /** P de la línea base (regla mecánica) para su clase (0-1). */
+  baseline_p: number | null;
+  /** Plan vigente al arrancar el reloj. */
+  plan_id: number | null;
+  /** Aciertos del gemelo mecánico. */
+  shadow_hits: number | null;
+  /** Resultado medio del gemelo mecánico (fracción). */
+  shadow_return: number | null;
+  /** Por qué terminó: 'target' | 'deadline' | 'bust' | 'loss_limit' | 'user' | 'replaced' | 'prep_timeout'. */
+  end_reason: string | null;
 }
 
 export interface MissionLimits {
@@ -63,7 +84,11 @@ export function activeMissions(): Mission[] {
   return db.prepare("SELECT * FROM missions WHERE status = 'active' ORDER BY id").all() as unknown as Mission[];
 }
 
-/** Historial objetivo de misiones terminadas (lo calcula el simulador, no el agente). */
+/**
+ * Historial objetivo de misiones terminadas (lo calcula el simulador, no el agente). Cada misión jugada hasta el final
+ * lleva su clase, la P que predijo el plan, la de la línea base y la comparación con su gemelo mecánico; las cuentas
+ * por clase (aciertos con su intervalo, calibración y gemelo) las da classStats (class-stats.ts).
+ */
 export function missionHistory() {
   const rows = db
     .prepare(
@@ -71,6 +96,12 @@ export function missionHistory() {
        FROM missions m WHERE m.status NOT IN ('active', 'closing') ORDER BY m.id`,
     )
     .all() as unknown as Array<Mission & { review_origin: string | null }>;
+  const twins = twinCounts();
+  // La comparación con la predicción y con el gemelo, sin repetir lo que ya dice la fila (resultado y desenlace).
+  const compared = (m: Mission) => {
+    const { hit: _hit, resultPct: _result, ...rest } = missionComparison(m, twins);
+    return rest;
+  };
   return rows.map((m) => {
     const minutes = Math.round((new Date(m.deadline).getTime() - new Date(m.created_at).getTime()) / 60_000);
     return {
@@ -83,8 +114,18 @@ export function missionHistory() {
       finalUsd: m.final_usd === null ? null : Number(m.final_usd.toFixed(2)),
       resultPct: m.final_usd === null ? null : Number((((m.final_usd - m.initial_usd) / m.initial_usd) * 100).toFixed(2)),
       outcome:
-        m.status === "succeeded" ? "objetivo conseguido" : m.status === "expired" ? "no llegó al objetivo" : m.status === "bust" ? "sin fondos (bancarrota)" : "cancelada",
+        m.status === "succeeded"
+          ? "objetivo conseguido"
+          : m.status === "expired"
+            ? "no llegó al objetivo"
+            : m.status === "bust"
+              ? "sin fondos (bancarrota)"
+              : m.end_reason === "prep_timeout"
+                ? "cancelada: el reloj no llegó a arrancar"
+                : "cancelada",
       reviewed: m.review_origin !== null || m.reviewed_at !== null,
+      ...(m.class ? { missionClass: m.class } : {}),
+      ...(m.status !== "cancelled" && m.started_at ? compared(m) : {}),
     };
   });
 }
@@ -98,14 +139,16 @@ function insertMission(args: {
   holdings: Holding[];
   live?: { approval: "manual" | "auto"; limits: MissionLimits };
 }): number {
-  const deadline = new Date(Date.now() + args.durationMinutes * 60_000).toISOString();
+  // Una sola hora para las dos fechas: deadline − created_at es la duración exacta (mission-kind.ts).
+  const created = Date.now();
+  const deadline = new Date(created + args.durationMinutes * 60_000).toISOString();
   const id = Number(
     db
       .prepare(
-        "INSERT INTO missions (created_at, initial_usd, target_usd, deadline, instructions, allocation, benchmark, mode, approval, limits) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO missions (created_at, initial_usd, target_usd, deadline, instructions, allocation, benchmark, mode, approval, limits, class) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       )
       .run(
-        now(),
+        new Date(created).toISOString(),
         args.initialUsd,
         args.targetUsd,
         deadline,
@@ -115,6 +158,7 @@ function insertMission(args: {
         args.live ? "live" : "sim",
         args.live?.approval ?? null,
         args.live ? JSON.stringify(args.live.limits) : null,
+        missionClass({ durationMinutes: args.durationMinutes, initialUsd: args.initialUsd, targetUsd: args.targetUsd, live: !!args.live }),
       ).lastInsertRowid,
   );
   // En una misión real, los saldos son los de la cadena (holdings es su espejo).
@@ -125,7 +169,7 @@ function insertMission(args: {
     kind: "mission",
     summary:
       `${args.live ? "Misión REAL" : "Misión"} #${id} iniciada: de ${args.initialUsd.toFixed(2)} USD a ${args.targetUsd.toFixed(2)} USD ` +
-      `en ${Math.round((new Date(deadline).getTime() - Date.now()) / 60_000)} min (el reloj arranca cuando el agente empieza a trabajar)`,
+      `en ${Number(args.durationMinutes.toFixed(1))} min (el reloj arranca cuando el agente empieza a trabajar; si no arranca en ${PREP_TIMEOUT_MINUTES} min, la misión se cancela)`,
   });
   return id;
 }
@@ -163,7 +207,7 @@ export async function createMission(
 function cancelActive() {
   const previous = getActiveMission();
   if (!previous) return;
-  db.prepare("UPDATE missions SET status = 'cancelled', ended_at = ? WHERE id = ?").run(now(), previous.id);
+  db.prepare("UPDATE missions SET status = 'cancelled', ended_at = ?, end_reason = 'replaced' WHERE id = ?").run(now(), previous.id);
   db.prepare("UPDATE orders SET status = 'cancelled', closed_at = ? WHERE status = 'open' AND mission_id = ?").run(now(), previous.id);
   logJournal({ missionId: previous.id, sessionId: null, kind: "mission", summary: `Misión #${previous.id} cancelada por el usuario al crear una nueva` });
 }
@@ -207,7 +251,10 @@ export function createLiveMission(args: {
 }
 
 function remaining(deadline: string) {
-  const ms = new Date(deadline).getTime() - Date.now();
+  return leftText(new Date(deadline).getTime() - Date.now());
+}
+
+function leftText(ms: number) {
   const totalSec = Math.max(0, Math.floor(ms / 1000));
   const h = Math.floor(totalSec / 3600), m = Math.floor(totalSec / 60) % 60, s = totalSec % 60;
   return { ms, seconds: totalSec, text: h ? `${h} h ${m} min` : `${m} min ${s} s` };
@@ -215,18 +262,52 @@ function remaining(deadline: string) {
 
 /**
  * El reloj de la misión arranca cuando el agente empieza a trabajar, no al crearla: así no se pierde
- * el tiempo que tarda en prepararse (el briefing del revisor, arrancar el agente). Solo la primera vez.
+ * el tiempo que tarda en prepararse (el plan, el briefing del revisor, esperar a un evento). Solo la primera
+ * vez: deadline = ahora + duración. Antes de eso no se puede operar (runTool) ni caduca (checkOne).
+ * Devuelve true si lo ha arrancado esta llamada.
  */
-export function startMissionClock(missionId: number | null) {
-  if (missionId === null) return;
+export function startMissionClock(missionId: number | null): boolean {
+  if (missionId === null) return false;
   const m = getMission(missionId);
-  if (!m || m.status !== "active" || m.started_at) return;
+  if (!m || m.status !== "active" || m.started_at) return false;
   const durationMs = new Date(m.deadline).getTime() - new Date(m.created_at).getTime();
   const start = new Date();
   const changed = db
-    .prepare("UPDATE missions SET started_at = ?, created_at = ?, deadline = ? WHERE id = ? AND started_at IS NULL AND status = 'active'")
-    .run(start.toISOString(), start.toISOString(), new Date(start.getTime() + durationMs).toISOString(), missionId).changes;
-  if (changed) logJournal({ missionId, sessionId: null, kind: "mission", summary: `El agente empieza a trabajar: el reloj de la misión #${missionId} arranca ahora` });
+    .prepare(
+      "UPDATE missions SET started_at = ?, created_at = ?, deadline = ?, class = COALESCE(class, ?) WHERE id = ? AND started_at IS NULL AND status = 'active'",
+    )
+    .run(
+      start.toISOString(),
+      start.toISOString(),
+      new Date(start.getTime() + durationMs).toISOString(),
+      missionClass({ durationMinutes: durationMs / 60_000, initialUsd: m.initial_usd, targetUsd: m.target_usd, live: isLive(m) }),
+      missionId,
+    ).changes;
+  if (!changed) return false;
+  // El plan del cerebro para su clase, si lo hay, queda asignado ya: su P y la de la línea base son las de antes de jugar.
+  const plan = attachPlanForMission(missionId);
+  // Sin plan (o con un plan sin ella), la P base es la de la tabla medida para su clase, si su mercado está medido.
+  const cls = getMission(missionId)?.class;
+  const table = baselineForClass(cls);
+  if (table) db.prepare("UPDATE missions SET baseline_p = ? WHERE id = ? AND baseline_p IS NULL").run(table.p, missionId);
+  // El gemelo mecánico (shadow.ts) se prepara ya, antes de que el agente compre: mismo tamaño y misma toma de beneficio.
+  try {
+    startShadowRun(missionId);
+  } catch (err) {
+    console.error(`No se pudo preparar el gemelo de la misión #${missionId}: ${(err as Error).message}`);
+  }
+  logJournal({
+    missionId,
+    sessionId: null,
+    kind: "mission",
+    summary: `El agente empieza a trabajar: el reloj de la misión #${missionId} arranca ahora${plan ? ` (plan #${plan.id})` : ""}`,
+  });
+  return true;
+}
+
+/** Minutos que le quedan a la misión: toda la duración mientras el reloj no ha arrancado. */
+export function minutesLeft(m: Pick<Mission, "created_at" | "deadline" | "started_at">): number {
+  return m.started_at ? (new Date(m.deadline).getTime() - Date.now()) / 60_000 : missionDurationMinutes(m);
 }
 
 /** Estado de una misión (por defecto, la principal activa o la última). */
@@ -246,24 +327,41 @@ export async function missionStatus(missionId?: number) {
         finalUsd: mission.final_usd,
         deadline: mission.deadline,
         endedAt: mission.ended_at,
+        // prep_timeout: se canceló sin arrancar el reloj (en una rápida, no llegó ningún candidato que pasara el plan).
+        ...(mission.end_reason ? { endReason: mission.end_reason } : {}),
+        ...(mission.class ? { missionClass: mission.class } : {}),
         instructions: mission.instructions,
       },
     };
   }
   const v = await valuation(mission.id);
-  const left = remaining(mission.deadline);
+  const left = leftText(minutesLeft(mission) * 60_000);
   const idle = idleCheck(mission, v, left.seconds);
+  const prepEndsAt = new Date(new Date(mission.created_at).getTime() + PREP_TIMEOUT_MINUTES * 60_000).toISOString();
   return {
     ...(idle ? { warning: idle } : {}),
     active: true,
     missionId: mission.id,
+    // rápida: simulada de 15 min o menos, con el plan del planner y el executor. normal: el trader (las reales siempre).
+    missionKind: isFastMission(mission) ? "rápida" : "normal",
+    ...(mission.class ? { missionClass: mission.class } : {}),
+    // Plan del cerebro asignado (al arrancar el reloj o con plan_ref): el executor lo cita con plan_ref.
+    ...(mission.plan_id !== null ? { planId: mission.plan_id } : {}),
     initialUsd: mission.initial_usd,
     targetUsd: mission.target_usd,
     currentUsd: Number(v.totalUsd.toFixed(2)),
     missingUsd: Number((mission.target_usd - v.totalUsd).toFixed(2)),
     progressPct: Number((((v.totalUsd - mission.initial_usd) / (mission.target_usd - mission.initial_usd)) * 100).toFixed(1)),
     now: new Date().toISOString(),
-    deadline: mission.deadline,
+    // Antes de arrancar el reloj no hay plazo: los minutos empiezan a contar con start_session.
+    ...(mission.started_at
+      ? { deadline: mission.deadline }
+      : {
+          clock:
+            `sin arrancar: los ${Number(missionDurationMinutes(mission).toFixed(1))} min empiezan a contar con start_session. ` +
+            `Hasta entonces no se puede operar; si no arranca antes de ${prepEndsAt}, la misión se cancela.`,
+          prepEndsAt,
+        }),
     timeLeft: left.text,
     secondsLeft: left.seconds,
     userInstructions: mission.instructions ?? "ninguna: modo libre",
@@ -295,7 +393,7 @@ export async function stopMission(closePositions: boolean, missionId?: number): 
   await settleTransfers({ missionId: mission.id, force: true });
   const problems = closePositions ? await liquidateAll(mission.id, null, `Cierre manual: el usuario detuvo la misión #${mission.id}`) : [];
   const final = await valuation(mission.id, true);
-  db.prepare("UPDATE missions SET status = 'cancelled', ended_at = ?, final_usd = ? WHERE id = ?").run(now(), final.totalUsd, mission.id);
+  db.prepare("UPDATE missions SET status = 'cancelled', ended_at = ?, final_usd = ?, end_reason = 'user' WHERE id = ?").run(now(), final.totalUsd, mission.id);
   logJournal({
     missionId: mission.id,
     sessionId: null,
@@ -322,6 +420,8 @@ export function minutesSinceLastTrade(mission: Mission): number {
  * a menudo tras perder ("si nada cumple la creencia, me quedo en BNB"), así que el simulador se lo dice.
  */
 export function idleCheck(mission: Mission, v: Awaited<ReturnType<typeof valuation>>, secondsLeft: number): string | null {
+  // Antes del reloj esperar es lo correcto (a un evento, al plan): no hay nada que avisar.
+  if (!mission.started_at) return null;
   if (mission.status !== "active" || v.totalUsd >= mission.target_usd || secondsLeft < 90 || v.totalUsd <= 0) return null;
   const natives = new Set(allChains().map((c) => `${c.id}:${c.native.address}`));
   const cash = v.holdings.filter((h) => h.valuedBy === "stable" || natives.has(`${h.venue}:${h.asset}`)).reduce((s, h) => s + h.usd, 0);
@@ -355,7 +455,26 @@ export function lossFloor(mission: Mission): number | null {
 /** Comprueba una misión y la cierra si ha llegado al objetivo o se le ha acabado el plazo. */
 const lastSync = new Map<number, number>();
 
+/**
+ * Misión que lleva PREP_TIMEOUT_MINUTES sin arrancar el reloj: se cancela sin tocar la cartera (antes del reloj no
+ * se puede operar). Queda fuera de la cola de retrospectivas y del historial de resultados (sin final_usd).
+ */
+function cancelForPrepTimeout(mission: Mission): string[] {
+  const changed = db
+    .prepare("UPDATE missions SET status = 'cancelled', ended_at = ?, end_reason = 'prep_timeout' WHERE id = ? AND status = 'active' AND started_at IS NULL")
+    .run(now(), mission.id).changes;
+  if (!changed) return [];
+  db.prepare("UPDATE orders SET status = 'cancelled', closed_at = ? WHERE status = 'open' AND mission_id = ?").run(now(), mission.id);
+  const summary = `Misión #${mission.id} cancelada: el reloj no arrancó en ${PREP_TIMEOUT_MINUTES} min desde que se creó (prep_timeout)`;
+  logJournal({ missionId: mission.id, sessionId: null, kind: "mission", summary, details: { reason: "prep_timeout" } });
+  return [summary];
+}
+
 async function checkOne(mission: Mission): Promise<string[]> {
+  // Antes del reloj no hay plazo que vencer ni operaciones que vigilar: solo el tope de preparación.
+  if (!mission.started_at) {
+    return Date.now() - new Date(mission.created_at).getTime() >= PREP_TIMEOUT_MINUTES * 60_000 ? cancelForPrepTimeout(mission) : [];
+  }
   const expired = remaining(mission.deadline).ms <= 0;
   // Misión real: los saldos se leen de la cadena (como mucho cada 20 s por proceso).
   if (isLive(mission) && (expired || Date.now() - (lastSync.get(mission.id) ?? 0) > 20_000)) {
@@ -425,7 +544,8 @@ async function checkOne(mission: Mission): Promise<string[]> {
     return [summary];
   }
 
-  db.prepare("UPDATE missions SET status = ?, ended_at = ?, final_usd = ? WHERE id = ?").run(status, now(), final.totalUsd, mission.id);
+  const endReason = reached ? "target" : bust ? "bust" : lossHit ? "loss_limit" : "deadline";
+  db.prepare("UPDATE missions SET status = ?, ended_at = ?, final_usd = ?, end_reason = ? WHERE id = ?").run(status, now(), final.totalUsd, endReason, mission.id);
   const summary =
     `Misión #${mission.id} ${reached ? "CONSEGUIDA" : bust ? "SIN FONDOS (bancarrota)" : lossHit ? "PARADA POR PÉRDIDA MÁXIMA" : "TERMINADA POR TIEMPO"}: ${mission.initial_usd.toFixed(2)} → ${final.totalUsd.toFixed(2)} USD ` +
     `(objetivo ${mission.target_usd} USD)`;

@@ -34,6 +34,12 @@ const reserveStmt = db.prepare(
   `INSERT INTO http_pacing (host, next_at) VALUES (?, ?) ON CONFLICT(host) DO UPDATE SET next_at = max(next_at, ?) + ?
    RETURNING next_at`,
 );
+// Turno de baja prioridad: solo si el siguiente está libre ya (nadie lo ha reservado); si no, no se reserva nada.
+const takeFreeStmt = db.prepare(
+  `INSERT INTO http_pacing (host, next_at) VALUES (?, ?) ON CONFLICT(host) DO UPDATE SET next_at = excluded.next_at WHERE http_pacing.next_at <= ?
+   RETURNING next_at`,
+);
+const nextAtStmt = db.prepare("SELECT next_at FROM http_pacing WHERE host = ?");
 const cooldownStmt = db.prepare(
   "INSERT INTO http_pacing (host, next_at) VALUES (?, ?) ON CONFLICT(host) DO UPDATE SET next_at = max(next_at, excluded.next_at)",
 );
@@ -61,6 +67,30 @@ async function pace(host: string) {
   const { next_at } = reserveStmt.get(host, nowMs + interval, nowMs, interval) as { next_at: number };
   const slot = next_at - interval;
   if (slot > nowMs) await sleep(slot - nowMs);
+}
+
+/** Lo más que espera una petición de baja prioridad a que quede libre un turno antes de rendirse (HostBusyError). */
+export const LOW_PRIORITY_MAX_WAIT_MS = 3_000;
+
+/** El servicio está ocupado con peticiones de otros: una de baja prioridad se rinde en vez de hacer cola. */
+export class HostBusyError extends Error {}
+
+/**
+ * Carril de baja prioridad (el gemelo mecánico, shadow.ts): no reserva un turno futuro, espera a que el siguiente
+ * esté libre y solo entonces lo toma. Quien reserva de la forma normal (el agente) pasa siempre por delante: la de
+ * baja prioridad nunca hace cola delante de él. Si nadie más pide, va igual de rápido.
+ */
+async function paceLow(host: string, maxWaitMs: number) {
+  const interval = MIN_INTERVAL_MS[host];
+  if (!interval) return;
+  const until = Date.now() + maxWaitMs;
+  for (;;) {
+    const nowMs = Date.now();
+    if (takeFreeStmt.get(host, nowMs + interval, nowMs)) return;
+    const next = (nextAtStmt.get(host) as { next_at: number } | undefined)?.next_at ?? nowMs;
+    if (next > until) throw new HostBusyError(`${host} está ocupado con otras peticiones: la de baja prioridad se deja para la siguiente vuelta`);
+    await sleep(Math.max(20, next - nowMs));
+  }
 }
 const MAX_CACHE_ENTRIES = 2_000;
 
@@ -107,6 +137,11 @@ export interface RequestOpts {
   /** Cuerpo de un POST: se envía como JSON. */
   body?: unknown;
   headers?: Record<string, string>;
+  /**
+   * Baja prioridad (el gemelo mecánico): solo usa turnos libres del servicio, sin hacer cola delante de nadie
+   * (HostBusyError si no hay ninguno en LOW_PRIORITY_MAX_WAIT_MS), y no reintenta si el servicio pide esperar.
+   */
+  lowPriority?: boolean;
 }
 
 async function request(url: string, opts: RequestOpts & { timeoutMs: number }): Promise<{ status: number; body: string }> {
@@ -117,7 +152,8 @@ async function request(url: string, opts: RequestOpts & { timeoutMs: number }): 
       const hora = new Date(blocked).toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
       throw new Error(`${host} ha bloqueado temporalmente esta IP por exceso de peticiones (hasta las ${hora}); no se le llama hasta entonces`);
     }
-    await pace(host);
+    if (opts.lowPriority) await paceLow(host, LOW_PRIORITY_MAX_WAIT_MS);
+    else await pace(host);
     await acquire(host);
     let res: Response;
     let body: string;
@@ -142,13 +178,15 @@ async function request(url: string, opts: RequestOpts & { timeoutMs: number }): 
       blockStmt.run(host, banUntil(res, body));
       return { status: res.status, body };
     }
-    // Demasiadas peticiones o servicio saturado: esperar y reintentar.
+    // Demasiadas peticiones o servicio saturado: esperar y reintentar (una de baja prioridad no reintenta: la pausa
+    // queda para todos igual, y ella vuelve en la siguiente vuelta).
     if ((res.status === 429 || res.status === 503) && attempt < MAX_RETRIES) {
       const retryAfter = Number(res.headers.get("retry-after"));
       const wait = Number.isFinite(retryAfter) && retryAfter > 0 ? Math.min(retryAfter, 15) * 1000 : COOLDOWN_MS;
       // Los servicios con turnos pausan a todos los procesos; el resto solo reintenta esta petición.
       if (MIN_INTERVAL_MS[host]) cooldownStmt.run(host, Date.now() + wait);
-      else await sleep(wait);
+      if (opts.lowPriority) return { status: res.status, body };
+      if (!MIN_INTERVAL_MS[host]) await sleep(wait);
       continue;
     }
     return { status: res.status, body };

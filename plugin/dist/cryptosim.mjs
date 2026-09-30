@@ -7654,10 +7654,40 @@ var init_config = __esm({
       maxStepsPerSession: num("MAX_STEPS_PER_SESSION", 80),
       loopPauseMinutes: num("LOOP_PAUSE_MINUTES", 30),
       watchIntervalSeconds: num("WATCH_INTERVAL_SECONDS", 60),
+      // Con una misión rápida en marcha (15 min o menos), órdenes, futuros y misión se miran así de a menudo.
+      fastWatchIntervalSeconds: num("FAST_WATCH_INTERVAL_SECONDS", 5),
       browserHeadful: process.env.BROWSER_HEADFUL === "true",
       // DATA_DIR permite usar otra base de datos (p. ej. para pruebas) sin tocar la simulación principal.
       dataDir: resolveDataDir()
     };
+  }
+});
+
+// src/sim/mission-kind.ts
+function missionDurationMinutes(m) {
+  return (new Date(m.deadline).getTime() - new Date(m.created_at).getTime()) / 6e4;
+}
+function missionClass(a) {
+  const market = a.market?.trim() || (!a.live && isFastMinutes(a.durationMinutes) ? DEFAULT_FAST_MARKET : FREE_MARKET);
+  const num5 = (x) => String(Number(x.toFixed(1)));
+  return `${market}-${num5(a.durationMinutes)}m-+${num5((a.targetUsd - a.initialUsd) / a.initialUsd * 100)}%`;
+}
+function parseMissionClass(cls) {
+  const m = cls?.match(/^([^-]+)-(\d+(?:\.\d+)?)m-\+(-?\d+(?:\.\d+)?)%$/);
+  return m ? { market: m[1], minutes: Number(m[2]), targetPct: Number(m[3]) } : null;
+}
+var FAST_MISSION_MAX_MINUTES, PREP_TIMEOUT_MINUTES, DEFAULT_FAST_MARKET, FREE_MARKET, isFastMinutes, isShortMission, isFastMission, TP_TARGET_MARGIN;
+var init_mission_kind = __esm({
+  "src/sim/mission-kind.ts"() {
+    "use strict";
+    FAST_MISSION_MAX_MINUTES = 15;
+    PREP_TIMEOUT_MINUTES = 60;
+    DEFAULT_FAST_MARKET = "graduado";
+    FREE_MARKET = "libre";
+    isFastMinutes = (minutes) => minutes <= FAST_MISSION_MAX_MINUTES + 1e-3;
+    isShortMission = (m) => isFastMinutes(missionDurationMinutes(m));
+    isFastMission = (m) => m.mode !== "live" && isShortMission(m);
+    TP_TARGET_MARGIN = 3e-3;
   }
 });
 
@@ -7700,7 +7730,7 @@ function decisionBackfill(db2) {
   const missions = new Map(db2.prepare("SELECT id, initial_usd, deadline FROM missions").all().map((m) => [m.id, m]));
   const buys = db2.prepare("SELECT ts, details FROM journal WHERE mission_id = ? AND kind = 'swap' AND ts >= ? AND ts <= ? ORDER BY id");
   const update = db2.prepare("UPDATE positions SET research = ? WHERE id = ?");
-  const num3 = (x) => Number(String(x ?? "").split(" ")[0]);
+  const num5 = (x) => Number(String(x ?? "").split(" ")[0]);
   const STABLE = /^(USDC|USDT|USDbC|FDUSD)$/;
   for (const p of positions) {
     const research = JSON.parse(p.research ?? "{}");
@@ -7716,7 +7746,7 @@ function decisionBackfill(db2) {
     for (const j of buys.all(p.mission_id, p.opened_at.slice(0, 19), p.closed_at ?? "9999")) {
       const d = JSON.parse(j.details ?? "{}");
       if (d.outputMint !== p.asset || !STABLE.test(String(d.sold ?? "").split(" ")[1] ?? "")) continue;
-      const usd2 = num3(d.sold), qty = num3(d.received);
+      const usd2 = num5(d.sold), qty = num5(d.received);
       if (usd2 > 0 && qty > 0) prices.push(usd2 / qty);
     }
     let addedWhileDown = false;
@@ -7913,6 +7943,7 @@ var MIGRATIONS, MAX_BACKUPS, schemaVersion;
 var init_migrations = __esm({
   "src/migrations.ts"() {
     "use strict";
+    init_mission_kind();
     init_text();
     MIGRATIONS = [
       {
@@ -8046,6 +8077,94 @@ var init_migrations = __esm({
             research.hourUtc = new Date(r.opened_at).getUTCHours();
             update.run(JSON.stringify(research), r.id);
           }
+        }
+      },
+      {
+        version: 10,
+        description: "Misiones r\xE1pidas: clase de misi\xF3n, P predicha y de la l\xEDnea base, plan, gemelo mec\xE1nico y motivo de cierre",
+        up: (db2) => {
+          db2.exec(`
+        ALTER TABLE missions ADD COLUMN class TEXT;           -- '<mercado>-<minutos>m-+<objetivo>%', p. ej. 'graduado-10m-+25%'
+        ALTER TABLE missions ADD COLUMN predicted_p REAL;     -- P de llegar al objetivo seg\xFAn el plan vigente al arrancar el reloj (0-1)
+        ALTER TABLE missions ADD COLUMN baseline_p REAL;      -- P de la l\xEDnea base (regla mec\xE1nica) para esa clase (0-1)
+        ALTER TABLE missions ADD COLUMN plan_id INTEGER;      -- plan vigente al arrancar el reloj
+        ALTER TABLE missions ADD COLUMN shadow_hits INTEGER;  -- aciertos del gemelo mec\xE1nico
+        ALTER TABLE missions ADD COLUMN shadow_return REAL;   -- resultado medio del gemelo (fracci\xF3n: -0.12 = -12 %)
+        -- 'target' | 'deadline' | 'bust' | 'loss_limit' | 'user' | 'replaced' | 'prep_timeout'
+        ALTER TABLE missions ADD COLUMN end_reason TEXT;
+      `);
+          const rows = db2.prepare("SELECT id, created_at, deadline, initial_usd, target_usd, mode FROM missions").all();
+          const update = db2.prepare("UPDATE missions SET class = ? WHERE id = ?");
+          for (const m of rows) {
+            update.run(missionClass({ durationMinutes: missionDurationMinutes(m), initialUsd: m.initial_usd, targetUsd: m.target_usd, live: m.mode === "live" }), m.id);
+          }
+        }
+      },
+      {
+        version: 11,
+        description: "Planes del cerebro (planner): reglas fijas para un bloque de misiones de una misma clase",
+        up: (db2) => db2.exec(`
+        CREATE TABLE plans (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          created_at TEXT NOT NULL,
+          class TEXT NOT NULL,               -- clase de misi\xF3n a la que se aplica, p. ej. 'graduado-10m-+25%'
+          body TEXT NOT NULL,                -- JSON: evento, filtros, tama\xF1o, toma de beneficio, reentrada, riesgos, lista corta
+          predicted_p REAL,                  -- P de llegar al objetivo siguiendo el plan (0-1)
+          baseline_p REAL,                   -- P de la l\xEDnea base (la regla mec\xE1nica) para esa clase (0-1)
+          active INTEGER NOT NULL DEFAULT 1  -- 1 = vigente; como mucho uno por clase
+        );
+        CREATE INDEX plans_class ON plans (class, active);
+      `)
+      },
+      {
+        version: 12,
+        description: "Gemelo mec\xE1nico de las misiones r\xE1pidas: posiciones en papel en los eventos siguientes, sin tocar la cartera",
+        up: (db2) => db2.exec(`
+        CREATE TABLE shadow_runs (
+          mission_id INTEGER PRIMARY KEY,
+          started_at TEXT NOT NULL,          -- cuando arranc\xF3 el reloj de la misi\xF3n
+          detect_until TEXT NOT NULL,        -- hasta cu\xE1ndo abre gemelos: el plazo de la misi\xF3n
+          horizon_minutes REAL NOT NULL,     -- plazo de cada gemelo desde que entra (la duraci\xF3n de la misi\xF3n)
+          source TEXT NOT NULL,              -- fuente de eventos, la misma que wait_for_signal: 'graduado'
+          size_usd REAL NOT NULL,            -- lo que compra cada gemelo (lo que comprar\xEDa el agente)
+          tp_usd REAL NOT NULL,              -- acierta si vender sus tokens da esto o m\xE1s (la toma de beneficio del plan)
+          tp_basis TEXT NOT NULL,
+          target_count INTEGER NOT NULL,     -- cu\xE1ntos gemelos abre como mucho
+          status TEXT NOT NULL DEFAULT 'running',  -- running | done | abandoned
+          note TEXT,
+          ended_at TEXT
+        );
+        CREATE TABLE shadow_positions (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          mission_id INTEGER NOT NULL,
+          token TEXT NOT NULL,
+          symbol TEXT,
+          pool TEXT,
+          opened_at TEXT NOT NULL,
+          expires_at TEXT NOT NULL,
+          usd_in REAL NOT NULL,
+          tokens_raw TEXT NOT NULL,          -- tokens comprados en unidades base (lo que se cotiza al venderlos)
+          decimals INTEGER NOT NULL,
+          entry_value_usd REAL NOT NULL,     -- lo que daba venderlos al entrar (tras la ida y vuelta)
+          last_value_usd REAL,
+          best_value_usd REAL,
+          last_quote_at TEXT,
+          quotes INTEGER NOT NULL DEFAULT 0,
+          status TEXT NOT NULL DEFAULT 'open',  -- open | hit | expired | abandoned
+          closed_at TEXT,
+          exit_usd REAL,
+          note TEXT,
+          UNIQUE (mission_id, token)
+        );
+        CREATE INDEX shadow_positions_open ON shadow_positions (status, mission_id);
+      `)
+      },
+      {
+        version: 13,
+        description: "Una misi\xF3n real nunca es r\xE1pida: su clase va en el mercado libre aunque dure 15 min o menos",
+        // La migración 10 les daba el mercado de las rápidas (graduado) a las reales cortas, y el flujo rápido solo existe en simulación.
+        up: (db2) => {
+          db2.exec("UPDATE missions SET class = 'libre' || substr(class, instr(class, '-')) WHERE mode = 'live' AND class IS NOT NULL AND class NOT LIKE 'libre-%'");
         }
       }
     ];
@@ -8279,7 +8398,7 @@ var init_db = __esm({
     }
     runMigrations(db, config2.dataDir);
     now = () => (/* @__PURE__ */ new Date()).toISOString();
-    CODE_VERSION = "0.36.2";
+    CODE_VERSION = "0.37.0";
     semver = (v) => v.split(".").map((n3) => Number.parseInt(n3, 10) || 0);
     newer = (a, b) => {
       const [x, y] = [semver(a), semver(b)];
@@ -8310,6 +8429,18 @@ async function pace(host) {
   const slot = next_at - interval;
   if (slot > nowMs) await sleep(slot - nowMs);
 }
+async function paceLow(host, maxWaitMs) {
+  const interval = MIN_INTERVAL_MS[host];
+  if (!interval) return;
+  const until = Date.now() + maxWaitMs;
+  for (; ; ) {
+    const nowMs = Date.now();
+    if (takeFreeStmt.get(host, nowMs + interval, nowMs)) return;
+    const next = nextAtStmt.get(host)?.next_at ?? nowMs;
+    if (next > until) throw new HostBusyError(`${host} est\xE1 ocupado con otras peticiones: la de baja prioridad se deja para la siguiente vuelta`);
+    await sleep(Math.max(20, next - nowMs));
+  }
+}
 async function acquire(host) {
   if ((active.get(host) ?? 0) >= MAX_PARALLEL_PER_HOST) {
     await new Promise((resolve) => {
@@ -8332,7 +8463,8 @@ async function request(url2, opts) {
       const hora = new Date(blocked).toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
       throw new Error(`${host} ha bloqueado temporalmente esta IP por exceso de peticiones (hasta las ${hora}); no se le llama hasta entonces`);
     }
-    await pace(host);
+    if (opts.lowPriority) await paceLow(host, LOW_PRIORITY_MAX_WAIT_MS);
+    else await pace(host);
     await acquire(host);
     let res;
     let body;
@@ -8360,7 +8492,8 @@ async function request(url2, opts) {
       const retryAfter = Number(res.headers.get("retry-after"));
       const wait = Number.isFinite(retryAfter) && retryAfter > 0 ? Math.min(retryAfter, 15) * 1e3 : COOLDOWN_MS;
       if (MIN_INTERVAL_MS[host]) cooldownStmt.run(host, Date.now() + wait);
-      else await sleep(wait);
+      if (opts.lowPriority) return { status: res.status, body };
+      if (!MIN_INTERVAL_MS[host]) await sleep(wait);
       continue;
     }
     return { status: res.status, body };
@@ -8404,7 +8537,7 @@ function takeBudget(host, limit, windowMs) {
   const { used } = budgetStmt.get(host, nowMs, windowMs, nowMs, windowMs, nowMs);
   return used <= limit;
 }
-var DEFAULT_TTL_MS, MAX_PARALLEL_PER_HOST, MAX_RETRIES, MIN_INTERVAL_MS, DEFAULT_BAN_MS, COOLDOWN_MS, reserveStmt, cooldownStmt, blockedStmt, blockStmt, MAX_CACHE_ENTRIES, cache, active, waiting, sleep, fetchImpl, budgetStmt;
+var DEFAULT_TTL_MS, MAX_PARALLEL_PER_HOST, MAX_RETRIES, MIN_INTERVAL_MS, DEFAULT_BAN_MS, COOLDOWN_MS, reserveStmt, takeFreeStmt, nextAtStmt, cooldownStmt, blockedStmt, blockStmt, LOW_PRIORITY_MAX_WAIT_MS, HostBusyError, MAX_CACHE_ENTRIES, cache, active, waiting, sleep, fetchImpl, budgetStmt;
 var init_http = __esm({
   "src/market/http.ts"() {
     "use strict";
@@ -8431,6 +8564,11 @@ var init_http = __esm({
       `INSERT INTO http_pacing (host, next_at) VALUES (?, ?) ON CONFLICT(host) DO UPDATE SET next_at = max(next_at, ?) + ?
    RETURNING next_at`
     );
+    takeFreeStmt = db.prepare(
+      `INSERT INTO http_pacing (host, next_at) VALUES (?, ?) ON CONFLICT(host) DO UPDATE SET next_at = excluded.next_at WHERE http_pacing.next_at <= ?
+   RETURNING next_at`
+    );
+    nextAtStmt = db.prepare("SELECT next_at FROM http_pacing WHERE host = ?");
     cooldownStmt = db.prepare(
       "INSERT INTO http_pacing (host, next_at) VALUES (?, ?) ON CONFLICT(host) DO UPDATE SET next_at = max(next_at, excluded.next_at)"
     );
@@ -8439,6 +8577,9 @@ var init_http = __esm({
     blockStmt = db.prepare(
       "INSERT INTO http_blocked (host, until) VALUES (?, ?) ON CONFLICT(host) DO UPDATE SET until = max(until, excluded.until)"
     );
+    LOW_PRIORITY_MAX_WAIT_MS = 3e3;
+    HostBusyError = class extends Error {
+    };
     MAX_CACHE_ENTRIES = 2e3;
     cache = /* @__PURE__ */ new Map();
     active = /* @__PURE__ */ new Map();
@@ -8595,9 +8736,9 @@ async function getTokenInfo(mint) {
   tokenCache.set(mint, info);
   return info;
 }
-async function getQuote(inputMint, outputMint, amountBase, slippageBps, ttlMs = 2e3) {
+async function getQuote(inputMint, outputMint, amountBase, slippageBps, ttlMs = 2e3, opts = {}) {
   const url2 = `${BASE2}/swap/v1/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountBase.toString()}&slippageBps=${slippageBps}`;
-  const quote2 = await fetchJson(url2, 15e3, ttlMs);
+  const quote2 = await fetchJson(url2, { timeoutMs: 15e3, ttlMs, lowPriority: opts.lowPriority });
   if (quote2.error) throw new Error(`Jupiter: ${quote2.error}`);
   return quote2;
 }
@@ -9415,7 +9556,7 @@ var init_research = __esm({
     "use strict";
     init_http();
     n2 = (v, digits = 2) => typeof v === "number" && Number.isFinite(v) ? Number(v.toFixed(digits)) : void 0;
-    ageMinutes2 = (iso) => iso === void 0 ? void 0 : Math.round((Date.now() - new Date(iso).getTime()) / 6e4);
+    ageMinutes2 = (iso2) => iso2 === void 0 ? void 0 : Math.round((Date.now() - new Date(iso2).getTime()) / 6e4);
   }
 });
 
@@ -10164,6 +10305,513 @@ var init_perps = __esm({
   }
 });
 
+// src/sim/baselines.json
+var baselines_default;
+var init_baselines = __esm({
+  "src/sim/baselines.json"() {
+    baselines_default = {
+      about: "L\xEDneas base medidas (30-sep-2026) de las misiones r\xE1pidas: la P de llegar al objetivo con una regla mec\xE1nica, sin inteligencia. Son mediciones sobre datos hist\xF3ricos, no predicciones. Fuente: C:/tf-tmp/dk-research/results/sintesis.md, secciones 1 y 4.7.",
+      method: "P por cierre de vela de 1 min, con 10 $ y costes reales: una sola compra con todo y una orden de venta en el objetivo neto de costes; si no salta, venta al acabar el reloj. El simulador mira la orden cada 5-15 s, as\xED que puede dar algo m\xE1s, hasta la cifra 'tocando mecha'.",
+      horizons: [5, 10, 15, 30],
+      targets: [25, 50, 100],
+      memecoins: {
+        graduado: {
+          strategy: "Memecoin reci\xE9n graduada",
+          label: "token de pump.fun reci\xE9n graduado (migrado a su pool de PumpSwap hace 2 min o menos), comprado 1-2 min despu\xE9s de migrar",
+          sample: "925 tokens en 23 h de un solo d\xEDa (29-30 sep 2026)",
+          verified: false,
+          reliability: "sin repetir con otro d\xEDa ni fuera de muestra. La P de +25 % en 10 min es estable en los cuatro bloques de 6 h (32, 34, 35 y 38 %; IC95 del total 32-38 %); el EV no lo es (de +3 a \u221223 % seg\xFAn el bloque). Puede deberse en parte a BOOST de pump.fun: si lo cambian, la cifra desaparece",
+          evPct: [-24, -12],
+          p: {
+            "5": { "25": 0.24, "50": 0.11, "100": 0.05 },
+            "10": { "25": 0.35, "50": 0.21, "100": 0.09 },
+            "15": { "25": 0.37, "50": 0.25, "100": 0.14 },
+            "30": { "25": 0.39, "50": 0.26, "100": 0.17 }
+          },
+          cellEvPct: {
+            "5": { "25": [-12, -12], "50": [-16, -8], "100": [-16, -8] },
+            "10": { "25": [-12, -12], "50": [-17, -17], "100": [-19, -19] },
+            "15": { "25": [-14, -14], "50": [-19, -19], "100": [-22, -22] },
+            "30": { "25": [-14, -14], "50": [-20, -20], "100": [-24, -24] }
+          },
+          wick: {
+            "5": { "25": 0.39, "100": 0.12 },
+            "10": { "25": 0.51, "100": 0.17 },
+            "15": { "25": 0.52, "100": 0.21 },
+            "30": { "25": 0.53, "100": 0.25 }
+          },
+          outOfSample: {}
+        },
+        momentum: {
+          strategy: "Memecoin con momentum (+25 % en 1 min)",
+          label: "token de pump.fun comprado en la primera vela de 1 min que sube un 25 % o m\xE1s en su primera hora de vida",
+          sample: "95 + 69 tokens en dos ventanas seguidas (la segunda, fuera de muestra, la baj\xF3 el verificador)",
+          verified: true,
+          reliability: "reimplementado por otro agente y comprobado con una segunda ventana de datos, que rebaj\xF3 las cifras",
+          evPct: [-27, -8],
+          p: {
+            "5": { "25": 0.16, "50": 0.12, "100": 0.06 },
+            "10": { "25": 0.19, "50": 0.13, "100": 0.08 },
+            "15": { "25": 0.2, "50": 0.14, "100": 0.1 },
+            "30": { "25": 0.2, "50": 0.14, "100": 0.11 }
+          },
+          outOfSample: {
+            "10": { "25": 0.16, "100": 0.07 }
+          }
+        },
+        lanzamiento: {
+          strategy: "Lanzamiento de pump.fun al minuto 1",
+          label: "cualquier lanzamiento de pump.fun comprado en su minuto 1",
+          sample: "692 + 513 lanzamientos en dos ventanas seguidas (la segunda, fuera de muestra)",
+          verified: true,
+          reliability: "comprobado fuera de muestra, que rebaj\xF3 las cifras",
+          evPct: [-14, -8],
+          p: {
+            "5": { "25": 0.06, "50": 0.04, "100": 0.02 },
+            "10": { "25": 0.07, "50": 0.04, "100": 0.03 },
+            "15": { "25": 0.07, "50": 0.05, "100": 0.03 },
+            "30": { "25": 0.07, "50": 0.05, "100": 0.03 }
+          },
+          outOfSample: {
+            "5": { "25": 0.03, "100": 0.01 },
+            "10": { "25": 0.04, "100": 0.02 }
+          }
+        }
+      },
+      perps: {
+        about: "R\xE9plica exacta del simulador (mira los futuros cada 60 s y cobra 0,30 $ + 1 $ fijos por posici\xF3n), con 6 meses de velas de 1 min (abril-septiembre 2026). Todo el capital (50 $) en una sola cadena y objetivo +25 %. Solo existen en simulaci\xF3n.",
+        capitalUsd: 50,
+        targetPct: 25,
+        x2: "\u22480 en todos los plazos de 30 min o menos (1 de cada 1.400 a 14.000 intentos, en la mejor moneda)",
+        defaultAllocation: "con el reparto por defecto (30/25/25/20) un futuro solo puede usar 13,95 $ de los 50 $, y el +25 % en 15 min cae a \u22480,01 %",
+        cells: [
+          {
+            id: "btc-40x",
+            coin: "BTC",
+            leverage: 40,
+            label: "BTC a 40x, sin esperar",
+            p: { "5": 1e-3, "10": 3e-3, "15": 67e-4, "30": 0.0195 },
+            evPct: [-6, -6]
+          },
+          {
+            id: "btc-40x-vol",
+            coin: "BTC",
+            leverage: 40,
+            label: "BTC a 40x, arrancando solo con la volatilidad de la \xFAltima hora en su 1 % m\xE1s alto",
+            gate: { sigmaPerMinute: 125e-5, text: "volatilidad de la \xFAltima hora \u2265 0,125 % por minuto (su 1 % m\xE1s alto): apareci\xF3 135 h en 121 d\xEDas, agrupadas en 37 d\xEDas" },
+            p: { "5": 0.014, "10": 0.043, "15": 0.076, "30": 0.172 },
+            ci95: { "15": [0.049, 0.098] },
+            evPct: [-10, -8],
+            note: "comprobado fuera de muestra; si el agente tarda 2 min en entrar, el 7,6 % baja a 5,9 %"
+          },
+          {
+            id: "zec-10x",
+            coin: "ZEC",
+            leverage: 10,
+            label: "futuro de alta volatilidad a 10x (tipo ZEC)",
+            p: { "5": 1e-3, "10": 27e-4, "15": 48e-4, "30": 0.0139 }
+          }
+        ]
+      }
+    };
+  }
+});
+
+// src/sim/baselines.ts
+function interp(xs, ys, x) {
+  if (x <= xs[0]) return ys[0];
+  for (let i = 1; i < xs.length; i++) {
+    if (x <= xs[i]) return ys[i - 1] + (ys[i] - ys[i - 1]) * (x - xs[i - 1]) / (xs[i] - xs[i - 1]);
+  }
+  return ys.at(-1);
+}
+function cell(m, h, t) {
+  const inSample = m.p[h][t];
+  return { p: m.outOfSample[h]?.[t] ?? inSample, inSample };
+}
+function baselineP(market, minutes, targetPct) {
+  const m = MARKETS[market];
+  if (!m || !(minutes > 0) || !(targetPct > 0)) return void 0;
+  const hs = BASELINE_HORIZONS;
+  const ts = BASELINE_TARGETS;
+  const exact = hs.includes(minutes) && ts.includes(targetPct);
+  const bounds = [];
+  if (minutes > hs.at(-1)) bounds.push("min");
+  if (targetPct < ts[0]) bounds.push("min");
+  if (targetPct > ts.at(-1)) bounds.push("max");
+  const bound = bounds.length && bounds.every((b) => b === bounds[0]) ? bounds[0] : void 0;
+  const logT = (t) => Math.log(1 + t / 100);
+  const at = (h, pick2) => interp(
+    ts.map(logT),
+    ts.map((t) => cell(m, h, t)[pick2]),
+    logT(targetPct)
+  );
+  const value = (pick2) => {
+    const row = hs.map((h) => at(h, pick2));
+    return minutes < hs[0] ? row[0] * minutes / hs[0] : interp(hs, row, minutes);
+  };
+  const p = value("p");
+  const inSample = value("inSample");
+  const wick = exact ? m.wick?.[minutes]?.[targetPct] : void 0;
+  const cellEv = exact ? m.cellEvPct?.[minutes]?.[targetPct] : void 0;
+  const ev = cellEv ?? m.evPct;
+  const how = exact ? `casilla medida (${minutes} min, ${targetLabel(targetPct)})` : bound ? `fuera de la tabla: ${bound === "min" ? "como poco" : "como mucho"} esto` : "interpolada entre casillas medidas";
+  return {
+    market,
+    strategy: m.strategy,
+    minutes: Number(minutes.toFixed(1)),
+    targetPct: Number(targetPct.toFixed(1)),
+    p: Number(p.toFixed(4)),
+    ...Math.abs(inSample - p) > 1e-9 ? { inSampleP: Number(inSample.toFixed(4)) } : {},
+    exact,
+    ...bound ? { bound } : {},
+    ...wick !== void 0 ? { wickP: wick } : {},
+    evPct: ev,
+    verified: m.verified,
+    sample: m.sample,
+    basis: `${m.label}: P ${pctText(p)}${Math.abs(inSample - p) > 1e-9 ? ` fuera de muestra (${pctText(inSample)} en la muestra)` : ""}${wick !== void 0 ? `, hasta ${pctText(wick)} si la orden pilla las mechas` : ""}; EV ${ev[0] === ev[1] ? `${ev[0]} %` : `${ev[0]} a ${ev[1]} %`}; ${how}; ${m.sample}${m.verified ? ", verificado fuera de muestra" : ", sin verificar con otro d\xEDa"}`
+  };
+}
+function baselineForClass(cls) {
+  const c = parseMissionClass(cls);
+  return c ? baselineP(c.market, c.minutes, c.targetPct) : void 0;
+}
+function baselineFrontier(market) {
+  const m = MARKETS[market];
+  if (!m) return void 0;
+  return BASELINE_HORIZONS.map((h) => {
+    const ps = BASELINE_TARGETS.map((t) => ({ t, p: cell(m, h, t).p }));
+    return {
+      minutes: h,
+      byTargetPct: Object.fromEntries(ps.map(({ t, p }) => [targetLabel(t), Number((p * 100).toFixed(1))])),
+      frontier: Object.fromEntries(
+        FRONTIER_LEVELS.map((level) => {
+          const best = ps.filter((x) => x.p >= level).at(-1);
+          return [`P\u2265${level * 100} %`, best ? targetLabel(best.t) : "ninguno"];
+        })
+      )
+    };
+  });
+}
+function baselineByMarket(minutes, targetPct) {
+  return baselineMarkets().map((market) => baselineP(market, minutes, targetPct)).sort((a, b) => b.p - a.p).map((b) => ({ market: b.market, strategy: b.strategy, pPct: Number((b.p * 100).toFixed(1)), exact: b.exact, ...b.bound ? { bound: b.bound } : {}, verified: b.verified }));
+}
+function perpBaselines(minutes, targetPct) {
+  return PERP_CELLS.map((c) => {
+    const base2 = { id: c.id, coin: c.coin, leverage: c.leverage, label: c.label, ...c.gate ? { gate: c.gate.text } : {} };
+    if (targetPct >= 100) return { ...base2, pPct: 0, text: `\xD72: ${baselines_default.perps.x2}` };
+    if (targetPct < 20 || targetPct > 30) return { ...base2, pPct: null, text: `medido solo para +${baselines_default.perps.targetPct} % y \xD72` };
+    const hs = BASELINE_HORIZONS;
+    const row = hs.map((h) => c.p[h]);
+    const p = minutes < hs[0] ? row[0] * minutes / hs[0] : interp(hs, row, minutes);
+    return {
+      ...base2,
+      pPct: Number((p * 100).toFixed(2)),
+      text: `${pctText(p)} de llegar a +${baselines_default.perps.targetPct} % en ${Number(minutes.toFixed(1))} min${minutes > hs.at(-1) ? " (como poco)" : ""}${c.evPct ? `; EV ${c.evPct[0] === c.evPct[1] ? `${c.evPct[0]} %` : `${c.evPct[0]} a ${c.evPct[1]} %`}` : ""}${c.note ? `; ${c.note}` : ""}`
+    };
+  });
+}
+var BASELINE_HORIZONS, BASELINE_TARGETS, FRONTIER_LEVELS, MARKETS, baselineMarkets, isBaselineMarket, targetLabel, pctText, PERP_CELLS, PERP_BASELINE_INFO;
+var init_baselines2 = __esm({
+  "src/sim/baselines.ts"() {
+    "use strict";
+    init_baselines();
+    init_mission_kind();
+    BASELINE_HORIZONS = baselines_default.horizons;
+    BASELINE_TARGETS = baselines_default.targets;
+    FRONTIER_LEVELS = [0.1, 0.25, 0.5];
+    MARKETS = baselines_default.memecoins;
+    baselineMarkets = () => Object.keys(MARKETS);
+    isBaselineMarket = (market) => Object.hasOwn(MARKETS, market);
+    targetLabel = (t) => t === 100 ? "\xD72" : `+${Number(t.toFixed(1))} %`;
+    pctText = (p) => `${String(Number((p * 100).toFixed(p < 0.01 ? 2 : p < 0.1 ? 1 : 0))).replace(".", ",")} %`;
+    PERP_CELLS = baselines_default.perps.cells;
+    PERP_BASELINE_INFO = {
+      about: baselines_default.perps.about,
+      capitalUsd: baselines_default.perps.capitalUsd,
+      targetPct: baselines_default.perps.targetPct,
+      x2: baselines_default.perps.x2,
+      defaultAllocation: baselines_default.perps.defaultAllocation
+    };
+  }
+});
+
+// src/sim/stats.ts
+function wilson(successes, n3) {
+  if (!n3) return { low: 0, high: 100 };
+  const z2 = 1.96;
+  const p = successes / n3;
+  const denom = 1 + z2 * z2 / n3;
+  const center = (p + z2 * z2 / (2 * n3)) / denom;
+  const half = z2 * Math.sqrt(p * (1 - p) / n3 + z2 * z2 / (4 * n3 * n3)) / denom;
+  return { low: Math.round(Math.max(0, center - half) * 100), high: Math.round(Math.min(1, center + half) * 100) };
+}
+var init_stats = __esm({
+  "src/sim/stats.ts"() {
+    "use strict";
+  }
+});
+
+// src/sim/class-stats.ts
+function twinCounts() {
+  const rows = db.prepare(
+    `SELECT r.mission_id, r.status AS run_status,
+              COALESCE(SUM(p.status IN ('hit', 'expired')), 0) AS done,
+              COALESCE(SUM(p.status = 'hit'), 0) AS hits,
+              COALESCE(SUM(p.status = 'open'), 0) AS open,
+              COALESCE(SUM(p.status = 'abandoned'), 0) AS dropped
+       FROM shadow_runs r LEFT JOIN shadow_positions p ON p.mission_id = r.mission_id
+       GROUP BY r.mission_id`
+  ).all();
+  return new Map(rows.map((r) => [r.mission_id, r]));
+}
+function missionComparison(m, twins = twinCounts()) {
+  const t = twins.get(m.id);
+  const resultPct = m.final_usd === null ? null : pct1((m.final_usd - m.initial_usd) / m.initial_usd);
+  const twinReturnPct = m.shadow_return === null ? null : pct1(m.shadow_return);
+  const twin = m.shadow_hits !== null && t ? `${m.shadow_hits} de ${t.done}` : t?.run_status === "running" ? `en curso (${t.done} terminados, ${t.open} abiertos)` : t?.run_status === "done" ? t.dropped ? "sin gemelos observados hasta el final de su plazo" : "sin eventos en su plazo" : t?.run_status === "abandoned" ? "abandonado" : "sin gemelo";
+  return {
+    ...m.plan_id !== null ? { planId: m.plan_id } : {},
+    hit: m.status === "succeeded",
+    resultPct,
+    ...m.predicted_p !== null ? { predictedPct: pct1(m.predicted_p) } : {},
+    ...m.baseline_p !== null ? { baselinePct: pct1(m.baseline_p) } : {},
+    twin,
+    ...twinReturnPct !== null ? { twinReturnPct } : {},
+    // Puntos de resultado del agente por encima (o por debajo) del gemelo, sobre el capital de la misión.
+    ...twinReturnPct !== null && resultPct !== null ? { vsTwinPoints: Number((resultPct - twinReturnPct).toFixed(1)) } : {}
+  };
+}
+function classStats(opts = {}) {
+  const rows = db.prepare(
+    `SELECT id, class, status, initial_usd, final_usd, predicted_p, baseline_p, plan_id, shadow_hits, shadow_return, ended_at
+       FROM missions
+       WHERE status IN ('succeeded', 'expired', 'bust') AND class IS NOT NULL AND started_at IS NOT NULL ${opts.cls ? "AND class = ?" : ""}
+       ORDER BY id`
+  ).all(...opts.cls ? [opts.cls] : []);
+  const twins = twinCounts();
+  const groups = /* @__PURE__ */ new Map();
+  for (const r of rows) groups.set(r.class, [...groups.get(r.class) ?? [], r]);
+  return [...groups.entries()].map(([cls, ms]) => {
+    const n3 = ms.length;
+    const hits = ms.filter((m) => m.status === "succeeded").length;
+    const agent = rate(hits, n3);
+    const predicted = ms.filter((m) => m.predicted_p !== null);
+    const expected = predicted.reduce((s, m) => s + m.predicted_p, 0);
+    const predictedHits = predicted.filter((m) => m.status === "succeeded").length;
+    const withBaseline = ms.filter((m) => m.baseline_p !== null);
+    const baselineExpected = withBaseline.reduce((s, m) => s + m.baseline_p, 0);
+    const table2 = baselineForClass(cls);
+    const withTwin = ms.filter((m) => m.shadow_hits !== null && (twins.get(m.id)?.done ?? 0) > 0);
+    const twinN = withTwin.reduce((s, m) => s + twins.get(m.id).done, 0);
+    const twinHits = withTwin.reduce((s, m) => s + m.shadow_hits, 0);
+    const twinRates = withTwin.map((m) => m.shadow_hits / twins.get(m.id).done);
+    const twinMeanRate = twinRates.length ? twinRates.reduce((s, r) => s + r, 0) / twinRates.length : 0;
+    const pending = ms.filter((m) => twins.get(m.id)?.run_status === "running").length;
+    const twin = withTwin.length ? missionRate(twinMeanRate, withTwin.length, twinHits, twinN) : null;
+    const agentOnTwinMissions = withTwin.length ? rate(withTwin.filter((m) => m.status === "succeeded").length, withTwin.length) : null;
+    let vsTwin;
+    if (!twin || !agentOnTwinMissions) vsTwin = pending ? "el gemelo a\xFAn no ha terminado" : "sin gemelo con el que comparar";
+    else {
+      const [aLo, aHi] = agentOnTwinMissions.ci95Pct;
+      const [tLo, tHi] = twin.ci95Pct;
+      vsTwin = `en las ${withTwin.length} misiones con gemelo, el agente ${agentOnTwinMissions.text} frente al gemelo ${twin.text}: ` + (aLo > tHi ? "el agente acierta m\xE1s (los intervalos no se solapan)" : aHi < tLo ? "el agente acierta menos (los intervalos no se solapan)" : "los intervalos se solapan: con esta muestra no se distingue al agente del gemelo");
+    }
+    const limit = opts.perMissionLimit ?? n3;
+    return {
+      class: cls,
+      missions: n3,
+      hits,
+      hitRate: agent.text,
+      ci95Pct: agent.ci95Pct,
+      avgResultPct: pct1(ms.reduce((s, m) => s + (m.final_usd - m.initial_usd) / m.initial_usd, 0) / n3),
+      calibration: predicted.length ? {
+        missions: predicted.length,
+        predictedHits: Number(expected.toFixed(1)),
+        actualHits: predictedHits,
+        reading: `el cerebro esperaba ${num2(expected)} aciertos en ${predicted.length} misiones y hubo ${predictedHits}`
+      } : "ninguna misi\xF3n con P predicha (sin plan)",
+      baseline: {
+        ...table2 ? { tablePct: pct1(table2.p), table: table2.basis } : { table: "su mercado no est\xE1 en la tabla medida" },
+        ...withBaseline.length ? { expectedHits: Number(baselineExpected.toFixed(1)), reading: `la l\xEDnea base esperaba ${num2(baselineExpected)} aciertos en ${withBaseline.length} misiones y hubo ${withBaseline.filter((m) => m.status === "succeeded").length}` } : {}
+      },
+      twin: twin ? {
+        missions: withTwin.length,
+        twins: twinN,
+        hits: twinHits,
+        meanRatePct: pct1(twinMeanRate),
+        hitRate: twin.text,
+        ci95Pct: twin.ci95Pct,
+        avgReturnPct: pct1(withTwin.reduce((s, m) => s + m.shadow_return, 0) / withTwin.length),
+        ...pending ? { pending } : {}
+      } : pending ? `${pending} gemelos a\xFAn en curso` : "sin gemelo",
+      vsTwin,
+      verdict: n3 < MIN_MISSIONS_FOR_VERDICT ? `${n3} de ${MIN_MISSIONS_FOR_VERDICT} misiones: a\xFAn no se saca ninguna conclusi\xF3n ni se cambian las reglas del bloque` : "muestra suficiente para un primer veredicto, solo si la diferencia es grande (\xD72); para mejoras moderadas hacen falta 50-130",
+      perMission: ms.slice(-limit).map((m) => ({ missionId: m.id, ...missionComparison(m, twins) }))
+    };
+  });
+}
+var MIN_MISSIONS_FOR_VERDICT, pct1, num2, rate, missionRate;
+var init_class_stats = __esm({
+  "src/sim/class-stats.ts"() {
+    "use strict";
+    init_db();
+    init_baselines2();
+    init_stats();
+    MIN_MISSIONS_FOR_VERDICT = 20;
+    pct1 = (x) => Number((x * 100).toFixed(1));
+    num2 = (x, d = 1) => String(Number(x.toFixed(d))).replace(".", ",");
+    rate = (k, n3) => {
+      const ci = wilson(k, n3);
+      return { text: `${k} de ${n3} (${n3 ? Math.round(k / n3 * 100) : 0} %; IC95 ${ci.low}-${ci.high} %)`, ci95Pct: [ci.low, ci.high] };
+    };
+    missionRate = (meanRate, missions, hits, twinsDone) => {
+      const ci = wilson(meanRate * missions, missions);
+      return {
+        text: `${Math.round(meanRate * 100)} % de media por misi\xF3n en ${missions} misiones (${hits} de ${twinsDone} gemelos); IC95 ${ci.low}-${ci.high} % con n = misiones`,
+        ci95Pct: [ci.low, ci.high]
+      };
+    };
+  }
+});
+
+// src/sim/plans.ts
+function planBlock(planId) {
+  const r = db.prepare(
+    `SELECT COALESCE(SUM(started_at IS NOT NULL), 0) AS played,
+              COALESCE(SUM(started_at IS NOT NULL AND status IN ('succeeded', 'expired', 'bust')), 0) AS finished,
+              COALESCE(SUM(started_at IS NOT NULL AND status = 'succeeded'), 0) AS succeeded,
+              COALESCE(SUM(end_reason = 'prep_timeout'), 0) AS noCandidate
+       FROM missions WHERE plan_id = ?`
+  ).get(planId);
+  const last = db.prepare(
+    `SELECT id, end_reason FROM missions WHERE plan_id = ? AND status NOT IN ('active', 'closing')
+         AND (started_at IS NOT NULL OR end_reason = 'prep_timeout') ORDER BY id DESC LIMIT 1`
+  ).get(planId);
+  return { ...r, left: Math.max(0, PLAN_BLOCK_SIZE - r.finished), lastWithoutCandidate: last?.end_reason === "prep_timeout" ? last.id : null };
+}
+function writePlan(a) {
+  let id = 0;
+  let current;
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    current = activePlan(a.cls);
+    if (current) {
+      const block = planBlock(current.id);
+      if (block.finished < PLAN_BLOCK_SIZE && !a.replaceReason) {
+        throw new Error(
+          `La clase ${a.cls} ya tiene vigente el plan #${current.id}, que lleva ${block.finished} de ${PLAN_BLOCK_SIZE} misiones terminadas: el plan queda fijo durante su bloque (si cambia a mitad, no se mide nada). Si de verdad no sirve (p. ej. su fuente no da candidatos), repite con replace_reason explicando por qu\xE9.`
+        );
+      }
+    }
+    const body = current && a.replaceReason ? { ...a.body, replaces: { id: current.id, reason: a.replaceReason } } : a.body;
+    db.prepare("UPDATE plans SET active = 0 WHERE class = ? AND active = 1").run(a.cls);
+    id = Number(
+      db.prepare("INSERT INTO plans (created_at, class, body, predicted_p, baseline_p, active) VALUES (?, ?, ?, ?, ?, 1)").run(now(), a.cls, JSON.stringify(body), a.predictedP, a.baselineP).lastInsertRowid
+    );
+    db.exec("COMMIT");
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  }
+  const pct4 = (p) => `${Math.round(p * 100)} %`;
+  logJournal({
+    missionId: a.missionId,
+    sessionId: a.sessionId,
+    kind: "plan",
+    summary: `Plan #${id} para ${a.cls}: ${a.body.event} (P ${pct4(a.predictedP)} frente a ${pct4(a.baselineP)} de la l\xEDnea base)` + (current ? `; sustituye al #${current.id}` : ""),
+    details: { planId: id, class: a.cls, ...current ? { replaced: current.id, reason: a.replaceReason } : {} }
+  });
+  return { id, ...current ? { replaced: current.id } : {} };
+}
+function planForMission(missionId) {
+  const m = missionRow(missionId);
+  if (!m) return void 0;
+  if (m.plan_id !== null && m.started_at) return getPlan(m.plan_id);
+  return preparedPlan(m);
+}
+function markPlanForMission(missionId, planId) {
+  db.prepare("UPDATE missions SET plan_id = ? WHERE id = ? AND started_at IS NULL AND status = 'active'").run(planId, missionId);
+}
+function attachPlan(missionId, plan) {
+  db.prepare("UPDATE missions SET plan_id = ?, predicted_p = ?, baseline_p = ?, class = ? WHERE id = ?").run(
+    plan.id,
+    plan.predicted_p,
+    plan.baseline_p,
+    plan.class,
+    missionId
+  );
+}
+function attachPlanForMission(missionId) {
+  const m = missionRow(missionId);
+  const plan = m ? preparedPlan(m) : void 0;
+  if (plan) attachPlan(missionId, plan);
+  return plan;
+}
+function thesisFromPlan(planId, missionId) {
+  const m = missionRow(missionId);
+  if (!m) throw new Error("No hay ninguna misi\xF3n");
+  if (!isFastMission(m)) {
+    throw new Error("plan_ref solo vale en misiones r\xE1pidas (simuladas de 15 min o menos): en esta, cada operaci\xF3n lleva su tesis completa");
+  }
+  const plan = getPlan(planId);
+  if (!plan) throw new Error(`No existe el plan #${planId}: los vigentes los da get_plan`);
+  if (!plan.active && m.plan_id !== plan.id) {
+    const current = activePlan(plan.class);
+    throw new Error(`El plan #${planId} ya no est\xE1 vigente${current ? `: el de su clase (${plan.class}) es el #${current.id}` : ""}`);
+  }
+  if (m.class && m.class !== plan.class && m.plan_id !== plan.id) {
+    throw new Error(`El plan #${planId} es para ${plan.class} y esta misi\xF3n es ${m.class}: no son de la misma clase`);
+  }
+  const b = plan.body;
+  return {
+    why: `Plan #${plan.id} (${plan.class}): ${b.event}. ${b.why}`,
+    evidence: b.evidence,
+    sources: b.sources.length ? b.sources : [`plan #${plan.id}`],
+    exit_plan: `Toma de beneficio ${b.tp_ratio ? `a \xD7${b.tp_ratio} del precio de compra` : "en el precio que deja el objetivo cumplido neto de costes"}; si no salta, venta al acabar el reloj. Reentrada: ${b.reentry_allowed ? b.reentry : "no"}`,
+    beliefs_applied: b.beliefs_applied ?? [],
+    memory_note: b.memory_note?.trim() || `Aplica el plan #${plan.id} del cerebro`,
+    risks_checked: b.risks_checked
+  };
+}
+function describePlan(plan) {
+  const block = planBlock(plan.id);
+  return {
+    planId: plan.id,
+    class: plan.class,
+    status: plan.active ? "vigente" : "sustituido",
+    createdAt: plan.created_at,
+    predictedP: plan.predicted_p,
+    baselineP: plan.baseline_p,
+    block: `${block.finished} de ${PLAN_BLOCK_SIZE} misiones terminadas (${block.succeeded} conseguidas)`,
+    ...block.noCandidate ? {
+      withoutCandidate: {
+        missions: block.noCandidate,
+        lastMissionWithoutCandidate: block.lastWithoutCandidate,
+        note: `${block.noCandidate} misi\xF3n(es) preparadas con este plan se cancelaron a los 60 min sin que llegara ning\xFAn candidato` + (block.lastWithoutCandidate !== null ? `, la \xFAltima (#${block.lastWithoutCandidate}) incluida: si su fuente o sus filtros no dejan pasar nada, el planner lo sustituye con replace_reason (los descartes de wait_for_signal est\xE1n en el diario de esa misi\xF3n: journal_history)` : "")
+      }
+    } : {},
+    ...plan.body
+  };
+}
+var PLAN_BLOCK_SIZE, SIGNAL_SOURCES, SOURCE_MARKET, toPlan, getPlan, activePlan, latestActivePlan, missionRow, preparedPlan;
+var init_plans = __esm({
+  "src/sim/plans.ts"() {
+    "use strict";
+    init_db();
+    init_mission_kind();
+    PLAN_BLOCK_SIZE = 20;
+    SIGNAL_SOURCES = ["graduado", "shortlist"];
+    SOURCE_MARKET = { graduado: "graduado", shortlist: "graduado" };
+    toPlan = (r) => r ? { ...r, body: JSON.parse(r.body), active: r.active === 1 } : void 0;
+    getPlan = (id) => toPlan(db.prepare("SELECT * FROM plans WHERE id = ?").get(id));
+    activePlan = (cls) => toPlan(db.prepare("SELECT * FROM plans WHERE class = ? AND active = 1 ORDER BY id DESC LIMIT 1").get(cls));
+    latestActivePlan = () => toPlan(db.prepare("SELECT * FROM plans WHERE active = 1 ORDER BY id DESC LIMIT 1").get());
+    missionRow = (id) => db.prepare("SELECT class, plan_id, created_at, deadline, started_at, mode FROM missions WHERE id = ?").get(id);
+    preparedPlan = (m) => (m.class ? activePlan(m.class) : void 0) ?? (m.plan_id !== null ? getPlan(m.plan_id) : void 0);
+  }
+});
+
 // src/market/lifi.ts
 async function bridgeQuote(q) {
   if (!process.env.LIFI_API_KEY && !takeBudget(HOST, BUDGET, WINDOW_MS)) {
@@ -10657,7 +11305,7 @@ var init_bridge = __esm({
     SOLANA_BRIDGE_EXTRA = 20000000n;
     isMovable = (chain, t) => chain.isCash(t.address) || t.address === chain.native.address;
     lifiToken = (chain, t) => t.address === chain.native.address ? LIFI_NATIVE[chain.id] : t.address;
-    hhmm = (iso) => new Date(iso).toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit" });
+    hhmm = (iso2) => new Date(iso2).toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit" });
     lastPoll = /* @__PURE__ */ new Map();
     POLL_MS = 2e4;
   }
@@ -10997,10 +11645,563 @@ var init_transfers = __esm({
     NETWORK = { solana: "SOL", base: "BASE", bsc: "BSC" };
     DEPOSIT_MINUTES = { solana: 1, base: 2, bsc: 1 };
     EVM_SEND_GAS = { token: 65000n, native: 21000n };
-    hhmm2 = (iso) => new Date(iso).toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit" });
+    hhmm2 = (iso2) => new Date(iso2).toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit" });
     inMinutes = (m) => new Date(Date.now() + m * 6e4).toISOString();
     lifiToken2 = (chain, t) => t.address === getChain(chain).native.address ? LIFI_NATIVE[chain] : t.address;
     STATIC_BRIDGE = { feePct: 0.25, fixedUsd: 0.05, seconds: 120, gas: { solana: 5e-5, base: 5e-6, bsc: 3e-5 } };
+  }
+});
+
+// src/sim/signals.ts
+function failureReason(err) {
+  const msg = String(err?.message ?? err);
+  const code = msg.match(/HTTP (\d{3})/)?.[1];
+  return code ?? (/timeout|timed out|aborted/i.test(msg) ? "sin respuesta" : "error de red");
+}
+function describeSourceErrors(e) {
+  if (!e?.failed) return "";
+  const why = Object.entries(e.byReason).map(([r, n3]) => `${r} \xD7${n3}`).join(", ");
+  return e.failed >= e.reads ? `\u26A0 ${e.source} no ha respondido en toda la espera (${why}): no se sabe si hubo eventos.` : `${e.source} fall\xF3 ${e.failed} de ${e.reads} veces (${why}).`;
+}
+function pumpSwapPools(data) {
+  if (!Array.isArray(data)) return [];
+  return data.flatMap((p) => {
+    if (p?.relationships?.dex?.data?.id !== "pumpswap") return [];
+    const base2 = stripNetwork(p.relationships?.base_token?.data?.id);
+    const quote2 = stripNetwork(p.relationships?.quote_token?.data?.id);
+    const token2 = quote2 === SOL_MINT ? base2 : base2 === SOL_MINT ? quote2 : "";
+    const a = p.attributes ?? {};
+    const createdMs = Date.parse(a.pool_created_at);
+    if (!token2 || !Number.isFinite(createdMs)) return [];
+    return [
+      {
+        pool: String(a.address ?? p.id),
+        token: token2,
+        name: a.name,
+        createdMs,
+        liquidityUsd: num3(a.reserve_in_usd),
+        fdvUsd: num3(a.fdv_usd),
+        buys5m: num3(a.transactions?.m5?.buys),
+        sells5m: num3(a.transactions?.m5?.sells),
+        buyers5m: num3(a.transactions?.m5?.buyers),
+        volume5mUsd: num3(a.volume_usd?.m5),
+        priceChange5mPct: num3(a.price_change_percentage?.m5)
+      }
+    ];
+  });
+}
+function poolRejection(p, f, nowMs) {
+  const maxAge = f.max_pool_age_minutes ?? DEFAULT_MAX_POOL_AGE_MINUTES;
+  if (nowMs - p.createdMs > maxAge * 6e4) return `pool de m\xE1s de ${maxAge} min`;
+  const below = (v, min) => min !== void 0 && v !== void 0 && v < min;
+  const above = (v, max) => max !== void 0 && v !== void 0 && v > max;
+  if (below(p.liquidityUsd, f.min_liquidity_usd)) return "liquidez por debajo del m\xEDnimo";
+  if (above(p.liquidityUsd, f.max_liquidity_usd)) return "liquidez por encima del m\xE1ximo";
+  if (below(p.fdvUsd, f.min_fdv_usd)) return "FDV por debajo del m\xEDnimo";
+  if (above(p.fdvUsd, f.max_fdv_usd)) return "FDV por encima del m\xE1ximo";
+  if (below(p.buys5m, f.min_buys_5m)) return "pocas compras en 5 min";
+  if (below(p.buyers5m, f.min_buyers_5m)) return "pocos compradores en 5 min";
+  if (f.min_buy_sell_ratio_5m !== void 0 && p.buys5m !== void 0 && p.sells5m !== void 0 && p.buys5m < f.min_buy_sell_ratio_5m * Math.max(1, p.sells5m)) {
+    return "proporci\xF3n compras/ventas por debajo del m\xEDnimo";
+  }
+  if (below(p.volume5mUsd, f.min_volume_5m_usd)) return "poco volumen en 5 min";
+  if (below(p.priceChange5mPct, f.min_price_change_5m_pct)) return "variaci\xF3n de 5 min por debajo del m\xEDnimo";
+  if (above(p.priceChange5mPct, f.max_price_change_5m_pct)) return "variaci\xF3n de 5 min por encima del m\xE1ximo";
+  return null;
+}
+async function tokenMeta2(mint, ttlMs, lowPriority) {
+  const list = await fetchJson(`${JUPITER_SEARCH}?query=${encodeURIComponent(mint)}`, { timeoutMs: 15e3, ttlMs, lowPriority });
+  const t = list.find((x) => x.id === mint);
+  if (!t) return null;
+  const graduatedAtMs = t.graduatedAt ? Date.parse(t.graduatedAt) : NaN;
+  return {
+    symbol: t.symbol,
+    name: t.name,
+    decimals: typeof t.decimals === "number" ? t.decimals : void 0,
+    launchpad: typeof t.launchpad === "string" ? t.launchpad : void 0,
+    graduatedAtMs: Number.isFinite(graduatedAtMs) ? graduatedAtMs : void 0
+  };
+}
+async function waitForSignal(opts) {
+  const scanner = new SignalScanner(opts);
+  const started = Date.now();
+  const until = started + opts.maxMinutes * 6e4;
+  let polls = 0;
+  const done = (extra) => ({
+    found: false,
+    waitedSeconds: Math.round((Date.now() - started) / 1e3),
+    polls,
+    ...scanner.summary(extra.candidate?.token),
+    ...extra
+  });
+  for (; ; ) {
+    polls++;
+    const stop = opts.shouldStop?.();
+    if (stop) return done({ stopped: stop });
+    const hit = await scanner.poll();
+    if (hit) return { ...done({ candidate: hit.candidate }), found: true };
+    const left = until - Date.now();
+    if (left <= 0) return done({});
+    await new Promise((r) => setTimeout(r, Math.min(scanner.timing.pollMs, left)));
+  }
+}
+var GECKO_NEW_POOLS, JUPITER_SEARCH, DEFAULT_MAX_POOL_AGE_MINUTES, DEFAULT_MIN_LIQUIDITY_USD, DEFAULT_MAX_ROUND_TRIP_COST_PCT, DEAD_POOL_ROUND_TRIP_PCT, SIGNAL_TIMING, num3, stripNetwork, rethrowBusy, SignalScanner;
+var init_signals = __esm({
+  "src/sim/signals.ts"() {
+    "use strict";
+    init_http();
+    init_jupiter();
+    GECKO_NEW_POOLS = "https://api.geckoterminal.com/api/v2/networks/solana/new_pools";
+    JUPITER_SEARCH = "https://lite-api.jup.ag/tokens/v2/search";
+    DEFAULT_MAX_POOL_AGE_MINUTES = 2;
+    DEFAULT_MIN_LIQUIDITY_USD = 1e3;
+    DEFAULT_MAX_ROUND_TRIP_COST_PCT = 10;
+    DEAD_POOL_ROUND_TRIP_PCT = 50;
+    SIGNAL_TIMING = { pollMs: 5e3, geckoPageTtlMs: [15e3, 3e4], recheckMs: 1e4, maxChecksPerPoll: 3 };
+    num3 = (v) => {
+      const x = typeof v === "string" ? Number(v) : v;
+      return typeof x === "number" && Number.isFinite(x) ? x : void 0;
+    };
+    stripNetwork = (id) => String(id ?? "").replace(/^solana_/, "");
+    rethrowBusy = (err) => {
+      if (err instanceof HostBusyError) throw err;
+      return null;
+    };
+    SignalScanner = class {
+      constructor(opts) {
+        this.opts = opts;
+        this.timing = { ...SIGNAL_TIMING, ...opts.timing };
+        const own2 = Object.fromEntries(Object.entries(opts.filters).filter(([, v]) => v !== void 0));
+        this.filters = {
+          launchpads: opts.source === "graduado" ? ["pump.fun"] : void 0,
+          min_liquidity_usd: DEFAULT_MIN_LIQUIDITY_USD,
+          max_round_trip_cost_pct: DEFAULT_MAX_ROUND_TRIP_COST_PCT,
+          ...own2
+        };
+        this.maxAgeMs = (this.filters.max_pool_age_minutes ?? DEFAULT_MAX_POOL_AGE_MINUTES) * 6e4;
+        this.shortlist = new Set(opts.shortlist ?? []);
+        this.excluded = new Set(opts.exclude ?? []);
+      }
+      opts;
+      timing;
+      filters;
+      maxAgeMs;
+      shortlist;
+      excluded;
+      pools = /* @__PURE__ */ new Map();
+      // por token: el pool más reciente
+      graduated = /* @__PURE__ */ new Map();
+      // tokens de la lista corta ya graduados
+      lastChecked = /* @__PURE__ */ new Map();
+      verdicts = /* @__PURE__ */ new Map();
+      // token → último motivo de descarte
+      dropped = /* @__PURE__ */ new Set();
+      // descartados para siempre
+      seen = /* @__PURE__ */ new Set();
+      pageRetryAt = [];
+      // tras un fallo, cada página no se vuelve a pedir hasta que tocaría renovarla
+      sourceErrors = { source: "GeckoTerminal", reads: 0, failed: 0, byReason: {} };
+      /** Tokens que ya no se devuelven (p. ej. los que ha comprado el agente o ya tiene el gemelo). */
+      exclude(tokens) {
+        for (const t of tokens) this.excluded.add(t);
+      }
+      /** Tokens frescos vistos y por qué se descartó cada uno (el último motivo), contado por motivo. */
+      summary(except) {
+        const rejected = {};
+        for (const [token2, reason] of this.verdicts) if (token2 !== except) rejected[reason] = (rejected[reason] ?? 0) + 1;
+        const e = this.sourceErrors;
+        return { seen: this.seen.size, rejected, ...e.failed ? { sourceErrors: { ...e, byReason: { ...e.byReason } } } : {} };
+      }
+      /** Pide a Jupiter los datos del token y cotiza comprarlo y venderlo al momento con el capital de la misión. */
+      async check(token2, pool, meta0) {
+        const { filters, opts } = this;
+        const meta3 = meta0 ?? await tokenMeta2(token2, this.timing.recheckMs, opts.lowPriority).catch(rethrowBusy);
+        if (!meta3 || meta3.decimals === void 0) return { ok: false, reason: "Jupiter a\xFAn no conoce el token", retry: true };
+        if (filters.launchpads?.length) {
+          if (!meta3.launchpad) return { ok: false, reason: "launchpad desconocido todav\xEDa", retry: true };
+          if (!filters.launchpads.includes(meta3.launchpad)) return { ok: false, reason: `launchpad ${meta3.launchpad}`, retry: false };
+        }
+        let tokensOut, backUsd, tokensOutRaw;
+        try {
+          const buy = await getQuote(USDC_MINT, token2, toBaseUnits(opts.usdAmount, 6), 300, 1, { lowPriority: opts.lowPriority });
+          tokensOut = fromBaseUnits(buy.outAmount, meta3.decimals);
+          tokensOutRaw = String(buy.outAmount);
+          if (!(tokensOut > 0)) return { ok: false, reason: "sin ruta de compra en Jupiter", retry: true };
+          const sell = await getQuote(token2, USDC_MINT, BigInt(buy.outAmount), 300, 1, { lowPriority: opts.lowPriority });
+          backUsd = fromBaseUnits(sell.outAmount, 6);
+        } catch (err) {
+          rethrowBusy(err);
+          return { ok: false, reason: "sin cotizaci\xF3n de compra y venta en Jupiter todav\xEDa", retry: true };
+        }
+        const roundTripCostPct = Number(((1 - backUsd / opts.usdAmount) * 100).toFixed(2));
+        if (filters.max_round_trip_cost_pct !== void 0 && roundTripCostPct > filters.max_round_trip_cost_pct) {
+          return roundTripCostPct >= DEAD_POOL_ROUND_TRIP_PCT ? { ok: false, reason: `pool vaciado (ida y vuelta de m\xE1s del ${DEAD_POOL_ROUND_TRIP_PCT} %)`, retry: false } : { ok: false, reason: `ida y vuelta de m\xE1s del ${filters.max_round_trip_cost_pct} %`, retry: true };
+        }
+        const nowMs = Date.now();
+        return {
+          ok: true,
+          decimals: meta3.decimals,
+          tokensOutRaw,
+          candidate: {
+            token: token2,
+            symbol: meta3.symbol,
+            name: meta3.name,
+            detectedBy: pool ? "geckoterminal" : "shortlist",
+            inShortlist: this.shortlist.has(token2),
+            ...pool ? {
+              pool: pool.pool,
+              poolAgeSeconds: Math.round((nowMs - pool.createdMs) / 1e3),
+              liquidityUsd: pool.liquidityUsd,
+              fdvUsd: pool.fdvUsd,
+              buys5m: pool.buys5m,
+              sells5m: pool.sells5m,
+              buyers5m: pool.buyers5m,
+              volume5mUsd: pool.volume5mUsd,
+              priceChange5mPct: pool.priceChange5mPct
+            } : {},
+            launchpad: meta3.launchpad,
+            ...meta3.graduatedAtMs ? { graduatedAgoSeconds: Math.round((nowMs - meta3.graduatedAtMs) / 1e3) } : {},
+            quote: { usdIn: opts.usdAmount, tokensOut, backUsd, roundTripCostPct }
+          }
+        };
+      }
+      /**
+       * Una vuelta: lee las fuentes, arma la cola de candidatos y cotiza en Jupiter como mucho maxChecks (3 peticiones
+       * cada uno; con 0, solo pone al día lo visto). Devuelve el primero que pasa, o null.
+       */
+      async poll(maxChecks = this.timing.maxChecksPerPoll) {
+        const { opts, timing, filters, maxAgeMs, shortlist, pools, graduated, lastChecked, verdicts, dropped, seen } = this;
+        const exclude = this.excluded;
+        const nowMs = Date.now();
+        if (opts.source === "graduado") {
+          for (const [i, ttl] of timing.geckoPageTtlMs.entries()) {
+            if (nowMs < (this.pageRetryAt[i] ?? 0)) continue;
+            this.sourceErrors.reads++;
+            const url2 = `${GECKO_NEW_POOLS}?page=${i + 1}`;
+            const page = await fetchJson(url2, { timeoutMs: 15e3, ttlMs: ttl, lowPriority: opts.lowPriority }).catch((err) => {
+              if (err instanceof HostBusyError) {
+                this.sourceErrors.reads--;
+                return null;
+              }
+              const why = failureReason(err);
+              this.sourceErrors.failed++;
+              this.sourceErrors.byReason[why] = (this.sourceErrors.byReason[why] ?? 0) + 1;
+              this.pageRetryAt[i] = Date.now() + ttl;
+              return null;
+            });
+            for (const p of pumpSwapPools(page?.data)) {
+              const prev = pools.get(p.token);
+              if (!prev || p.createdMs >= prev.createdMs) pools.set(p.token, p);
+            }
+          }
+        }
+        for (const mint of shortlist) {
+          if (graduated.has(mint) || exclude.has(mint) || dropped.has(mint) || nowMs - (lastChecked.get(`lista:${mint}`) ?? 0) < timing.recheckMs) continue;
+          lastChecked.set(`lista:${mint}`, nowMs);
+          const meta3 = await tokenMeta2(mint, timing.recheckMs, opts.lowPriority).catch((err) => err instanceof HostBusyError ? void 0 : null);
+          if (meta3 === void 0) {
+            lastChecked.delete(`lista:${mint}`);
+            break;
+          }
+          if (!meta3?.graduatedAtMs) continue;
+          if (Date.now() - meta3.graduatedAtMs > maxAgeMs) {
+            verdicts.set(mint, `se gradu\xF3 hace m\xE1s de ${maxAgeMs / 6e4} min`);
+            dropped.add(mint);
+            continue;
+          }
+          graduated.set(mint, meta3);
+        }
+        const queue = [];
+        for (const [token2, meta3] of graduated) {
+          if (exclude.has(token2) || dropped.has(token2)) continue;
+          if (Date.now() - meta3.graduatedAtMs > maxAgeMs) {
+            verdicts.set(token2, verdicts.get(token2) ?? `se gradu\xF3 hace m\xE1s de ${maxAgeMs / 6e4} min`);
+            dropped.add(token2);
+            continue;
+          }
+          queue.push({ token: token2, pool: pools.get(token2), meta: meta3 });
+        }
+        const fresh = [...pools.values()].filter((p) => !exclude.has(p.token) && !dropped.has(p.token) && !graduated.has(p.token));
+        fresh.sort((a, b) => Number(shortlist.has(b.token)) - Number(shortlist.has(a.token)) || b.createdMs - a.createdMs);
+        for (const p of fresh) {
+          if (opts.source === "shortlist" && !shortlist.has(p.token)) continue;
+          if (Date.now() - p.createdMs <= maxAgeMs) seen.add(p.token);
+          const reason = poolRejection(p, filters, Date.now());
+          if (reason) {
+            if (seen.has(p.token)) verdicts.set(p.token, reason);
+            if (Date.now() - p.createdMs > maxAgeMs) dropped.add(p.token);
+            continue;
+          }
+          queue.push({ token: p.token, pool: p });
+        }
+        for (const q of queue) seen.add(q.token);
+        let checks = 0;
+        for (const q of queue) {
+          if (checks >= maxChecks) break;
+          if (Date.now() - (lastChecked.get(q.token) ?? 0) < timing.recheckMs) continue;
+          lastChecked.set(q.token, Date.now());
+          checks++;
+          let r;
+          try {
+            r = await this.check(q.token, q.pool, q.meta);
+            if (r.ok && opts.accept) {
+              const veto = await opts.accept(r.candidate);
+              if (veto) r = { ok: false, reason: veto, retry: false };
+            }
+          } catch (err) {
+            if (!(err instanceof HostBusyError)) throw err;
+            lastChecked.delete(q.token);
+            return null;
+          }
+          if (r.ok) return { candidate: r.candidate, decimals: r.decimals, tokensOutRaw: r.tokensOutRaw };
+          verdicts.set(q.token, r.reason);
+          if (!r.retry) dropped.add(q.token);
+        }
+        return null;
+      }
+    };
+  }
+});
+
+// src/sim/shadow.ts
+function startShadowRun(missionId) {
+  const m = db.prepare("SELECT id, mode, class, created_at, deadline, started_at, initial_usd, target_usd FROM missions WHERE id = ?").get(missionId);
+  if (!m?.started_at) return { started: false, reason: "el reloj no ha arrancado" };
+  if (m.mode === "live") return { started: false, reason: "misi\xF3n real" };
+  if (!isFastMission(m)) return { started: false, reason: "no es una misi\xF3n r\xE1pida" };
+  const cls = parseMissionClass(m.class);
+  const source = cls ? TWIN_SOURCES[cls.market] : void 0;
+  if (!source) return { started: false, reason: `el mercado ${cls?.market ?? "?"} no tiene fuente de eventos mec\xE1nica` };
+  const plan = planForMission(missionId);
+  const cash = Math.max(0, ...getChain("solana").stables.map((s) => balance(missionId, "solana", s.address)));
+  const size = Math.min(plan?.body.usd_amount ?? cash, cash);
+  if (!(size >= 1)) return { started: false, reason: "sin efectivo en Solana" };
+  const tpRatio = plan?.body.tp_ratio;
+  const tpUsd = tpRatio ? size * tpRatio : m.target_usd * (1 + TP_TARGET_MARGIN) - (m.initial_usd - size);
+  const durationMs = new Date(m.deadline).getTime() - new Date(m.started_at).getTime();
+  const changed = db.prepare(
+    `INSERT OR IGNORE INTO shadow_runs (mission_id, started_at, detect_until, horizon_minutes, source, size_usd, tp_usd, tp_basis, target_count)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    missionId,
+    m.started_at,
+    m.deadline,
+    durationMs / 6e4,
+    source,
+    size,
+    tpUsd,
+    tpRatio ? `\xD7${tpRatio} de lo que paga (plan #${plan.id})` : `el objetivo de la misi\xF3n neto de costes${plan ? ` (plan #${plan.id}, sin tp_ratio)` : ""}`,
+    SHADOW_COUNT
+  ).changes;
+  return changed ? { started: true } : { started: false, reason: "ya ten\xEDa gemelo" };
+}
+function agentTokens(missionId) {
+  const rows = db.prepare(
+    `SELECT asset AS t FROM positions WHERE mission_id = ? AND venue = 'solana'
+       UNION SELECT target AS t FROM research_log WHERE mission_id = ? AND tool = 'wait_for_signal' AND target IS NOT NULL`
+  ).all(missionId, missionId);
+  return rows.map((r) => r.t);
+}
+function openTwin(run, hit, nowMs) {
+  let id;
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const n3 = db.prepare("SELECT COUNT(*) AS n FROM shadow_positions WHERE mission_id = ?").get(run.mission_id).n;
+    if (n3 < run.target_count) {
+      const back = hit.candidate.quote.backUsd;
+      const r = db.prepare(
+        `INSERT OR IGNORE INTO shadow_positions
+             (mission_id, token, symbol, pool, opened_at, expires_at, usd_in, tokens_raw, decimals, entry_value_usd, last_value_usd, best_value_usd, last_quote_at, quotes)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`
+      ).run(
+        run.mission_id,
+        hit.candidate.token,
+        hit.candidate.symbol ?? null,
+        hit.candidate.pool ?? null,
+        iso(nowMs),
+        iso(nowMs + run.horizon_minutes * 6e4),
+        run.size_usd,
+        hit.tokensOutRaw,
+        hit.decimals,
+        back,
+        back,
+        back,
+        iso(nowMs)
+      );
+      if (r.changes) id = Number(r.lastInsertRowid);
+    }
+    db.exec("COMMIT");
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  }
+  return id === void 0 ? void 0 : db.prepare("SELECT * FROM shadow_positions WHERE id = ?").get(id);
+}
+function dropTwin(t, note, nowMs) {
+  return db.prepare("UPDATE shadow_positions SET status = 'abandoned', closed_at = ?, note = ? WHERE id = ? AND status = 'open'").run(iso(nowMs), note, t.id).changes > 0;
+}
+function closeTwin(t, status, exitUsd, note, nowMs) {
+  return db.prepare("UPDATE shadow_positions SET status = ?, exit_usd = ?, closed_at = ?, note = COALESCE(?, note) WHERE id = ? AND status = 'open'").run(status, exitUsd, iso(nowMs), note, t.id).changes > 0;
+}
+async function quoteTwin(t, run, nowMs, timing) {
+  const expiresMs = Date.parse(t.expires_at);
+  const expired = nowMs >= expiresMs;
+  const name = t.symbol ?? t.token;
+  if (expired && nowMs - expiresMs > timing.lateMs) {
+    const lastSeenMs = t.last_quote_at ? Date.parse(t.last_quote_at) : Number.NEGATIVE_INFINITY;
+    if (expiresMs - lastSeenMs <= timing.unobservedMs) {
+      const exit = t.last_value_usd ?? 0;
+      return closeTwin(t, "expired", exit, "cerrado con la \xFAltima cotizaci\xF3n de su plazo (la vigilancia lleg\xF3 tarde al cierre)", nowMs) ? `Gemelo #${t.id} (${name}) cerrado por tiempo con su \xFAltima cotizaci\xF3n: ${exit.toFixed(2)} $` : null;
+    }
+    return dropTwin(t, "sin observar al acabar su plazo (la vigilancia no corr\xEDa): no cuenta", nowMs) ? `Gemelo #${t.id} (${name}) sin observar al final de su plazo: no cuenta` : null;
+  }
+  let value;
+  try {
+    const q = await getQuote(t.token, USDC_MINT, BigInt(t.tokens_raw), 300, 1e3, { lowPriority: true });
+    value = fromBaseUnits(q.outAmount, 6);
+  } catch (err) {
+    if (err instanceof HostBusyError) return null;
+    db.prepare("UPDATE shadow_positions SET last_quote_at = ?, note = ? WHERE id = ? AND status = 'open'").run(iso(nowMs), `sin cotizaci\xF3n: ${err.message.slice(0, 120)}`, t.id);
+    return null;
+  }
+  db.prepare(
+    "UPDATE shadow_positions SET quotes = quotes + 1, last_value_usd = ?, best_value_usd = MAX(COALESCE(best_value_usd, ?), ?), last_quote_at = ? WHERE id = ? AND status = 'open'"
+  ).run(value, value, value, iso(nowMs), t.id);
+  if (value >= run.tp_usd) {
+    return closeTwin(t, "hit", run.tp_usd, null, nowMs) ? `Gemelo #${t.id} (${name}) llega a la toma de beneficio: ${run.tp_usd.toFixed(2)} $` : null;
+  }
+  if (expired) return closeTwin(t, "expired", value, null, nowMs) ? `Gemelo #${t.id} (${name}) cerrado por tiempo: ${value.toFixed(2)} $` : null;
+  return null;
+}
+function finalize2(run, nowMs) {
+  const mission = db.prepare("SELECT status, initial_usd FROM missions WHERE id = ?").get(run.mission_id);
+  if (!mission || mission.status === "active" || mission.status === "closing") return null;
+  const twins = twinsOf(run.mission_id);
+  if (twins.some((t) => t.status === "open")) return null;
+  if (twins.length < run.target_count && nowMs < Date.parse(run.detect_until)) return null;
+  const done = twins.filter((t) => t.status === "hit" || t.status === "expired");
+  const hits = done.filter((t) => t.status === "hit").length;
+  const ret = done.length ? done.reduce((s, t) => s + (t.exit_usd - t.usd_in), 0) / done.length / mission.initial_usd : null;
+  const note = done.length ? null : twins.length ? "ning\xFAn gemelo se pudo seguir hasta el final de su plazo (la vigilancia no corr\xEDa): sin resultado" : "no hubo ning\xFAn evento que pasara los filtros mec\xE1nicos en el plazo de la misi\xF3n";
+  const claimed = db.prepare("UPDATE shadow_runs SET status = 'done', ended_at = ?, note = ? WHERE mission_id = ? AND status = 'running'").run(iso(nowMs), note, run.mission_id).changes;
+  if (!claimed) return null;
+  db.prepare("UPDATE missions SET shadow_hits = ?, shadow_return = ? WHERE id = ?").run(done.length ? hits : null, ret, run.mission_id);
+  const summary = done.length ? `Gemelo mec\xE1nico de la misi\xF3n #${run.mission_id}: ${hits} de ${done.length} llegaron a la toma de beneficio; resultado medio ${(ret * 100).toFixed(1).replace(".", ",")} % sobre el capital` : `Gemelo mec\xE1nico de la misi\xF3n #${run.mission_id}: sin gemelos (${note})`;
+  logJournal({ missionId: run.mission_id, sessionId: null, kind: "shadow", summary, details: { hits, twins: done.length, shadowReturn: ret } });
+  return summary;
+}
+function abandon(run, nowMs, reason) {
+  db.prepare("UPDATE shadow_runs SET status = 'abandoned', ended_at = ?, note = ? WHERE mission_id = ? AND status = 'running'").run(iso(nowMs), reason, run.mission_id);
+  db.prepare("UPDATE shadow_positions SET status = 'abandoned', closed_at = ?, note = ? WHERE mission_id = ? AND status = 'open'").run(iso(nowMs), reason, run.mission_id);
+  scanners.delete(run.mission_id);
+}
+async function checkShadows(opts = {}) {
+  const timing = { ...SHADOW_TIMING, ...opts.timing };
+  const nowMs = opts.nowMs ?? Date.now();
+  const log = [];
+  const runs = db.prepare("SELECT r.*, m.status AS mission_status FROM shadow_runs r JOIN missions m ON m.id = r.mission_id WHERE r.status = 'running' ORDER BY r.mission_id").all();
+  for (const id of scanners.keys()) if (!runs.some((r) => r.mission_id === id)) scanners.delete(id);
+  const live = runs.filter((r) => {
+    if (r.mission_status !== "cancelled") return true;
+    abandon(r, nowMs, "misi\xF3n cancelada");
+    return false;
+  });
+  let budget = timing.jupiterPerTick;
+  const byMission = new Map(live.map((r) => [r.mission_id, r]));
+  const open2 = db.prepare("SELECT * FROM shadow_positions WHERE status = 'open' ORDER BY id").all().filter((t) => byMission.has(t.mission_id));
+  const isExpired = (t) => nowMs >= Date.parse(t.expires_at);
+  const due = open2.filter((t) => isExpired(t) || !t.last_quote_at || nowMs - Date.parse(t.last_quote_at) >= timing.quoteEveryMs - DUE_SLACK_MS).sort((a, b) => Number(isExpired(b)) - Number(isExpired(a)) || Date.parse(a.last_quote_at ?? "") - Date.parse(b.last_quote_at ?? ""));
+  for (const t of due) {
+    const late2 = nowMs - Date.parse(t.expires_at) > timing.lateMs;
+    if (!late2 && budget <= 0) continue;
+    if (!late2) budget--;
+    const line = await quoteTwin(t, byMission.get(t.mission_id), nowMs, timing).catch((err) => `Error cotizando el gemelo #${t.id}: ${err.message}`);
+    if (line) log.push(line);
+  }
+  for (const r of live) {
+    const count = db.prepare("SELECT COUNT(*) AS n FROM shadow_positions WHERE mission_id = ?").get(r.mission_id).n;
+    if (count >= r.target_count || nowMs >= Date.parse(r.detect_until)) {
+      scanners.delete(r.mission_id);
+      continue;
+    }
+    let scanner = scanners.get(r.mission_id);
+    if (!scanner) {
+      scanner = new SignalScanner({ source: r.source, filters: {}, usdAmount: r.size_usd, timing: timing.signal, lowPriority: true });
+      scanners.set(r.mission_id, scanner);
+    }
+    scanner.exclude([...agentTokens(r.mission_id), ...twinsOf(r.mission_id).map((t) => t.token)]);
+    const checks = budget >= 3 ? 1 : 0;
+    budget -= checks * 3;
+    const hit = await scanner.poll(checks).catch(() => null);
+    if (!hit) continue;
+    const twin = openTwin(r, hit, nowMs);
+    if (twin) log.push(`Gemelo #${twin.id} de la misi\xF3n #${r.mission_id}: ${twin.symbol ?? twin.token} con ${twin.usd_in.toFixed(2)} $ (vender al momento: ${twin.entry_value_usd.toFixed(2)} $)`);
+  }
+  for (const r of live) {
+    const line = finalize2(r, nowMs);
+    if (line) log.push(line);
+  }
+  return log;
+}
+function shadowSummary(missionId) {
+  const run = db.prepare("SELECT * FROM shadow_runs WHERE mission_id = ?").get(missionId);
+  if (!run) return null;
+  const initial = db.prepare("SELECT initial_usd FROM missions WHERE id = ?").get(missionId)?.initial_usd ?? run.size_usd;
+  const all = twinsOf(missionId);
+  const twins = all.filter((t) => t.status !== "abandoned");
+  const unobserved = run.status === "abandoned" ? 0 : all.length - twins.length;
+  const done = twins.filter((t) => t.status === "hit" || t.status === "expired");
+  const hits = done.filter((t) => t.status === "hit").length;
+  const pct4 = (x) => Number((x * 100).toFixed(1));
+  const clockMs = Date.parse(run.started_at);
+  return {
+    status: run.status === "done" ? "terminado" : run.status === "abandoned" ? `abandonado (${run.note ?? "misi\xF3n cancelada"})` : `en curso: ${done.length} de ${twins.length} gemelos terminados${twins.length < run.target_count ? `, buscando eventos hasta ${run.detect_until}` : ""}`,
+    rule: `comprar ${run.size_usd.toFixed(2)} $ en cada uno de los ${run.target_count} eventos siguientes (fuente ${run.source}, solo filtros mec\xE1nicos) con la toma de beneficio en ${run.tp_usd.toFixed(2)} $ (${run.tp_basis}) y ${Number(run.horizon_minutes.toFixed(1))} min de plazo cada uno`,
+    hits,
+    twins: done.length,
+    ...unobserved ? { unobserved: `${unobserved} gemelo(s) sin observar al final de su plazo: no cuentan` } : {},
+    ...done.length ? { avgResultPct: pct4(done.reduce((s, t) => s + (t.exit_usd - t.usd_in), 0) / done.length / initial) } : {},
+    ...run.note ? { note: run.note } : {},
+    positions: twins.map((t) => ({
+      twinId: t.id,
+      token: t.token,
+      symbol: t.symbol ?? void 0,
+      enteredMinutesAfterClock: Number(((Date.parse(t.opened_at) - clockMs) / 6e4).toFixed(1)),
+      status: t.status === "hit" ? "toma de beneficio" : t.status === "expired" ? "cerrado por tiempo" : "abierto",
+      entryValuePct: pct4(t.entry_value_usd / t.usd_in - 1),
+      bestPct: t.best_value_usd !== null ? pct4(t.best_value_usd / t.usd_in - 1) : void 0,
+      ...t.exit_usd !== null ? { resultPct: pct4(t.exit_usd / t.usd_in - 1) } : { nowPct: t.last_value_usd !== null ? pct4(t.last_value_usd / t.usd_in - 1) : void 0 },
+      quotes: t.quotes,
+      ...t.note ? { note: t.note } : {}
+    }))
+  };
+}
+var SHADOW_COUNT, TWIN_SOURCES, SHADOW_TIMING, DUE_SLACK_MS, iso, scanners, twinsOf, shadowsRunning;
+var init_shadow = __esm({
+  "src/sim/shadow.ts"() {
+    "use strict";
+    init_config();
+    init_db();
+    init_http();
+    init_jupiter();
+    init_mission_kind();
+    init_plans();
+    init_portfolio();
+    init_signals();
+    init_venues();
+    SHADOW_COUNT = 3;
+    TWIN_SOURCES = { graduado: "graduado" };
+    SHADOW_TIMING = {
+      quoteEveryMs: config2.fastWatchIntervalSeconds * 1e3,
+      jupiterPerTick: 6,
+      lateMs: 15e3,
+      unobservedMs: 3e4
+    };
+    DUE_SLACK_MS = 250;
+    iso = (ms) => new Date(ms).toISOString();
+    scanners = /* @__PURE__ */ new Map();
+    twinsOf = (missionId) => db.prepare("SELECT * FROM shadow_positions WHERE mission_id = ? ORDER BY id").all(missionId);
+    shadowsRunning = () => !!db.prepare("SELECT 1 FROM shadow_runs WHERE status = 'running' LIMIT 1").get();
   }
 });
 
@@ -11022,6 +12223,11 @@ function missionHistory() {
     `SELECT m.*, (SELECT r.origin FROM mission_reviews r WHERE r.mission_id = m.id) AS review_origin
        FROM missions m WHERE m.status NOT IN ('active', 'closing') ORDER BY m.id`
   ).all();
+  const twins = twinCounts();
+  const compared = (m) => {
+    const { hit: _hit, resultPct: _result, ...rest } = missionComparison(m, twins);
+    return rest;
+  };
   return rows.map((m) => {
     const minutes = Math.round((new Date(m.deadline).getTime() - new Date(m.created_at).getTime()) / 6e4);
     return {
@@ -11033,18 +12239,21 @@ function missionHistory() {
       userInstructions: m.instructions ?? "ninguna (modo libre)",
       finalUsd: m.final_usd === null ? null : Number(m.final_usd.toFixed(2)),
       resultPct: m.final_usd === null ? null : Number(((m.final_usd - m.initial_usd) / m.initial_usd * 100).toFixed(2)),
-      outcome: m.status === "succeeded" ? "objetivo conseguido" : m.status === "expired" ? "no lleg\xF3 al objetivo" : m.status === "bust" ? "sin fondos (bancarrota)" : "cancelada",
-      reviewed: m.review_origin !== null || m.reviewed_at !== null
+      outcome: m.status === "succeeded" ? "objetivo conseguido" : m.status === "expired" ? "no lleg\xF3 al objetivo" : m.status === "bust" ? "sin fondos (bancarrota)" : m.end_reason === "prep_timeout" ? "cancelada: el reloj no lleg\xF3 a arrancar" : "cancelada",
+      reviewed: m.review_origin !== null || m.reviewed_at !== null,
+      ...m.class ? { missionClass: m.class } : {},
+      ...m.status !== "cancelled" && m.started_at ? compared(m) : {}
     };
   });
 }
 function insertMission(args) {
-  const deadline = new Date(Date.now() + args.durationMinutes * 6e4).toISOString();
+  const created = Date.now();
+  const deadline = new Date(created + args.durationMinutes * 6e4).toISOString();
   const id = Number(
     db.prepare(
-      "INSERT INTO missions (created_at, initial_usd, target_usd, deadline, instructions, allocation, benchmark, mode, approval, limits) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      "INSERT INTO missions (created_at, initial_usd, target_usd, deadline, instructions, allocation, benchmark, mode, approval, limits, class) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     ).run(
-      now(),
+      new Date(created).toISOString(),
       args.initialUsd,
       args.targetUsd,
       deadline,
@@ -11053,7 +12262,8 @@ function insertMission(args) {
       JSON.stringify(args.holdings),
       args.live ? "live" : "sim",
       args.live?.approval ?? null,
-      args.live ? JSON.stringify(args.live.limits) : null
+      args.live ? JSON.stringify(args.live.limits) : null,
+      missionClass({ durationMinutes: args.durationMinutes, initialUsd: args.initialUsd, targetUsd: args.targetUsd, live: !!args.live })
     ).lastInsertRowid
   );
   resetPortfolio(id, args.holdings);
@@ -11061,7 +12271,7 @@ function insertMission(args) {
     missionId: id,
     sessionId: null,
     kind: "mission",
-    summary: `${args.live ? "Misi\xF3n REAL" : "Misi\xF3n"} #${id} iniciada: de ${args.initialUsd.toFixed(2)} USD a ${args.targetUsd.toFixed(2)} USD en ${Math.round((new Date(deadline).getTime() - Date.now()) / 6e4)} min (el reloj arranca cuando el agente empieza a trabajar)`
+    summary: `${args.live ? "Misi\xF3n REAL" : "Misi\xF3n"} #${id} iniciada: de ${args.initialUsd.toFixed(2)} USD a ${args.targetUsd.toFixed(2)} USD en ${Number(args.durationMinutes.toFixed(1))} min (el reloj arranca cuando el agente empieza a trabajar; si no arranca en ${PREP_TIMEOUT_MINUTES} min, la misi\xF3n se cancela)`
   });
   return id;
 }
@@ -11087,7 +12297,7 @@ async function createMission(initialUsd, targetUsd, durationMinutes, instruction
 function cancelActive() {
   const previous = getActiveMission();
   if (!previous) return;
-  db.prepare("UPDATE missions SET status = 'cancelled', ended_at = ? WHERE id = ?").run(now(), previous.id);
+  db.prepare("UPDATE missions SET status = 'cancelled', ended_at = ?, end_reason = 'replaced' WHERE id = ?").run(now(), previous.id);
   db.prepare("UPDATE orders SET status = 'cancelled', closed_at = ? WHERE status = 'open' AND mission_id = ?").run(now(), previous.id);
   logJournal({ missionId: previous.id, sessionId: null, kind: "mission", summary: `Misi\xF3n #${previous.id} cancelada por el usuario al crear una nueva` });
 }
@@ -11114,19 +12324,48 @@ function createLiveMission(args) {
   );
 }
 function remaining(deadline) {
-  const ms = new Date(deadline).getTime() - Date.now();
+  return leftText(new Date(deadline).getTime() - Date.now());
+}
+function leftText(ms) {
   const totalSec = Math.max(0, Math.floor(ms / 1e3));
   const h = Math.floor(totalSec / 3600), m = Math.floor(totalSec / 60) % 60, s = totalSec % 60;
   return { ms, seconds: totalSec, text: h ? `${h} h ${m} min` : `${m} min ${s} s` };
 }
 function startMissionClock(missionId) {
-  if (missionId === null) return;
+  if (missionId === null) return false;
   const m = getMission(missionId);
-  if (!m || m.status !== "active" || m.started_at) return;
+  if (!m || m.status !== "active" || m.started_at) return false;
   const durationMs = new Date(m.deadline).getTime() - new Date(m.created_at).getTime();
   const start = /* @__PURE__ */ new Date();
-  const changed = db.prepare("UPDATE missions SET started_at = ?, created_at = ?, deadline = ? WHERE id = ? AND started_at IS NULL AND status = 'active'").run(start.toISOString(), start.toISOString(), new Date(start.getTime() + durationMs).toISOString(), missionId).changes;
-  if (changed) logJournal({ missionId, sessionId: null, kind: "mission", summary: `El agente empieza a trabajar: el reloj de la misi\xF3n #${missionId} arranca ahora` });
+  const changed = db.prepare(
+    "UPDATE missions SET started_at = ?, created_at = ?, deadline = ?, class = COALESCE(class, ?) WHERE id = ? AND started_at IS NULL AND status = 'active'"
+  ).run(
+    start.toISOString(),
+    start.toISOString(),
+    new Date(start.getTime() + durationMs).toISOString(),
+    missionClass({ durationMinutes: durationMs / 6e4, initialUsd: m.initial_usd, targetUsd: m.target_usd, live: isLive(m) }),
+    missionId
+  ).changes;
+  if (!changed) return false;
+  const plan = attachPlanForMission(missionId);
+  const cls = getMission(missionId)?.class;
+  const table2 = baselineForClass(cls);
+  if (table2) db.prepare("UPDATE missions SET baseline_p = ? WHERE id = ? AND baseline_p IS NULL").run(table2.p, missionId);
+  try {
+    startShadowRun(missionId);
+  } catch (err) {
+    console.error(`No se pudo preparar el gemelo de la misi\xF3n #${missionId}: ${err.message}`);
+  }
+  logJournal({
+    missionId,
+    sessionId: null,
+    kind: "mission",
+    summary: `El agente empieza a trabajar: el reloj de la misi\xF3n #${missionId} arranca ahora${plan ? ` (plan #${plan.id})` : ""}`
+  });
+  return true;
+}
+function minutesLeft(m) {
+  return m.started_at ? (new Date(m.deadline).getTime() - Date.now()) / 6e4 : missionDurationMinutes(m);
 }
 async function missionStatus(missionId) {
   const mission = missionId !== void 0 ? getMission(missionId) : getActiveMission() ?? getLastMission();
@@ -11144,24 +12383,37 @@ async function missionStatus(missionId) {
         finalUsd: mission.final_usd,
         deadline: mission.deadline,
         endedAt: mission.ended_at,
+        // prep_timeout: se canceló sin arrancar el reloj (en una rápida, no llegó ningún candidato que pasara el plan).
+        ...mission.end_reason ? { endReason: mission.end_reason } : {},
+        ...mission.class ? { missionClass: mission.class } : {},
         instructions: mission.instructions
       }
     };
   }
   const v = await valuation(mission.id);
-  const left = remaining(mission.deadline);
+  const left = leftText(minutesLeft(mission) * 6e4);
   const idle = idleCheck(mission, v, left.seconds);
+  const prepEndsAt = new Date(new Date(mission.created_at).getTime() + PREP_TIMEOUT_MINUTES * 6e4).toISOString();
   return {
     ...idle ? { warning: idle } : {},
     active: true,
     missionId: mission.id,
+    // rápida: simulada de 15 min o menos, con el plan del planner y el executor. normal: el trader (las reales siempre).
+    missionKind: isFastMission(mission) ? "r\xE1pida" : "normal",
+    ...mission.class ? { missionClass: mission.class } : {},
+    // Plan del cerebro asignado (al arrancar el reloj o con plan_ref): el executor lo cita con plan_ref.
+    ...mission.plan_id !== null ? { planId: mission.plan_id } : {},
     initialUsd: mission.initial_usd,
     targetUsd: mission.target_usd,
     currentUsd: Number(v.totalUsd.toFixed(2)),
     missingUsd: Number((mission.target_usd - v.totalUsd).toFixed(2)),
     progressPct: Number(((v.totalUsd - mission.initial_usd) / (mission.target_usd - mission.initial_usd) * 100).toFixed(1)),
     now: (/* @__PURE__ */ new Date()).toISOString(),
-    deadline: mission.deadline,
+    // Antes de arrancar el reloj no hay plazo: los minutos empiezan a contar con start_session.
+    ...mission.started_at ? { deadline: mission.deadline } : {
+      clock: `sin arrancar: los ${Number(missionDurationMinutes(mission).toFixed(1))} min empiezan a contar con start_session. Hasta entonces no se puede operar; si no arranca antes de ${prepEndsAt}, la misi\xF3n se cancela.`,
+      prepEndsAt
+    },
     timeLeft: left.text,
     secondsLeft: left.seconds,
     userInstructions: mission.instructions ?? "ninguna: modo libre",
@@ -11185,7 +12437,7 @@ async function stopMission(closePositions, missionId) {
   await settleTransfers({ missionId: mission.id, force: true });
   const problems = closePositions ? await liquidateAll(mission.id, null, `Cierre manual: el usuario detuvo la misi\xF3n #${mission.id}`) : [];
   const final = await valuation(mission.id, true);
-  db.prepare("UPDATE missions SET status = 'cancelled', ended_at = ?, final_usd = ? WHERE id = ?").run(now(), final.totalUsd, mission.id);
+  db.prepare("UPDATE missions SET status = 'cancelled', ended_at = ?, final_usd = ?, end_reason = 'user' WHERE id = ?").run(now(), final.totalUsd, mission.id);
   logJournal({
     missionId: mission.id,
     sessionId: null,
@@ -11200,6 +12452,7 @@ function minutesSinceLastTrade(mission) {
   return (Date.now() - new Date(last ?? mission.started_at ?? mission.created_at).getTime()) / 6e4;
 }
 function idleCheck(mission, v, secondsLeft) {
+  if (!mission.started_at) return null;
   if (mission.status !== "active" || v.totalUsd >= mission.target_usd || secondsLeft < 90 || v.totalUsd <= 0) return null;
   const natives = new Set(allChains().map((c) => `${c.id}:${c.native.address}`));
   const cash = v.holdings.filter((h) => h.valuedBy === "stable" || natives.has(`${h.venue}:${h.asset}`)).reduce((s, h) => s + h.usd, 0);
@@ -11218,7 +12471,18 @@ function lossFloor(mission) {
   const { maxLossPct } = JSON.parse(mission.limits);
   return mission.initial_usd * (1 - maxLossPct / 100);
 }
+function cancelForPrepTimeout(mission) {
+  const changed = db.prepare("UPDATE missions SET status = 'cancelled', ended_at = ?, end_reason = 'prep_timeout' WHERE id = ? AND status = 'active' AND started_at IS NULL").run(now(), mission.id).changes;
+  if (!changed) return [];
+  db.prepare("UPDATE orders SET status = 'cancelled', closed_at = ? WHERE status = 'open' AND mission_id = ?").run(now(), mission.id);
+  const summary = `Misi\xF3n #${mission.id} cancelada: el reloj no arranc\xF3 en ${PREP_TIMEOUT_MINUTES} min desde que se cre\xF3 (prep_timeout)`;
+  logJournal({ missionId: mission.id, sessionId: null, kind: "mission", summary, details: { reason: "prep_timeout" } });
+  return [summary];
+}
 async function checkOne(mission) {
+  if (!mission.started_at) {
+    return Date.now() - new Date(mission.created_at).getTime() >= PREP_TIMEOUT_MINUTES * 6e4 ? cancelForPrepTimeout(mission) : [];
+  }
   const expired = remaining(mission.deadline).ms <= 0;
   if (isLive(mission) && (expired || Date.now() - (lastSync.get(mission.id) ?? 0) > 2e4)) {
     const { syncHoldings: syncHoldings2 } = await Promise.resolve().then(() => (init_sync(), sync_exports));
@@ -11258,7 +12522,8 @@ async function checkOne(mission) {
     logJournal({ missionId: mission.id, sessionId: null, kind: "mission", summary: summary2, details: { problems } });
     return [summary2];
   }
-  db.prepare("UPDATE missions SET status = ?, ended_at = ?, final_usd = ? WHERE id = ?").run(status, now(), final.totalUsd, mission.id);
+  const endReason = reached ? "target" : bust ? "bust" : lossHit ? "loss_limit" : "deadline";
+  db.prepare("UPDATE missions SET status = ?, ended_at = ?, final_usd = ?, end_reason = ? WHERE id = ?").run(status, now(), final.totalUsd, endReason, mission.id);
   const summary = `Misi\xF3n #${mission.id} ${reached ? "CONSEGUIDA" : bust ? "SIN FONDOS (bancarrota)" : lossHit ? "PARADA POR P\xC9RDIDA M\xC1XIMA" : "TERMINADA POR TIEMPO"}: ${mission.initial_usd.toFixed(2)} \u2192 ${final.totalUsd.toFixed(2)} USD (objetivo ${mission.target_usd} USD)`;
   logJournal({ missionId: mission.id, sessionId: null, kind: "mission", summary, details: { problems } });
   return [summary, ...problems.map((p) => `No se pudo liquidar: ${p}`)];
@@ -11285,10 +12550,16 @@ var init_mission = __esm({
   "src/sim/mission.ts"() {
     "use strict";
     init_db();
+    init_mission_kind();
+    init_baselines2();
+    init_class_stats();
+    init_plans();
     init_portfolio();
     init_types();
     init_transfers();
+    init_shadow();
     init_venues();
+    init_mission_kind();
     isLive = (m) => m?.mode === "live";
     lastSync = /* @__PURE__ */ new Map();
     checking = /* @__PURE__ */ new Set();
@@ -11943,9 +13214,13 @@ var init_portfolio = __esm({
 // src/sim/fit.ts
 var fit_exports = {};
 __export(fit_exports, {
+  PERP_FIXED_COST_USD: () => PERP_FIXED_COST_USD,
+  perpCash: () => perpCash,
   perpMoveNeeded: () => perpMoveNeeded,
+  probFirstTouch: () => probFirstTouch,
   probTouch: () => probTouch,
-  strategyFit: () => strategyFit
+  strategyFit: () => strategyFit,
+  tableFit: () => tableFit
 });
 function phi(x) {
   const t = 1 / (1 + 0.2316419 * Math.abs(x));
@@ -11953,57 +13228,133 @@ function phi(x) {
   const p = d * t * (0.3193815 + t * (-0.3565638 + t * (1.781478 + t * (-1.821256 + t * 1.330274))));
   return x > 0 ? 1 - p : p;
 }
+function upperTail(x) {
+  const z2 = Math.abs(x) / Math.SQRT2;
+  const t = 1 / (1 + 0.5 * z2);
+  const r = t * Math.exp(
+    -z2 * z2 - 1.26551223 + t * (1.00002368 + t * (0.37409196 + t * (0.09678418 + t * (-0.18628806 + t * (0.27886807 + t * (-1.13520398 + t * (1.48851587 + t * (-0.82215223 + t * 0.17087277))))))))
+  );
+  return x >= 0 ? r / 2 : 1 - r / 2;
+}
+function probFirstTouch(up, down, s) {
+  if (up <= 0) return { up: 1, down: 0 };
+  if (down <= 0) return { up: 0, down: 1 };
+  if (!(s > 0)) return { up: 0, down: 0 };
+  const L = up + down;
+  if (s / L > 1e4) return { up: down / L, down: up / L };
+  const first = (a) => {
+    let p = 2 * upperTail(a / s);
+    for (let k = 1; (2 * k * L - a) / s < 9; k++) p -= 2 * (upperTail((2 * k * L - a) / s) - upperTail((2 * k * L + a) / s));
+    return Math.min(1, Math.max(0, p));
+  };
+  return { up: first(up), down: first(down) };
+}
 async function volatility(symbol2) {
   const k = await klines(symbol2, "1m", 240);
   const r = k.slice(1).map((c, i) => Math.log(c[4] / k[i][4]));
-  const mean = r.reduce((s, x) => s + x, 0) / r.length;
-  const sigma = Math.sqrt(r.reduce((s, x) => s + (x - mean) ** 2, 0) / (r.length - 1));
+  const sd = (xs) => {
+    const mean = xs.reduce((s, x) => s + x, 0) / xs.length;
+    return Math.sqrt(xs.reduce((s, x) => s + (x - mean) ** 2, 0) / Math.max(1, xs.length - 1));
+  };
   const last = k.at(-1)[4];
   const hourAgo = k.at(-61)?.[4] ?? k[0][4];
-  return { sigma, change1hPct: Number(((last / hourAgo - 1) * 100).toFixed(2)) };
+  return { sigma: sd(r), sigma1h: sd(r.slice(-60)), change1hPct: Number(((last / hourAgo - 1) * 100).toFixed(2)) };
 }
-function perpMoveNeeded(totalUsd, targetUsd, leverage) {
-  const margin = Math.max(1, totalUsd - PERP_DEPOSIT_FEE_USD);
-  return (targetUsd - totalUsd + PERP_DEPOSIT_FEE_USD + PERP_WITHDRAW_FEE_USD) / (margin * leverage) + 2 * PERP_TAKER_FEE;
+function perpMoveNeeded(totalUsd, targetUsd, leverage, cashUsd = totalUsd) {
+  const margin = Math.max(1, cashUsd - PERP_DEPOSIT_FEE_USD);
+  return (targetUsd - totalUsd + PERP_FIXED_COST_USD) / (margin * leverage) + 2 * PERP_TAKER_FEE;
+}
+function perpCash(missionId) {
+  const best = allChains().map((c) => ({ chain: c.label, cashUsd: balance(missionId, c.id, c.cash.address) })).sort((a, b) => b.cashUsd - a.cashUsd)[0];
+  return best ?? { chain: "ninguna", cashUsd: 0 };
+}
+function tableFit(a) {
+  const market = a.market ?? DEFAULT_FAST_MARKET;
+  const known = isBaselineMarket(market);
+  const asked = a.minutes !== void 0 && a.targetPct !== void 0;
+  const baseline = asked && known ? baselineP(market, a.minutes, a.targetPct) : void 0;
+  return {
+    ...asked ? {
+      requested: `${market} \xB7 ${Number(a.minutes.toFixed(1))} min \xB7 ${targetLabel(a.targetPct)}`,
+      baseline: baseline ?? `sin l\xEDnea base medida para el mercado ${market} (medidos: ${baselineMarkets().join(", ")})`,
+      byMarket: baselineByMarket(a.minutes, a.targetPct),
+      perps: perpBaselines(a.minutes, a.targetPct)
+    } : {},
+    frontier: known ? { market, horizons: baselineFrontier(market) } : Object.fromEntries(baselineMarkets().map((m) => [m, baselineFrontier(m)])),
+    note: `Tabla medida con datos reales (P por cierre de vela de 1 min, una compra con todo y la venta en el objetivo neto de costes). frontier: en cada plazo, el objetivo m\xE1s alto con una P de al menos el 10, el 25 y el 50 %. EV negativo en todas las casillas. Futuros: ${PERP_BASELINE_INFO.about}`
+  };
 }
 async function strategyFit(missionOrId) {
   const mission = typeof missionOrId === "number" ? getMission(missionOrId) : missionOrId;
   const v = await valuation(mission.id);
-  const minutesLeft = Math.max(1, (new Date(mission.deadline).getTime() - Date.now()) / 6e4);
+  const minutesLeft2 = Math.max(1, minutesLeft(mission));
   const need = mission.target_usd / v.totalUsd - 1;
   const a = Math.log(1 + Math.max(need, 0));
   const rows = [];
+  if (need > 0 && minutesLeft2 <= TABLE_MAX_MINUTES) {
+    for (const market2 of baselineMarkets()) {
+      const b = baselineP(market2, minutesLeft2, Math.max(0.1, Number((need * 100).toFixed(1))));
+      rows.push({
+        strategy: `${b.strategy} (l\xEDnea base medida)`,
+        reachTargetPct: pct(b.p),
+        fit: label(b.p),
+        basis: b.basis,
+        available: true
+      });
+    }
+  }
   const perpMax = await perpMarkets().then(
     (m) => new Map([...m.values()].map((x) => [x.coin, x.maxLeverage])),
     () => /* @__PURE__ */ new Map()
   );
-  for (const sym of MAJORS) {
-    const vol = await volatility(`${sym}USDT`).catch(() => null);
+  const cash = perpCash(mission.id);
+  const margin = cash.cashUsd - PERP_DEPOSIT_FEE_USD;
+  for (const coin of /* @__PURE__ */ new Set([...SPOT, ...PERPS.map((p) => p.coin)])) {
+    const perp = PERPS.find((p) => p.coin === coin);
+    const maxLev = perpMax.get(coin) ?? 0;
+    const levs = perp?.leverages.filter((l) => l <= maxLev) ?? [];
+    if (!SPOT.includes(coin) && !levs.length) continue;
+    const vol = await volatility(`${coin}USDT`).catch(() => null);
     if (vol === null) continue;
-    const s = vol.sigma * Math.sqrt(minutesLeft);
-    const spot = probTouch(a, s);
-    rows.push({
-      strategy: `${sym} al contado`,
-      reachTargetPct: pct(spot),
-      fit: label(spot),
-      basis: `movimiento t\xEDpico en ${Math.round(minutesLeft)} min: \xB1${(s * 100).toFixed(2)} %; \xFAltima hora: ${vol.change1hPct > 0 ? "+" : ""}${vol.change1hPct} %`,
-      available: true
-    });
-    const maxLev = perpMax.get(sym) ?? 0;
-    for (const lev of LEVERAGES.filter((l) => l <= maxLev)) {
-      const margin = Math.max(1, v.totalUsd - PERP_DEPOSIT_FEE_USD);
-      const needMove = perpMoveNeeded(v.totalUsd, mission.target_usd, lev);
-      const move = Math.log(1 + Math.max(needMove, 0));
-      const liqDistance = 1 / lev - 1 / (2 * maxLev);
-      const liq = -Math.log(1 - liqDistance);
-      const reach = probTouch(move, s);
-      const ruin = probTouch(liq, s);
+    const s = vol.sigma * Math.sqrt(minutesLeft2);
+    if (SPOT.includes(coin)) {
+      const spot = probTouch(a, s);
       rows.push({
-        strategy: `Futuros ${sym} ${lev}x`,
-        reachTargetPct: pct(reach),
-        ruinPct: pct(ruin),
-        fit: label(reach * (1 - ruin)),
-        basis: `necesita ${(needMove * 100).toFixed(2)} % a favor contando costes (~${(PERP_DEPOSIT_FEE_USD + PERP_WITHDRAW_FEE_USD + 2 * PERP_TAKER_FEE * margin * lev).toFixed(2)} $); liquidaci\xF3n a ~${(liqDistance * 100).toFixed(1)} % en contra; open_perp`,
+        strategy: `${coin} al contado`,
+        reachTargetPct: pct(spot),
+        fit: label(spot),
+        basis: `movimiento t\xEDpico en ${Math.round(minutesLeft2)} min: \xB1${(s * 100).toFixed(2)} %; \xFAltima hora: ${vol.change1hPct > 0 ? "+" : ""}${vol.change1hPct} %`,
+        available: true
+      });
+    }
+    for (const lev of levs) {
+      const measured = perpBaselines(minutesLeft2, need * 100).filter((c) => c.coin === coin && c.leverage === lev);
+      const measuredText = measured.length ? `; medido con la r\xE9plica del simulador (${PERP_BASELINE_INFO.capitalUsd} $ en una cadena): ` + measured.map((c) => {
+        const gate = PERP_CELLS.find((x) => x.id === c.id)?.gate;
+        const now2 = gate ? ` (ahora ${(vol.sigma1h * 100).toFixed(3).replace(".", ",")} %/min: ${vol.sigma1h >= gate.sigmaPerMinute ? "S\xCD se cumple" : "no se cumple"})` : "";
+        return `${c.label}${now2}: ${c.text}`;
+      }).join(" \xB7 ") : "";
+      if (!(margin * lev >= PERP_MIN_NOTIONAL_USD)) {
+        rows.push({
+          strategy: `Futuros ${coin} ${lev}x`,
+          reachTargetPct: null,
+          fit: "sin datos",
+          basis: `no hay margen: el efectivo de una sola cadena (${cash.chain}: ${cash.cashUsd.toFixed(2)} $) menos el dep\xF3sito no llega a ${PERP_MIN_NOTIONAL_USD} $ de nocional${measuredText}`,
+          available: false
+        });
+        continue;
+      }
+      const needMove = perpMoveNeeded(v.totalUsd, mission.target_usd, lev, cash.cashUsd);
+      const up = Math.log(1 + Math.max(needMove, 0));
+      const liqDistance = 1 / lev - 1 / (2 * maxLev);
+      const down = -Math.log(1 - liqDistance);
+      const touch = probFirstTouch(up, down, s);
+      rows.push({
+        strategy: `Futuros ${coin} ${lev}x`,
+        reachTargetPct: pct(touch.up),
+        ruinPct: pct(touch.down),
+        fit: label(touch.up),
+        basis: `necesita ${(needMove * 100).toFixed(2)} % a favor ANTES de un ${(liqDistance * 100).toFixed(1)} % en contra (liquidaci\xF3n), con ${margin.toFixed(2)} $ de margen (el efectivo de ${cash.chain}: el margen sale de una sola cadena) y ~${(PERP_FIXED_COST_USD + 2 * PERP_TAKER_FEE * margin * lev).toFixed(2)} $ de costes (${PERP_FIXED_COST_USD.toFixed(2)} $ fijos por posici\xF3n y la comisi\xF3n); open_perp${measuredText}`,
         available: true
       });
     }
@@ -12013,7 +13364,7 @@ async function strategyFit(missionOrId) {
     const hit = closed.filter((p) => (p.pnlPct ?? 0) >= need * 100).length / closed.length;
     const ruin = closed.filter((p) => (p.pnlPct ?? 0) <= -50).length / closed.length;
     rows.push({
-      strategy: "Memecoin joven (< 60 min)",
+      strategy: "Memecoin joven (< 60 min), seg\xFAn tu historial",
       reachTargetPct: pct(hit),
       ruinPct: pct(ruin),
       fit: label(hit),
@@ -12021,17 +13372,24 @@ async function strategyFit(missionOrId) {
       available: true
     });
   } else {
-    rows.push({ strategy: "Memecoin joven (< 60 min)", reachTargetPct: null, fit: "sin datos", basis: "menos de 5 operaciones propias", available: true });
+    rows.push({ strategy: "Memecoin joven (< 60 min), seg\xFAn tu historial", reachTargetPct: null, fit: "sin datos", basis: "menos de 5 operaciones propias", available: true });
   }
-  rows.sort((x, y) => (y.reachTargetPct ?? -1) * (1 - (y.ruinPct ?? 0) / 100) - (x.reachTargetPct ?? -1) * (1 - (x.ruinPct ?? 0) / 100));
+  rows.sort((x, y) => (y.reachTargetPct ?? -1) - (x.reachTargetPct ?? -1));
+  const cls = parseMissionClass(mission.class);
+  const market = cls && isBaselineMarket(cls.market) ? cls.market : DEFAULT_FAST_MARKET;
+  const baseline = cls && isBaselineMarket(cls.market) ? baselineP(cls.market, cls.minutes, cls.targetPct) : void 0;
   return {
     needPct: Number((need * 100).toFixed(1)),
-    minutesLeft: Math.round(minutesLeft),
-    note: "Estimaci\xF3n del simulador: probabilidad de tocar el objetivo en el tiempo que queda, con la volatilidad real (cripto grande) o con tu historial (memecoins). No es una predicci\xF3n: sirve para descartar lo que no encaja con la misi\xF3n y comparar riesgos. available: false = a\xFAn no se puede ejecutar en el simulador.",
+    minutesLeft: Math.round(minutesLeft2),
+    ...mission.class ? { missionClass: mission.class } : {},
+    // La P base de la clase (la de la misión entera, no la de lo que queda): con ella se compara al agente y a su gemelo.
+    ...baseline ? { baseline: { pPct: pct(baseline.p), basis: baseline.basis } } : {},
+    frontier: { market, horizons: baselineFrontier(market) },
+    note: "Estimaci\xF3n del simulador: probabilidad de llegar al objetivo en el tiempo que queda, con las l\xEDneas base medidas (memecoins), la volatilidad real (cripto grande; en futuros, llegar antes de liquidarse) o tu historial. No es una predicci\xF3n: sirve para descartar lo que no encaja con la misi\xF3n y comparar riesgos. frontier: en cada plazo medido, el objetivo m\xE1s alto con P \u226510/25/50 %. available: false = no se puede ejecutar ahora.",
     strategies: rows
   };
 }
-var MAJORS, LEVERAGES, probTouch, pct, label;
+var SPOT, PERPS, TABLE_MAX_MINUTES, PERP_FIXED_COST_USD, probTouch, pct, label;
 var init_fit = __esm({
   "src/sim/fit.ts"() {
     "use strict";
@@ -12039,12 +13397,23 @@ var init_fit = __esm({
     init_hyperliquid();
     init_perps();
     init_mission();
+    init_mission_kind();
     init_portfolio();
     init_positions();
-    MAJORS = ["SOL", "ETH", "BNB"];
-    LEVERAGES = [5, 10, 20];
+    init_venues();
+    init_baselines2();
+    SPOT = ["SOL", "ETH", "BNB", "BTC"];
+    PERPS = [
+      { coin: "SOL", leverages: [5, 10, 20] },
+      { coin: "ETH", leverages: [5, 10, 20] },
+      { coin: "BNB", leverages: [5, 10, 20] },
+      { coin: "BTC", leverages: [40] },
+      { coin: "ZEC", leverages: [10] }
+    ];
+    TABLE_MAX_MINUTES = 60;
+    PERP_FIXED_COST_USD = PERP_DEPOSIT_FEE_USD + PERP_WITHDRAW_FEE_USD;
     probTouch = (a, s) => a <= 0 ? 1 : s <= 0 ? 0 : Math.min(1, 2 * (1 - phi(a / s)));
-    pct = (p) => Math.round(p * 100);
+    pct = (p) => Number((p * 100).toFixed(p < 0.1 ? 1 : 0));
     label = (p) => p >= 0.25 ? "encaja" : p >= 0.05 ? "posible" : "no encaja";
   }
 });
@@ -12052,6 +13421,7 @@ var init_fit = __esm({
 // src/sim/counterfactuals.ts
 var counterfactuals_exports = {};
 __export(counterfactuals_exports, {
+  HOLD_HORIZONS: () => HOLD_HORIZONS,
   missionCounterfactuals: () => missionCounterfactuals
 });
 async function candles(venue, token2, fromSec, toSec) {
@@ -12077,43 +13447,47 @@ async function perpCandles(coin, fromSec, toSec) {
   );
   return raw.map((k) => [Math.floor(k[0] / 1e3), Number(k[1]), Number(k[2]), Number(k[3]), Number(k[4])]);
 }
-async function one(p) {
+async function one(p, horizons) {
   const base2 = { positionId: p.id, symbol: p.symbol, actualPct: p.pnlPct ?? null };
   const perp = p.venue === "hyperliquid" ? p.symbol.match(/^(\w+)-PERP (largo|corto) (\d+)x/) : null;
   if (!p.closedAt || !NETWORK2[p.venue] && !perp) return { ...base2, unavailable: "sin datos de precio para esta cadena" };
   const open2 = Math.floor(new Date(p.openedAt).getTime() / 1e3);
   const close2 = Math.floor(new Date(p.closedAt).getTime() / 1e3);
   const now2 = Math.floor(Date.now() / 1e3);
-  const end = Math.min(now2, close2 + 30 * 60);
+  const last = horizons.at(-1);
+  const end = Math.min(now2, close2 + last * 60);
   const raw = perp ? await perpCandles(perp[1], open2 - 120, end) : await candles(p.venue, p.asset, open2 - 120, end);
   const cs = perp?.[2] === "corto" ? raw.map(([t, o, h, l, c]) => [t, 1 / o, 1 / l, 1 / h, 1 / c]) : raw;
   const entry = priceAt(cs, open2) ?? cs[0]?.[4];
   const exit = priceAt(cs, close2);
   if (!entry || !exit) return { ...base2, unavailable: "sin velas en ese intervalo" };
   const held = cs.filter((c) => c[0] >= open2 - 60 && c[0] <= close2);
-  const at15 = close2 + 15 * 60 <= now2 ? priceAt(cs, close2 + 15 * 60) : void 0;
-  const at30 = close2 + 30 * 60 <= now2 ? priceAt(cs, close2 + 30 * 60) : void 0;
   const d = perp ? 2 : 1;
+  const after = horizons.map((h) => {
+    const price = close2 + h * 60 <= now2 ? priceAt(cs, close2 + h * 60) : void 0;
+    return { h, pct: price ? pct2(entry, price, d) : void 0 };
+  });
   const out = {
     ...base2,
     marketMovePct: pct2(entry, exit, d),
     // Con los cierres de cada minuto, no con los máximos y mínimos: en pools pequeños las mechas son picos de un
     // segundo que no se podían vender (en la M28, p/acc "llegó a +66 %" justo antes de un rug del -95 %).
     bestWhileHeldPct: held.length ? pct2(entry, Math.max(...held.map((c) => c[4])), d) : void 0,
-    worstWhileHeldPct: held.length ? pct2(entry, Math.min(...held.map((c) => c[4])), d) : void 0,
-    ifHeld15Pct: at15 ? pct2(entry, at15, d) : void 0,
-    ifHeld30Pct: at30 ? pct2(entry, at30, d) : void 0
+    worstWhileHeldPct: held.length ? pct2(entry, Math.min(...held.map((c) => c[4])), d) : void 0
   };
+  for (const a of after) out[`ifHeld${a.h}Pct`] = a.pct;
   const notes = [];
   if (out.bestWhileHeldPct !== void 0 && out.marketMovePct !== void 0 && out.bestWhileHeldPct >= 3 && out.bestWhileHeldPct - out.marketMovePct >= 20) {
     notes.push(`lleg\xF3 a +${out.bestWhileHeldPct} % mientras la ten\xEDa y sali\xF3 en ${out.marketMovePct} %: la salida dej\xF3 dinero en la mesa`);
   }
-  if (out.ifHeld15Pct !== void 0 && out.marketMovePct !== void 0 && out.ifHeld15Pct > out.marketMovePct + 30) {
-    notes.push(`a los 15 min de vender iba ${out.ifHeld15Pct} %`);
+  const first = after[0];
+  const final = after.at(-1);
+  if (first.pct !== void 0 && out.marketMovePct !== void 0 && first.pct > out.marketMovePct + 30) {
+    notes.push(`a los ${first.h} min de vender iba ${first.pct} %`);
   }
-  if (out.ifHeld30Pct !== void 0 && out.marketMovePct !== void 0) {
-    if (out.ifHeld30Pct < out.marketMovePct - 15) notes.push(`mantenerla 30 min m\xE1s habr\xEDa dado ${out.ifHeld30Pct} %: la salida fue buena`);
-    else if (out.ifHeld30Pct > out.marketMovePct + 15) notes.push(`mantenerla 30 min m\xE1s habr\xEDa dado ${out.ifHeld30Pct} %: sali\xF3 demasiado pronto`);
+  if (final.pct !== void 0 && out.marketMovePct !== void 0) {
+    if (final.pct < out.marketMovePct - 15) notes.push(`mantenerla ${final.h} min m\xE1s habr\xEDa dado ${final.pct} %: la salida fue buena`);
+    else if (final.pct > out.marketMovePct + 15) notes.push(`mantenerla ${final.h} min m\xE1s habr\xEDa dado ${final.pct} %: sali\xF3 demasiado pronto`);
   }
   if (out.bestWhileHeldPct !== void 0 && out.bestWhileHeldPct < (perp ? 0.1 : 3) && (p.pnlPct ?? 0) < 0) notes.push("nunca lleg\xF3 a ir en positivo: el problema fue la entrada, no la salida");
   if (perp) notes.push(`futuro a ${perp[3]}x: los % son del precio en el sentido de la posici\xF3n; sobre el margen, por ${perp[3]}`);
@@ -12122,10 +13496,12 @@ async function one(p) {
     notes.unshift("lectura poco fiable, ver unreliable");
   }
   out.reading = notes.join("; ") || "sin nada destacable";
-  if (at30 !== void 0) cache2.set(p.id, out);
+  if (final.pct !== void 0) cache2.set(p.id, out);
   return out;
 }
 async function missionCounterfactuals(missionId, limit = 8) {
+  const m = db.prepare("SELECT created_at, deadline FROM missions WHERE id = ?").get(missionId);
+  const horizons = m && isShortMission(m) ? HOLD_HORIZONS.fast : HOLD_HORIZONS.long;
   const closed = listPositions(missionId).filter((p) => p.status === "closed").slice(-limit);
   const out = [];
   for (const p of closed) {
@@ -12134,16 +13510,19 @@ async function missionCounterfactuals(missionId, limit = 8) {
       out.push(cached3);
       continue;
     }
-    out.push(await one(p).catch((err) => ({ positionId: p.id, symbol: p.symbol, actualPct: p.pnlPct ?? null, unavailable: err.message.slice(0, 120) })));
+    out.push(await one(p, horizons).catch((err) => ({ positionId: p.id, symbol: p.symbol, actualPct: p.pnlPct ?? null, unavailable: err.message.slice(0, 120) })));
   }
   return out;
 }
-var NETWORK2, cache2, pct2, priceAt;
+var HOLD_HORIZONS, NETWORK2, cache2, pct2, priceAt;
 var init_counterfactuals = __esm({
   "src/sim/counterfactuals.ts"() {
     "use strict";
+    init_db();
     init_http();
+    init_mission_kind();
     init_positions();
+    HOLD_HORIZONS = { long: [15, 30], fast: [1, 3, 5] };
     NETWORK2 = { solana: "solana", base: "base", bsc: "bsc" };
     cache2 = /* @__PURE__ */ new Map();
     pct2 = (a, b, decimals = 1) => Number(((b / a - 1) * 100).toFixed(decimals));
@@ -12191,7 +13570,7 @@ async function exportTaxes(opts = {}) {
   if (!ops.length && !positions.length) return { operations: 0, positions: 0, files: [], note: "No hay operaciones con dinero real" + (opts.year ? ` en ${opts.year}` : "") + "." };
   const dates = [...ops.map((o) => o.ts), ...positions.map((p) => p.closed_at)].filter(Boolean).sort();
   const eur = await eurRates(dates[0], dates.at(-1));
-  const toEur = (usd2, iso) => usd2 === null || usd2 === void 0 || !eur.get(day(iso)) ? null : usd2 * eur.get(day(iso));
+  const toEur = (usd2, iso2) => usd2 === null || usd2 === void 0 || !eur.get(day(iso2)) ? null : usd2 * eur.get(day(iso2));
   const opRows = ops.map((o) => {
     const d = o.details ? JSON.parse(o.details) : {};
     const tipo = o.kind === "swap" ? "permuta (swap)" : o.kind === "transfer" ? "puente (salida)" : o.kind === "transfer_arrived" ? "puente (llegada)" : "transacci\xF3n fallida";
@@ -12258,20 +13637,20 @@ async function exportTaxes(opts = {}) {
     note: "Registro de apoyo, no asesoramiento fiscal. En Espa\xF1a cada permuta entre criptomonedas es una ganancia o p\xE9rdida patrimonial; Hacienda exige FIFO y aqu\xED el coste de cada posici\xF3n es el medio: tu gestor puede recalcularlo con el archivo de operaciones. El cambio a EUR es el cierre diario de EURUSDT en Binance."
   };
 }
-var day, num2, cell2, csv;
+var day, num4, cell3, csv;
 var init_taxes = __esm({
   "src/live/taxes.ts"() {
     "use strict";
     init_config();
     init_db();
     init_http();
-    day = (iso) => iso.slice(0, 10);
-    num2 = (n3, d = 8) => n3 === null || n3 === void 0 || !Number.isFinite(n3) ? "" : Number(n3.toFixed(d)).toString().replace(".", ",");
-    cell2 = (v) => {
-      const s = typeof v === "number" ? num2(v) : v ?? "";
+    day = (iso2) => iso2.slice(0, 10);
+    num4 = (n3, d = 8) => n3 === null || n3 === void 0 || !Number.isFinite(n3) ? "" : Number(n3.toFixed(d)).toString().replace(".", ",");
+    cell3 = (v) => {
+      const s = typeof v === "number" ? num4(v) : v ?? "";
       return /[;"\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
     };
-    csv = (header, rows) => "\uFEFF" + [header, ...rows].map((r) => r.map(cell2).join(";")).join("\r\n") + "\r\n";
+    csv = (header, rows) => "\uFEFF" + [header, ...rows].map((r) => r.map(cell3).join(";")).join("\r\n") + "\r\n";
   }
 });
 
@@ -41703,7 +43082,7 @@ async function checkOrders() {
       log.push(`Orden #${id} caducada`);
     }
   }
-  const open2 = db.prepare("SELECT o.* FROM orders o JOIN missions m ON m.id = o.mission_id WHERE o.status = 'open' AND m.status = 'active'").all();
+  const open2 = db.prepare("SELECT o.* FROM orders o JOIN missions m ON m.id = o.mission_id WHERE o.status = 'open' AND m.status = 'active' AND m.started_at IS NOT NULL").all();
   const prices = /* @__PURE__ */ new Map();
   for (const order of open2) {
     if (order.condition === "time") {
@@ -41784,9 +43163,13 @@ import http from "node:http";
 // src/sim/memory.ts
 init_db();
 init_mission();
+init_mission_kind();
 init_positions();
 init_text();
 init_launchpads();
+init_stats();
+init_class_stats();
+init_shadow();
 function profile(m) {
   return {
     durationMinutes: Math.max(1, Math.round((new Date(m.deadline).getTime() - new Date(m.created_at).getTime()) / 6e4)),
@@ -41918,15 +43301,6 @@ function summarizeTrades(ps) {
 }
 var BIG_WIN_PCT = 20;
 var magnitude = (t) => t.trades ? `; media ${t.avgPnlPct} %, mejor ${t.bestPct} %, ${t.bigWins} de ${t.trades} con +${BIG_WIN_PCT} % o m\xE1s` : "";
-function wilson(successes, n3) {
-  if (!n3) return { low: 0, high: 100 };
-  const z2 = 1.96;
-  const p = successes / n3;
-  const denom = 1 + z2 * z2 / n3;
-  const center = (p + z2 * z2 / (2 * n3)) / denom;
-  const half = z2 * Math.sqrt(p * (1 - p) / n3 + z2 * z2 / (4 * n3 * n3)) / denom;
-  return { low: Math.round(Math.max(0, center - half) * 100), high: Math.round(Math.min(1, center + half) * 100) };
-}
 var beliefStage = (decided2) => decided2 >= 30 ? "rule" : decided2 >= 10 ? "provisional" : "hypothesis";
 var STAGE_LABEL = {
   hypothesis: "hip\xF3tesis (menos de 10 casos: puede ser suerte)",
@@ -41998,26 +43372,26 @@ var LIQ_BUCKETS = [["<15k", 15e3], ["15-50k", 5e4], ["50-200k", 2e5], ["200k-1M"
 var bucket = (v, buckets) => typeof v === "number" ? buckets.find(([, max]) => v < max)[0] : "sin dato";
 function explorationMap() {
   const closed = closedPositions();
-  const cell3 = (ps) => {
+  const cell4 = (ps) => {
     const s = summarizeTrades(ps);
     return s.trades ? { trades: s.trades, wins: s.wins, losses: s.losses, avgPnlPct: s.avgPnlPct } : { trades: 0 };
   };
   const byVenue = {};
-  for (const venue of new Set(closed.map((p) => p.venue))) byVenue[venue] = cell3(closed.filter((p) => p.venue === venue));
+  for (const venue of new Set(closed.map((p) => p.venue))) byVenue[venue] = cell4(closed.filter((p) => p.venue === venue));
   const spot = closed.filter((p) => p.venue !== "hyperliquid");
   const spotByAgeAndLiquidity = AGE_BUCKETS.map(([age]) => ({
     age,
     ...Object.fromEntries(
       LIQ_BUCKETS.map(([liq]) => {
         const ps = spot.filter((p) => bucket(p.entry.ageMinutes, AGE_BUCKETS) === age && bucket(p.entry.liquidityUsd, LIQ_BUCKETS) === liq);
-        const c = cell3(ps);
+        const c = cell4(ps);
         return [liq, c.trades ? `${c.trades} op: ${c.wins}G/${c.losses}P, media ${c.avgPnlPct} %` : "sin probar"];
       })
     )
   }));
   const perps = closed.filter((p) => p.venue === "hyperliquid");
   const perpsByCoin = {};
-  for (const coin of new Set(perps.map((p) => p.symbol.split("-")[0]))) perpsByCoin[coin] = cell3(perps.filter((p) => p.symbol.startsWith(`${coin}-`)));
+  for (const coin of new Set(perps.map((p) => p.symbol.split("-")[0]))) perpsByCoin[coin] = cell4(perps.filter((p) => p.symbol.startsWith(`${coin}-`)));
   return {
     closedTrades: closed.length,
     byVenue,
@@ -42073,7 +43447,7 @@ function recall(missionId, limit) {
       similarity: curProfile ? similarityLabel(d) : void 0,
       distance: Number(d.toFixed(2)),
       instructions: m.instructions ?? void 0,
-      result: m.status === "cancelled" ? "cancelada por el usuario" : `${m.status === "succeeded" ? "objetivo conseguido" : "no lleg\xF3 al objetivo"}: ${m.initial_usd} \u2192 ${m.final_usd?.toFixed(2)} USD (${((m.final_usd - m.initial_usd) / m.initial_usd * 100).toFixed(1)} %)`,
+      result: m.status === "cancelled" ? m.end_reason === "prep_timeout" ? "cancelada: el reloj no lleg\xF3 a arrancar" : "cancelada por el usuario" : `${m.status === "succeeded" ? "objetivo conseguido" : "no lleg\xF3 al objetivo"}: ${m.initial_usd} \u2192 ${m.final_usd?.toFixed(2)} USD (${((m.final_usd - m.initial_usd) / m.initial_usd * 100).toFixed(1)} %)`,
       ...review && review.origin !== "legacy" ? { nextTime: review.next_time } : {}
     };
   }).sort((a, b) => a.distance - b.distance);
@@ -42399,6 +43773,7 @@ function reviewCheckpoint(missionId, summary) {
 function recentApproach(count = 8) {
   const missions = db.prepare("SELECT * FROM missions WHERE status IN ('succeeded', 'expired', 'bust', 'cancelled') AND final_usd IS NOT NULL ORDER BY id DESC LIMIT ?").all(count);
   if (!missions.length) return null;
+  const twins = twinCounts();
   const perMission = missions.reverse().map((m) => {
     const ps = listPositions(m.id).filter((p) => p.status !== "moved");
     const ages = ps.map((p) => p.entry.ageMinutes).filter((a) => typeof a === "number").sort((a, b) => a - b);
@@ -42421,7 +43796,10 @@ function recentApproach(count = 8) {
       venues: [...new Set(ps.map((p) => p.venue))].join("+") || "ninguno",
       tokenAgeMinutes: ages.length ? ages[Math.floor(ages.length / 2)] : null,
       closedByDeadline: ps.filter((p) => String(p.exitReason ?? "").startsWith("Cierre autom\xE1tico")).length,
-      orders
+      orders,
+      // Su clase y cómo quedó frente a lo que predijo el plan, a la línea base y a su gemelo mecánico.
+      ...m.class ? { missionClass: m.class } : {},
+      ...m.status !== "cancelled" && m.started_at ? comparedToTwin(m, twins) : {}
     };
   });
   const n3 = perMission.length;
@@ -42445,6 +43823,10 @@ function recentApproach(count = 8) {
     perMission
   };
 }
+function comparedToTwin(m, twins) {
+  const { hit: _hit, resultPct: _result, ...rest } = missionComparison(m, twins);
+  return rest;
+}
 function reviewQueue() {
   const active2 = getActiveMission();
   let activeMission = null;
@@ -42453,6 +43835,8 @@ function reviewQueue() {
     const briefing = db.prepare("SELECT updated_at, seen_at FROM briefings WHERE mission_id = ?").get(active2.id);
     activeMission = {
       missionId: active2.id,
+      // rápida (simulada de 15 min o menos: planner y executor, sin briefing) o normal (el trader, con briefing).
+      missionKind: isFastMission(active2) ? "r\xE1pida" : "normal",
       profile: describe3(profile(active2)),
       instructions: active2.instructions ?? void 0,
       deadline: active2.deadline,
@@ -42467,6 +43851,8 @@ function reviewQueue() {
     pendingFinalReviews: pendingReviews(),
     activeMission,
     recentApproach: recentApproach(),
+    // Por clase de misión: aciertos con su IC de Wilson, calibración del cerebro, línea base y gemelo mecánico.
+    missionClasses: classStats({ perMissionLimit: 20 }),
     memoryHygiene: memoryHygiene(),
     pendingObservations: db.prepare("SELECT id, ts, mission_id, kind, text FROM observations WHERE status = 'pending' ORDER BY id").all(),
     errorsWithoutHowto: recurringErrors().filter((e) => !e.howtoId),
@@ -42482,9 +43868,13 @@ function missionReviewData(missionId, since) {
   const errors = db.prepare("SELECT id, ts, tool, error_class, message, howto_id FROM tool_errors WHERE mission_id = ? AND ts > ? ORDER BY id").all(missionId, from);
   const allPositions = listPositions(missionId);
   const positions = since ? allPositions.filter((p) => p.status === "open" || p.openedAt > from || (p.closedAt ?? "") > from).map((p) => p.openedAt > from ? p : { ...p, thesis: void 0, lessonsApplied: void 0, entry: void 0, research: void 0, note: "abierta antes de tu \xFAltima revisi\xF3n" }) : allPositions;
+  const twin = m.status === "active" || m.status === "closing" ? null : shadowSummary(missionId);
   return {
     mission: { ...mission, profile: describe3(profile(m)) },
     stats: missionStats(missionId),
+    // Misión rápida: su gemelo mecánico (los eventos siguientes con la regla sin inteligencia) y cómo va su clase.
+    ...twin ? { twin } : {},
+    ...m.class && !since ? { missionClass: classStats({ cls: m.class, perMissionLimit: 10 })[0] ?? `${m.class}: a\xFAn sin misiones terminadas` } : {},
     briefing: !briefing ? null : since && briefing.updated_at <= from ? { updated_at: briefing.updated_at, seen_at: briefing.seen_at, text: "(sin cambios desde tu \xFAltima revisi\xF3n)" } : briefing,
     ...since ? { checkpoints: `${db.prepare("SELECT COUNT(*) AS n FROM review_checkpoints WHERE mission_id = ?").get(missionId).n} revisiones anteriores` } : { checkpoints: db.prepare("SELECT ts, summary FROM review_checkpoints WHERE mission_id = ? ORDER BY id").all(missionId) },
     positions,
@@ -42732,6 +44122,14 @@ async function estimateTokenLaunch(a) {
 // src/sim/guard.ts
 init_venues();
 init_positions();
+async function memoryBlockers(a) {
+  const chain = getChain(a.chain);
+  const features = await chain.entryFeatures(a.token.address).catch(() => null);
+  if (!features) return [];
+  const decision = a.missionId !== void 0 ? decisionContext(a.missionId, chain.id, a.token.address, a.amountUsd ?? 0, false) : {};
+  const entry = { ...features, ...creatorHistory(features.creator) };
+  return blockingBeliefs(chain.id, entry, a.token.address, decision);
+}
 async function checkBuyAgainstMemory(a) {
   const chain = getChain(a.chain);
   const out = await chain.resolveToken(a.output);
@@ -42741,31 +44139,135 @@ async function checkBuyAgainstMemory(a) {
       `Antes de comprar ${out.symbol}, rellena thesis.risks_checked: qu\xE9 creencias negativas de tu memoria podr\xEDan aplicar y qu\xE9 dicen los datos de riskCheck en token_report, y por qu\xE9 no descartan la compra.`
     );
   }
-  const features = await chain.entryFeatures(out.address).catch(() => null);
-  if (!features) return [];
   const overridden = new Map((a.overrides ?? []).map((o) => [o.id, o]));
-  const reasons = [];
   let amountUsd = 0;
   if (a.input && a.amount) {
     const input2 = await chain.resolveToken(a.input).catch(() => null);
     if (input2 && chain.isCash(input2.address)) amountUsd = a.amount;
   }
-  const decision = a.missionId !== void 0 ? decisionContext(a.missionId, chain.id, out.address, amountUsd, false) : {};
-  const entry = { ...features, ...creatorHistory(features.creator) };
-  const blocking = blockingBeliefs(chain.id, entry, out.address, decision);
-  for (const b of blocking.filter((x) => !overridden.has(x.id))) reasons.push(`- #${b.id}: ${b.statement} (evidencia: ${b.verdict})`);
-  if (reasons.length) {
-    const ids = blocking.filter((x) => !overridden.has(x.id)).map((b) => b.id);
+  const blocking = (await memoryBlockers({ chain: chain.id, token: out, missionId: a.missionId, amountUsd })).filter((b) => !overridden.has(b.id));
+  if (blocking.length) {
+    const reasons = blocking.map((b) => `- #${b.id}: ${b.statement} (evidencia: ${b.verdict})`);
     throw new Error(
       `Tu memoria desaconseja esta compra de ${out.symbol}:
 ${reasons.join("\n")}
-Si aun as\xED quieres comprarlo, repite la operaci\xF3n con thesis.overrides = [${ids.map((id) => `{ id: ${id}, reason: "por qu\xE9 esta vez es distinto" }`).join(", ")}].`
+Si aun as\xED quieres comprarlo, repite la operaci\xF3n con thesis.overrides = [${blocking.map((b) => `{ id: ${b.id}, reason: "por qu\xE9 esta vez es distinto" }`).join(", ")}].`
     );
   }
   return [...overridden.values()];
 }
 
+// src/sim/entry.ts
+init_db();
+init_mission();
+init_mission_kind();
+init_portfolio();
+init_venues();
+function entryCash(missionId, chainId, usdAmount, upTo) {
+  const chain = getChain(chainId);
+  const [stable, have] = chain.stables.map((s) => [s, balance(missionId, chain.id, s.address)]).sort((a, b) => b[1] - a[1])[0];
+  const amount = usdAmount ?? Math.min(upTo ?? have, have);
+  if (!(have >= 1)) throw new Error(`No tienes efectivo en ${chain.label} para entrar (el nativo se queda para pagar la red)`);
+  if (amount > have * 1.000001) throw new Error(`Solo tienes ${Number(have.toFixed(2))} ${stable.symbol} en ${chain.label}: usd_amount no puede pasar de ah\xED`);
+  return { stable, amount: Math.min(amount, have) };
+}
+async function prepareEntry(a) {
+  const chain = getChain(a.chain);
+  const { stable, amount } = entryCash(a.missionId, chain.id, a.usdAmount, a.planUsdAmount);
+  const token2 = await chain.resolveToken(a.token);
+  if (chain.isCash(token2.address) || token2.address === chain.native.address) {
+    throw new Error("enter_with_exits compra un token: ni el efectivo ni el nativo de la cadena");
+  }
+  let backUsd;
+  try {
+    const buy = await chain.quote({ input: stable, output: token2, amountIn: amount, slippageBps: a.slippageBps });
+    if (!(buy.amountOut > 0)) throw new Error("la compra no da tokens");
+    backUsd = (await chain.quote({ input: token2, output: stable, amountIn: buy.amountOut, slippageBps: a.slippageBps })).amountOut;
+  } catch (err) {
+    throw new Error(`No hay cotizaci\xF3n de compra y venta de ${token2.symbol} en ${chain.label} (${err.message.slice(0, 160)}): no se entra`);
+  }
+  const roundTripCostPct = (1 - backUsd / amount) * 100;
+  if (roundTripCostPct > a.maxRoundTripCostPct) {
+    throw new Error(
+      `Comprar ${Number(amount.toFixed(2))} ${stable.symbol} de ${token2.symbol} y venderlo al momento devolver\xEDa ${Number(backUsd.toFixed(2))} ${stable.symbol}: una ida y vuelta del ${roundTripCostPct.toFixed(1)} %, por encima del ${a.maxRoundTripCostPct} % (pool vaciado o sin liquidez). No se entra: espera al siguiente candidato`
+    );
+  }
+  return { stable, amount, token: token2, roundTrip: { backUsd, costPct: Number(roundTripCostPct.toFixed(2)) } };
+}
+async function enterWithExits(a) {
+  const chain = getChain(a.chain);
+  const token2 = await chain.resolveToken(a.token);
+  if (chain.isCash(token2.address) || token2.address === chain.native.address) {
+    throw new Error("enter_with_exits compra un token: ni el efectivo ni el nativo de la cadena");
+  }
+  const { stable, amount } = entryCash(a.missionId, chain.id, a.usdAmount);
+  const before = balance(a.missionId, chain.id, token2.address);
+  const buy = await swap({
+    missionId: a.missionId,
+    sessionId: a.sessionId,
+    chain: chain.id,
+    input: stable.address,
+    output: token2.address,
+    amount,
+    slippageBps: a.slippageBps,
+    reasoning: a.reasoning,
+    meta: a.meta
+  });
+  const qty = balance(a.missionId, chain.id, token2.address);
+  const bought = qty - before;
+  const entryPrice = amount / bought;
+  const mission = getMission(a.missionId);
+  const v = await valuation(a.missionId);
+  const tokenUsd = v.holdings.find((h) => h.venue === chain.id && h.asset === token2.address)?.usd ?? 0;
+  const sellPrice2 = qty > 0 ? tokenUsd / qty : 0;
+  const fromTarget = a.tpRatio === void 0;
+  const triggerPrice = fromTarget ? (mission.target_usd * (1 + TP_TARGET_MARGIN) - (v.totalUsd - tokenUsd)) / qty : entryPrice * a.tpRatio;
+  const basis = fromTarget ? "el objetivo de la misi\xF3n, neto de costes" : `\xD7${a.tpRatio} del precio de compra (${a.tpRatioFrom ?? "par\xE1metro"})`;
+  let takeProfit;
+  try {
+    const order = await placeOrder({
+      missionId: a.missionId,
+      sessionId: a.sessionId,
+      venue: chain.id,
+      triggerAsset: token2.address,
+      condition: "above",
+      triggerPrice,
+      action: { input: token2.address, output: stable.symbol, amount: 0, sellAll: true, slippageBps: a.slippageBps },
+      reasoning: `Toma de beneficio de enter_with_exits: ${basis}.
+${a.reasoning}`
+    });
+    takeProfit = {
+      orderId: order.id,
+      summary: order.summary,
+      triggerPrice,
+      basis,
+      tpRatio: Number((triggerPrice / entryPrice).toFixed(4)),
+      // Lo que tiene que subir el precio de venta de ahora (ya con el coste de ida y vuelta) para que salte.
+      riseNeededPct: sellPrice2 > 0 ? (triggerPrice / sellPrice2 - 1) * 100 : void 0,
+      sellsFor: `${Number((triggerPrice * qty).toFixed(2))} ${stable.symbol}`
+    };
+  } catch (err) {
+    const message = err.message;
+    logJournal({ missionId: a.missionId, sessionId: a.sessionId, kind: "rejected", summary: `enter_with_exits: la toma de beneficio no se pudo poner: ${message}` });
+    takeProfit = {
+      error: `La toma de beneficio NO se ha puesto (${message}). La compra s\xED est\xE1 hecha: ponla con place_swap_trigger_order si sigue haciendo falta.`
+    };
+  }
+  const now2 = getMission(a.missionId);
+  return {
+    clock: now2.started_at ? { startedAt: now2.started_at, deadline: now2.deadline, minutesLeft: Number(minutesLeft(now2).toFixed(1)) } : void 0,
+    buy,
+    tokensBought: bought,
+    entryPrice,
+    takeProfit,
+    mission: { valueUsd: v.totalUsd, targetUsd: mission.target_usd }
+  };
+}
+
 // src/tools/index.ts
+init_plans();
+init_signals();
+init_baselines2();
 init_paths();
 
 // src/tools/format.ts
@@ -42784,14 +44286,14 @@ function compactReplacer(key, value) {
 var json2 = (value) => JSON.stringify(value, compactReplacer);
 var isRecord = (v) => Boolean(v) && typeof v === "object" && !Array.isArray(v);
 var isEmpty = (v) => v === void 0 || v === null;
-function cell(key, v) {
+function cell2(key, v) {
   if (isEmpty(v)) return "";
   const s = typeof v === "object" ? json2(v) : typeof v === "number" ? String(roundFor(key, v)) : String(v);
   return s.replace(/\|/g, "\xA6").replace(/\r?\n/g, " ");
 }
 function table(rows, indent = "") {
   const keys = [...new Set(rows.flatMap((r) => Object.keys(r)))].filter((k) => rows.some((r) => !isEmpty(r[k]) && r[k] !== ""));
-  return [`${indent}[${rows.length}] ${keys.join("|")}`, ...rows.map((r) => indent + keys.map((k) => cell(k, r[k])).join("|"))].join("\n");
+  return [`${indent}[${rows.length}] ${keys.join("|")}`, ...rows.map((r) => indent + keys.map((k) => cell2(k, r[k])).join("|"))].join("\n");
 }
 function toText(value, indent = "") {
   if (Array.isArray(value) && value.length > 1 && value.every(isRecord)) return table(value, indent);
@@ -42808,17 +44310,129 @@ ${toText(v, indent + "  ")}`;
 }
 
 // src/tools/define.ts
+var AGENTS = ["planner", "executor", "trader", "reviewer"];
+var OPERATORS = ["trader", "executor"];
+var MARKET_READERS = [...OPERATORS, "planner"];
 function tool(def) {
   return def;
 }
 
 // src/tools/index.ts
 init_market_state();
+
+// src/sim/watch.ts
+init_config();
+init_db();
+init_mission();
+init_mission_kind();
+init_shadow();
+var PRICE_ORDERS_WATCH_SECONDS = 15;
+var MIN_GAP_MS = 1500;
+var SLACK_MS = 250;
+function currentWatchState() {
+  const running2 = db.prepare("SELECT created_at, deadline FROM missions WHERE status = 'active' AND started_at IS NOT NULL").all();
+  const priceOrders = !!db.prepare(
+    `SELECT 1 FROM orders o JOIN missions m ON m.id = o.mission_id
+       WHERE o.status = 'open' AND o.condition != 'time' AND m.status = 'active' AND m.started_at IS NOT NULL LIMIT 1`
+  ).get();
+  return { fastMission: running2.some(isShortMission), priceOrders };
+}
+function watchIntervals(s, base2 = { full: config2.watchIntervalSeconds, fast: config2.fastWatchIntervalSeconds }) {
+  if (s.fastMission) return { fullSeconds: base2.fast, ordersSeconds: base2.fast };
+  return { fullSeconds: base2.full, ordersSeconds: s.priceOrders ? Math.min(PRICE_ORDERS_WATCH_SECONDS, base2.full) : base2.full };
+}
+function dueWatchWork(s, base2) {
+  const { fullSeconds, ordersSeconds } = watchIntervals(s, base2);
+  if (s.nowMs - s.lastFullMs >= fullSeconds * 1e3 - SLACK_MS) return "full";
+  if (s.nowMs - Math.max(s.lastFullMs, s.lastOrdersMs) >= ordersSeconds * 1e3 - SLACK_MS) return "orders";
+  return null;
+}
+var LAST_TICK_KEY = "watch_tick_at";
+var inFlight = null;
+function watchTick(opts = {}) {
+  if (inFlight) return inFlight;
+  if (opts.skipIfFresherMs && Date.now() - Number(getMeta(LAST_TICK_KEY) ?? 0) < opts.skipIfFresherMs) return Promise.resolve([]);
+  inFlight = (async () => {
+    const startedAt = Date.now();
+    const log = await checkOrders().catch((err) => [`Error revisando \xF3rdenes: ${err.message}`]);
+    log.push(...await checkMission().catch((err) => [`Error revisando la misi\xF3n: ${err.message}`]));
+    setMeta(LAST_TICK_KEY, String(startedAt));
+    return log;
+  })().finally(() => {
+    inFlight = null;
+  });
+  return inFlight;
+}
+var shadowInFlight = null;
+function shadowTick() {
+  if (shadowInFlight) return shadowInFlight;
+  shadowInFlight = checkShadows().catch((err) => [`Error revisando el gemelo: ${err.message}`]).finally(() => {
+    shadowInFlight = null;
+  });
+  return shadowInFlight;
+}
+function startWatchLoop(opts = {}) {
+  const heartbeatMs = Math.max(1, Math.min(config2.fastWatchIntervalSeconds, PRICE_ORDERS_WATCH_SECONDS, config2.watchIntervalSeconds)) * 1e3;
+  let lastFullMs = Date.now();
+  let lastOrdersMs = Date.now();
+  let timer;
+  let stopped = false;
+  const beat = async () => {
+    const started = Date.now();
+    try {
+      if (opts.canRun?.() ?? true) {
+        const state2 = currentWatchState();
+        const work = dueWatchWork({ ...state2, nowMs: started, lastFullMs, lastOrdersMs });
+        if (work === "full") {
+          lastFullMs = started;
+          const { fullSeconds } = watchIntervals(state2);
+          for (const line of await watchTick({ skipIfFresherMs: fullSeconds * 1e3 - 1e3 })) opts.log?.(line);
+        } else if (work === "orders") {
+          lastOrdersMs = started;
+          for (const line of await checkOrders().catch((err) => [`Error revisando \xF3rdenes: ${err.message}`])) opts.log?.(line);
+        }
+      }
+    } catch (err) {
+      opts.log?.(`Error en la vigilancia: ${err.message}`);
+    }
+    if (!stopped) timer = setTimeout(beat, Math.max(MIN_GAP_MS, heartbeatMs - (Date.now() - started)));
+  };
+  timer = setTimeout(beat, heartbeatMs);
+  const shadowMs = Math.max(1, config2.fastWatchIntervalSeconds) * 1e3;
+  let shadowTimer;
+  const shadowBeat = async () => {
+    const started = Date.now();
+    try {
+      if ((opts.canRun?.() ?? true) && shadowsRunning()) for (const line of await shadowTick()) opts.log?.(line);
+    } catch (err) {
+      opts.log?.(`Error en la vigilancia del gemelo: ${err.message}`);
+    }
+    if (!stopped) shadowTimer = setTimeout(shadowBeat, Math.max(MIN_GAP_MS, shadowMs - (Date.now() - started)));
+  };
+  shadowTimer = setTimeout(shadowBeat, shadowMs);
+  return () => {
+    stopped = true;
+    clearTimeout(timer);
+    clearTimeout(shadowTimer);
+  };
+}
+var WAIT_MIN_MINUTES = 0.25;
+var LONG_WAIT_MIN_MINUTES = 1;
+var FAST_WAIT_POLL_MS = 5e3;
+var LONG_WAIT_POLL_MS = 2e4;
+function waitTiming(requestedMinutes, fast) {
+  return fast ? { minutes: Math.max(WAIT_MIN_MINUTES, requestedMinutes), pollMs: FAST_WAIT_POLL_MS } : { minutes: Math.max(LONG_WAIT_MIN_MINUTES, requestedMinutes), pollMs: LONG_WAIT_POLL_MS };
+}
+
+// src/tools/index.ts
 var mid = (ctx) => {
   if (ctx.missionId === null) throw new Error("No hay ninguna misi\xF3n");
   return ctx.missionId;
 };
 var MAX_WAIT_MINUTES = 4.5;
+var DEFAULT_SIGNAL_USD = 50;
+var CLOCK_NOT_STARTED = "Arranca el reloj con start_session antes de operar";
+var WAIT_FRESH_TICK_MS = 4e3;
 var FIELD_GUIDE = asset("guia-del-terreno.md", "knowledge/guia-del-terreno.md");
 var reasoning = external_exports.string().describe("Por qu\xE9 haces esto. Queda en el diario.");
 var chainParam = external_exports.enum(CHAINS).describe("Cadena en la que operas o investigas");
@@ -42850,6 +44464,17 @@ Memoria: ${t.beliefs_applied.length ? `creencias #${t.beliefs_applied.join(", #"
 Riesgos comprobados: ${t.risks_checked}` : "") + (t.overrides?.length ? `
 Ignora a sabiendas: ${t.overrides.map((o) => `#${o.id} (${o.reason})`).join("; ")}` : "");
 var tradeMeta = (t) => ({ thesis: formatThesis(t), lessonsApplied: t.memory_note, beliefsApplied: t.beliefs_applied });
+var planThesis = external_exports.object({
+  plan_ref: external_exports.number().int().describe("Id del plan vigente (get_plan): la tesis, con su risks_checked, se toma del plan"),
+  overrides: thesis.shape.overrides
+}).describe("Solo en misiones r\xE1pidas (15 min o menos): en lugar de la tesis completa, el plan del cerebro");
+var thesisParam = external_exports.union([thesis, planThesis]);
+function fullThesis(t, ctx) {
+  if (!("plan_ref" in t)) return t;
+  const fromPlan = thesisFromPlan(t.plan_ref, mid(ctx));
+  const gone = fromPlan.beliefs_applied.length ? unknownBeliefs(fromPlan.beliefs_applied) : [];
+  return { ...fromPlan, beliefs_applied: fromPlan.beliefs_applied.filter((id) => !gone.includes(id)), ...t.overrides ? { overrides: t.overrides } : {} };
+}
 var lastReads = /* @__PURE__ */ new Map();
 function riskCheck(chain, token2, f) {
   const key = `${chain}:${token2.toLowerCase()}`;
@@ -43071,6 +44696,7 @@ var SIM_TOOLS = [
   tool({
     name: "scan_market",
     kind: "research",
+    role: MARKET_READERS,
     deliversNews: true,
     researchTarget: () => void 0,
     description: "Escaneo de mercado de una cadena en una sola llamada, con los datos clave de cada candidato (capitalizaci\xF3n, liquidez, variaci\xF3n de precio, compradores netos, antig\xFCedad). Los que aparecen en m\xE1s fuentes van primero. En Solana combina los tokens en tendencia de Jupiter (5 min y 1 h), los que est\xE1n en directo en pump.fun, los promocionados en DexScreener y las tendencias de GeckoTerminal.",
@@ -43089,6 +44715,7 @@ var SIM_TOOLS = [
   tool({
     name: "token_report",
     kind: "research",
+    role: MARKET_READERS,
     deliversNews: true,
     researchTarget: (i) => i.tokens?.length ? i.tokens : i.token,
     description: "Con tokens (hasta 5), una ficha breve de cada uno en una tabla, para comparar o releerlos de una vez: liquidez, mcap, variaci\xF3n, compradores, holders, impuestos, datos de riesgo, qu\xE9 dice tu memoria y qu\xE9 ha cambiado desde la \xFAltima lectura. Con token, la ficha completa en una sola llamada: actividad de compras y ventas (5 min, 1 h, 24 h), holders, liquidez, auditor\xEDa y riesgos, webs y redes sociales del proyecto. En Solana incluye las autoridades de mint y freeze, el % del creador y de los mayores holders, los riesgos de RugCheck y, si es de pump.fun, su descripci\xF3n, comentarios y m\xE1ximo hist\xF3rico. Siempre a\xF1ade `riskCheck`, solo datos: el creador (tokens lanzados y graduados, y los suyos que has operado t\xFA), lo que conserva, insiders, liquidez bloqueada, launchpad, honeypot y mcap/liquidez. Si repites token_report sobre el mismo token, `sinceLastRead` dice qu\xE9 ha cambiado desde la lectura anterior (liquidez, precio, compradores).",
@@ -43116,19 +44743,36 @@ var SIM_TOOLS = [
   tool({
     name: "strategy_fit",
     kind: "research",
-    role: "both",
+    role: AGENTS,
     researchTarget: () => void 0,
-    description: "Encaje de estrategias con la misi\xF3n: con lo que te falta para el objetivo y el tiempo que queda, la probabilidad estimada de llegar con cada estrategia (cripto grande al contado, futuros con apalancamiento, memecoins j\xF3venes) y su riesgo de ruina. Usa la volatilidad real de ahora (Binance) y tu propio historial. Sirve para elegir con l\xF3gica: no todas encajan con cada misi\xF3n.",
-    schema: external_exports.object({}),
-    run: async (_i, ctx) => {
-      const { strategyFit: strategyFit2 } = await Promise.resolve().then(() => (init_fit(), fit_exports));
-      return toText(await strategyFit2(mid(ctx)));
+    description: "Encaje de estrategias con la misi\xF3n: con lo que te falta para el objetivo y el tiempo que queda, la probabilidad estimada de llegar con cada estrategia (memecoins seg\xFAn las l\xEDneas base medidas y tu historial, cripto grande al contado, futuros: estos, llegar ANTES de liquidarse) y su riesgo de ruina. Trae la frontera: en cada plazo medido (5/10/15/30 min), el objetivo m\xE1s alto con P \u226510, \u226525 y \u226550 %. Con duration_minutes y target_pct (o market), solo la tabla medida para esa clase de misi\xF3n, sin mirar ninguna cartera (la P base de mercado \xD7 plazo \xD7 objetivo, la misma casilla en los otros mercados y lo medido con futuros): sirve antes de crear la misi\xF3n.",
+    schema: external_exports.object({
+      market: external_exports.string().regex(/^[a-z0-9_]+$/).optional().describe("Mercado de la clase: graduado (por defecto), momentum o lanzamiento son los medidos"),
+      duration_minutes: external_exports.number().positive().optional().describe("Plazo de la clase (por defecto, el de la misi\xF3n)"),
+      target_pct: external_exports.number().positive().optional().describe("Objetivo de la clase en % (por defecto, el de la misi\xF3n)")
+    }),
+    run: async (i, ctx) => {
+      const { strategyFit: strategyFit2, tableFit: tableFit2 } = await Promise.resolve().then(() => (init_fit(), fit_exports));
+      if (i.duration_minutes === void 0 !== (i.target_pct === void 0)) {
+        throw new Error("Indica duration_minutes y target_pct juntos (o ninguno, para los de la misi\xF3n)");
+      }
+      const m = ctx.missionId !== null ? getMission(ctx.missionId) : void 0;
+      if (!m || i.duration_minutes !== void 0 || i.market) {
+        return toText(
+          tableFit2({
+            market: i.market,
+            minutes: i.duration_minutes ?? (m ? missionDurationMinutes(m) : void 0),
+            targetPct: i.target_pct ?? (m ? (m.target_usd - m.initial_usd) / m.initial_usd * 100 : void 0)
+          })
+        );
+      }
+      return toText(await strategyFit2(m));
     }
   }),
   tool({
     name: "field_guide",
     kind: "research",
-    role: "both",
+    role: AGENTS,
     description: "Gu\xEDa del terreno: qu\xE9 mercados puede ejecutar el simulador y c\xF3mo los simula, c\xF3mo funciona pump.fun (curva, comisiones, graduaci\xF3n) y qu\xE9 APIs p\xFAblicas de datos responden, con sus URLs y campos. Hechos, no recomendaciones. Sin sections, el \xEDndice; con sections, el texto de esas secciones.",
     schema: external_exports.object({ sections: external_exports.array(external_exports.number().int().min(1).max(20)).optional().describe("N\xFAmeros de secci\xF3n que quieres leer") }),
     run: async ({ sections }) => fieldGuide(readFileSync3(FIELD_GUIDE, "utf8"), sections)
@@ -43147,6 +44791,7 @@ var SIM_TOOLS = [
   tool({
     name: "mission_status",
     kind: "misc",
+    role: MARKET_READERS,
     // Sin novedades del briefing: también la usa la sesión del usuario para ver si la misión sigue, y se las
     // quedaba (marcándolas como vistas) antes de que llegaran al trader. Le llegan con el resto de sus herramientas.
     description: "Estado de tu misi\xF3n: capital inicial, objetivo, valor actual de la cartera, cu\xE1nto falta y tiempo restante. La misi\xF3n termina sola al alcanzar el objetivo o al acabarse el plazo; entonces se cierran todas las posiciones a mercado.",
@@ -43157,13 +44802,17 @@ var SIM_TOOLS = [
     name: "wait",
     kind: "misc",
     deliversNews: true,
-    description: `Deja pasar tiempo real (1-${MAX_WAIT_MINUTES} minutos) vigilando tu cartera. Vuelve antes si la misi\xF3n termina, si pasa algo (se dispara una orden, llega una transferencia, un futuro se cierra) o si una posici\xF3n se mueve wake_on_move_pct o m\xE1s. Devuelve solo lo que ha cambiado: las novedades, c\xF3mo se han movido tus posiciones y el estado de la misi\xF3n (no hace falta pedir portfolio ni mission_status despu\xE9s). El tiempo tambi\xE9n pasa mientras investigas u operas.`,
+    description: `Deja pasar tiempo real (1-${MAX_WAIT_MINUTES} minutos; en una misi\xF3n de ${FAST_MISSION_MAX_MINUTES} min o menos, desde ${String(WAIT_MIN_MINUTES).replace(".", ",")}) vigilando tu cartera. Vuelve antes si la misi\xF3n termina, si pasa algo (se dispara una orden, llega una transferencia, un futuro se cierra) o si una posici\xF3n se mueve wake_on_move_pct o m\xE1s. Devuelve solo lo que ha cambiado: las novedades, c\xF3mo se han movido tus posiciones y el estado de la misi\xF3n (no hace falta pedir portfolio ni mission_status despu\xE9s). El tiempo tambi\xE9n pasa mientras investigas u operas.`,
     schema: external_exports.object({
-      minutes: external_exports.number().min(1).max(MAX_WAIT_MINUTES),
+      minutes: external_exports.number().min(WAIT_MIN_MINUTES).max(MAX_WAIT_MINUTES),
       wake_on_move_pct: external_exports.number().min(3).max(100).default(15).describe("Vuelve antes si una posici\xF3n sube o baja este % desde que empezaste a esperar")
     }),
-    run: async ({ minutes, wake_on_move_pct }, ctx) => {
+    run: async ({ minutes: requested, wake_on_move_pct }, ctx) => {
       const m = mid(ctx);
+      const row = getMission(m);
+      const timing = waitTiming(requested, !!row && isShortMission(row));
+      const pollMs = timing.pollMs;
+      let minutes = timing.minutes;
       const before = await missionStatus(m);
       const idle = "warning" in before && before.warning;
       if (idle) minutes = Math.min(minutes, 1);
@@ -43174,9 +44823,8 @@ var SIM_TOOLS = [
       let current = base2;
       let wake = "";
       while (Date.now() < until && !wake) {
-        await new Promise((r) => setTimeout(r, Math.min(2e4, until - Date.now())));
-        await checkOrders().catch(() => []);
-        await checkMission(m).catch(() => []);
+        await new Promise((r) => setTimeout(r, Math.min(pollMs, until - Date.now())));
+        await watchTick({ skipIfFresherMs: WAIT_FRESH_TICK_MS });
         if (getMission(m)?.status !== "active") wake = "la misi\xF3n ha terminado";
         else if (db.prepare("SELECT COUNT(*) AS n FROM journal WHERE mission_id = ? AND ts > ?").get(m, startIso).n) wake = "hay novedades";
         else {
@@ -43202,8 +44850,73 @@ ${toText(await missionStatus(m))}`
     }
   }),
   tool({
+    name: "wait_for_signal",
+    kind: "misc",
+    description: `Espera sin gastar turnos (hasta ${MAX_WAIT_MINUTES} min por llamada) a la se\xF1al de entrada del plan: mira su fuente de eventos cada 5 s y devuelve el primer token que pasa sus filtros mec\xE1nicos y tiene cotizaci\xF3n de compra y de venta en Jupiter, con la ida y vuelta calculada para tu capital (por defecto, liquidez de 1.000 $ o m\xE1s e ida y vuelta del 10 % o menos: fuera los pools vaciados; el plan puede cambiarlos), y que tu memoria no frenar\xEDa al entrar. Si la fuente no responde (p. ej. GeckoTerminal con 429), lo dice. Fuente graduado (por defecto): tokens de pump.fun reci\xE9n migrados a PumpSwap (pool de 2 min o menos), vistos en GeckoTerminal, que los publica con 10-70 s de retraso; shortlist: solo la lista corta del plan, cuando se grad\xFAa. Funciona antes de arrancar el reloj: esperar al evento es leg\xEDtimo, operar no. Sin candidato, vuelve a llamarla; con candidato, entra con enter_with_exits.`,
+    schema: external_exports.object({
+      plan_ref: external_exports.number().int().optional().describe("Plan cuyos filtros aplica (por defecto, el de la misi\xF3n o el vigente de su clase)"),
+      source: external_exports.enum(SIGNAL_SOURCES).optional().describe("Por defecto, la del plan (o graduado)"),
+      max_minutes: external_exports.number().min(0.25).max(MAX_WAIT_MINUTES).default(MAX_WAIT_MINUTES),
+      usd_amount: external_exports.number().positive().optional().describe("Con cu\xE1nto cotizar la ida y vuelta (por defecto, el importe del plan o todo tu efectivo en Solana)"),
+      exclude: external_exports.array(external_exports.string()).max(100).optional().describe("Tokens que ya has descartado: no los devuelve")
+    }),
+    run: async (i, ctx) => {
+      const m = ctx.missionId !== null ? getMission(ctx.missionId) : void 0;
+      const active2 = m?.status === "active" ? m : void 0;
+      const plan = i.plan_ref !== void 0 ? getPlan(i.plan_ref) : active2 ? planForMission(active2.id) : latestActivePlan();
+      if (i.plan_ref !== void 0 && !plan) throw new Error(`No existe el plan #${i.plan_ref}`);
+      const source = i.source ?? plan?.body.source ?? "graduado";
+      const shortlist = plan?.body.shortlist?.map((s) => s.mint) ?? [];
+      if (source === "shortlist" && !shortlist.length) throw new Error("El plan no tiene lista corta (shortlist): usa la fuente graduado");
+      const cash = active2 ? Math.max(0, ...getChain("solana").stables.map((s) => balance(active2.id, "solana", s.address))) : 0;
+      if (active2 && plan && !active2.started_at && plan.class === active2.class) markPlanForMission(active2.id, plan.id);
+      const usdAmount = i.usd_amount ?? (cash >= 1 ? Math.min(plan?.body.usd_amount ?? cash, cash) : plan?.body.usd_amount ?? DEFAULT_SIGNAL_USD);
+      const r = await waitForSignal({
+        source,
+        filters: plan?.body.filters ?? {},
+        shortlist,
+        usdAmount,
+        maxMinutes: i.max_minutes,
+        exclude: i.exclude,
+        shouldStop: () => active2 && getMission(active2.id)?.status !== "active" ? "la misi\xF3n ya no est\xE1 activa" : null,
+        // Un candidato que la memoria va a rechazar al entrar no sirve: enter_with_exits lo frenaría con el evento ya pasado.
+        accept: async (c) => {
+          const token2 = await getChain("solana").resolveToken(c.token).catch(() => null);
+          const blocking = token2 ? await memoryBlockers({ chain: "solana", token: token2, missionId: active2?.id, amountUsd: usdAmount }) : [];
+          return blocking.length ? `tu memoria lo desaconseja (creencia${blocking.length > 1 ? "s" : ""} #${blocking.map((b) => b.id).join(", #")})` : null;
+        }
+      });
+      const waited = { waitedSeconds: r.waitedSeconds, polls: r.polls };
+      const sourceNote = describeSourceErrors(r.sourceErrors);
+      if (!r.candidate) {
+        const rejected = Object.entries(r.rejected).map(([reason, n3]) => `${reason} \xD7${n3}`).join("; ");
+        const summary = (r.stopped ? `Espera cortada: ${r.stopped}. ` : `Sin se\xF1al en ${r.waitedSeconds} s (${r.polls} vueltas). `) + `Tokens frescos vistos: ${r.seen}${rejected ? `; descartes: ${rejected}` : ""}.` + (sourceNote ? ` ${sourceNote}` : "");
+        if (active2 && !active2.started_at) {
+          logJournal({
+            missionId: active2.id,
+            sessionId: ctx.sessionId,
+            kind: "signal",
+            summary: `wait_for_signal${plan ? ` (plan #${plan.id})` : ""}: ${summary}`,
+            details: { rejected: r.rejected, seen: r.seen, sourceErrors: r.sourceErrors }
+          });
+        }
+        return summary + (r.stopped ? "" : " Vuelve a llamar a wait_for_signal (con exclude si has descartado alguno a mano).");
+      }
+      logResearch(ctx.missionId, "wait_for_signal", r.candidate.token);
+      return toText({
+        signal: `${r.candidate.symbol ?? r.candidate.token} pasa los filtros${plan ? ` del plan #${plan.id}` : ""}`,
+        ...r.candidate,
+        ...waited,
+        ...sourceNote ? { sourceErrors: sourceNote } : {},
+        ...plan?.body.manual_filters ? { checkByHand: plan.body.manual_filters } : {},
+        next: `enter_with_exits con token ${r.candidate.token}${plan ? ` y thesis { plan_ref: ${plan.id} }` : ""}`
+      });
+    }
+  }),
+  tool({
     name: "http_get",
     kind: "research",
+    role: MARKET_READERS,
     researchTarget: (i) => i.url,
     description: "Hace una petici\xF3n HTTP GET y devuelve la respuesta en texto (\xFAtil para APIs p\xFAblicas en JSON).",
     schema: external_exports.object({ url: external_exports.string() }),
@@ -43220,6 +44933,7 @@ ${body.slice(0, 2e4)}${body.length > 2e4 ? `
   tool({
     name: "portfolio",
     kind: "misc",
+    role: MARKET_READERS,
     deliversNews: true,
     description: "Muestra tu cartera simulada y su valor en USD a precio de liquidaci\xF3n real ahora mismo, el PnL desde el inicio, la direcci\xF3n de tu monedero EVM y una referencia: lo que valdr\xEDa tu cartera inicial si no hubieras operado.",
     schema: external_exports.object({}),
@@ -43228,6 +44942,7 @@ ${body.slice(0, 2e4)}${body.length > 2e4 ? `
   tool({
     name: "quote_swap",
     kind: "research",
+    role: MARKET_READERS,
     researchTarget: (i) => i.output,
     description: `Cotiza un swap en una cadena sin ejecutarlo, con el agregador de DEX real de esa cadena (en Solana, Jupiter). input/output: direcci\xF3n del token, o un alias (${TOKEN_ALIASES}). amount en unidades del token de entrada.`,
     schema: external_exports.object({
@@ -43251,11 +44966,12 @@ ${body.slice(0, 2e4)}${body.length > 2e4 ? `
       amount: external_exports.number().positive().optional(),
       sell_all: external_exports.boolean().optional().describe("Vende todo tu saldo del token de entrada (en lugar de amount)"),
       slippage_bps: external_exports.number().int().min(1).max(5e3).default(50),
-      thesis
+      thesis: thesisParam
     }),
     run: async (i, ctx) => {
+      const t = fullThesis(i.thesis, ctx);
       if (isLiveMission(mid(ctx))) throw new Error("Esta misi\xF3n es REAL: usa execute_swap (opera con dinero de verdad). simulate_swap solo sirve en misiones simuladas.");
-      await checkBuyAgainstMemory({ chain: i.chain, output: i.output, overrides: i.thesis.overrides, risksChecked: i.thesis.risks_checked, missionId: mid(ctx), input: i.input, amount: i.amount });
+      await checkBuyAgainstMemory({ chain: i.chain, output: i.output, overrides: t.overrides, risksChecked: t.risks_checked, missionId: mid(ctx), input: i.input, amount: i.amount });
       return json2(
         await swap({
           missionId: mid(ctx),
@@ -43266,8 +44982,8 @@ ${body.slice(0, 2e4)}${body.length > 2e4 ? `
           amount: i.amount,
           sellAll: i.sell_all,
           slippageBps: i.slippage_bps,
-          reasoning: formatThesis(i.thesis),
-          meta: tradeMeta(i.thesis)
+          reasoning: formatThesis(t),
+          meta: tradeMeta(t)
         })
       );
     }
@@ -43284,11 +45000,12 @@ ${body.slice(0, 2e4)}${body.length > 2e4 ? `
       amount: external_exports.number().positive().optional(),
       sell_all: external_exports.boolean().optional().describe("Vende todo tu saldo del token de entrada (en lugar de amount)"),
       slippage_bps: external_exports.number().int().min(1).max(5e3).default(100),
-      thesis
+      thesis: thesisParam
     }),
     run: async (i, ctx) => {
+      const t = fullThesis(i.thesis, ctx);
       if (!isLiveMission(mid(ctx))) throw new Error("Esta misi\xF3n es simulada: usa simulate_swap. execute_swap solo existe en misiones reales.");
-      await checkBuyAgainstMemory({ chain: i.chain, output: i.output, overrides: i.thesis.overrides, risksChecked: i.thesis.risks_checked, missionId: mid(ctx), input: i.input, amount: i.amount });
+      await checkBuyAgainstMemory({ chain: i.chain, output: i.output, overrides: t.overrides, risksChecked: t.risks_checked, missionId: mid(ctx), input: i.input, amount: i.amount });
       return json2(
         await swap({
           missionId: mid(ctx),
@@ -43299,8 +45016,8 @@ ${body.slice(0, 2e4)}${body.length > 2e4 ? `
           amount: i.amount,
           sellAll: i.sell_all,
           slippageBps: i.slippage_bps,
-          reasoning: formatThesis(i.thesis),
-          meta: tradeMeta(i.thesis)
+          reasoning: formatThesis(t),
+          meta: tradeMeta(t)
         })
       );
     }
@@ -43310,8 +45027,11 @@ ${body.slice(0, 2e4)}${body.length > 2e4 ? `
     kind: "trade",
     journaled: true,
     description: "Ejecuta en simulaci\xF3n una orden de mercado en Binance spot contra el order book real (precio medio y slippage reales, comisi\xF3n taker incluida). BUY: amount = cantidad del activo quote a gastar. SELL: amount = cantidad del activo base a vender. symbol: par de Binance, p. ej. BTCUSDC.",
-    schema: external_exports.object({ symbol: external_exports.string(), side: external_exports.enum(["BUY", "SELL"]), amount: external_exports.number().positive(), thesis }),
-    run: async (i, ctx) => json2(await binanceMarketOrder({ missionId: mid(ctx), sessionId: ctx.sessionId, symbol: i.symbol, side: i.side, amount: i.amount, reasoning: formatThesis(i.thesis), meta: tradeMeta(i.thesis) }))
+    schema: external_exports.object({ symbol: external_exports.string(), side: external_exports.enum(["BUY", "SELL"]), amount: external_exports.number().positive(), thesis: thesisParam }),
+    run: async (i, ctx) => {
+      const t = fullThesis(i.thesis, ctx);
+      return json2(await binanceMarketOrder({ missionId: mid(ctx), sessionId: ctx.sessionId, symbol: i.symbol, side: i.side, amount: i.amount, reasoning: formatThesis(t), meta: tradeMeta(t) }));
+    }
   }),
   tool({
     name: "simulate_transfer",
@@ -43353,22 +45073,25 @@ ${body.slice(0, 2e4)}${body.length > 2e4 ? `
       token_out: external_exports.string().describe("Token que quieres recibir en la cadena de destino (direcci\xF3n o alias)"),
       amount: external_exports.number().positive(),
       slippage_bps: external_exports.number().int().min(1).max(5e3).default(50),
-      thesis
+      thesis: thesisParam
     }),
-    run: async (i, ctx) => json2(
-      await bridge({
-        missionId: mid(ctx),
-        sessionId: ctx.sessionId,
-        fromChain: i.from_chain,
-        toChain: i.to_chain,
-        tokenIn: i.token_in,
-        tokenOut: i.token_out,
-        amount: i.amount,
-        slippageBps: i.slippage_bps,
-        reasoning: formatThesis(i.thesis),
-        meta: tradeMeta(i.thesis)
-      })
-    )
+    run: async (i, ctx) => {
+      const t = fullThesis(i.thesis, ctx);
+      return json2(
+        await bridge({
+          missionId: mid(ctx),
+          sessionId: ctx.sessionId,
+          fromChain: i.from_chain,
+          toChain: i.to_chain,
+          tokenIn: i.token_in,
+          tokenOut: i.token_out,
+          amount: i.amount,
+          slippageBps: i.slippage_bps,
+          reasoning: formatThesis(t),
+          meta: tradeMeta(t)
+        })
+      );
+    }
   }),
   tool({
     name: "execute_bridge",
@@ -43382,9 +45105,10 @@ ${body.slice(0, 2e4)}${body.length > 2e4 ? `
       token_out: external_exports.string().describe("Estable o nativo que quieres recibir en la cadena de destino"),
       amount: external_exports.number().positive(),
       slippage_bps: external_exports.number().int().min(1).max(5e3).default(50),
-      thesis
+      thesis: thesisParam
     }),
     run: async (i, ctx) => {
+      const t = fullThesis(i.thesis, ctx);
       if (!isLiveMission(mid(ctx))) throw new Error("Esta misi\xF3n es simulada: usa simulate_bridge. execute_bridge solo existe en misiones reales.");
       const { liveBridge: liveBridge2 } = await Promise.resolve().then(() => (init_bridge(), bridge_exports));
       return json2(
@@ -43397,7 +45121,7 @@ ${body.slice(0, 2e4)}${body.length > 2e4 ? `
           tokenOut: i.token_out,
           amount: i.amount,
           slippageBps: i.slippage_bps,
-          reasoning: formatThesis(i.thesis)
+          reasoning: formatThesis(t)
         })
       );
     }
@@ -43415,9 +45139,10 @@ ${body.slice(0, 2e4)}${body.length > 2e4 ? `
       from_chain: chainParam.optional().describe("De qu\xE9 cadena sale el margen (por defecto, la que m\xE1s efectivo tenga)"),
       take_profit: external_exports.number().positive().optional(),
       stop_loss: external_exports.number().positive().optional(),
-      thesis
+      thesis: thesisParam
     }),
     run: async (i, ctx) => {
+      const t = fullThesis(i.thesis, ctx);
       const { openPerp: openPerp2 } = await Promise.resolve().then(() => (init_perps(), perps_exports));
       return json2(
         await openPerp2({
@@ -43430,8 +45155,8 @@ ${body.slice(0, 2e4)}${body.length > 2e4 ? `
           fromChain: i.from_chain,
           takeProfit: i.take_profit,
           stopLoss: i.stop_loss,
-          reasoning: formatThesis(i.thesis),
-          meta: tradeMeta(i.thesis)
+          reasoning: formatThesis(t),
+          meta: tradeMeta(t)
         })
       );
     }
@@ -43467,7 +45192,7 @@ ${body.slice(0, 2e4)}${body.length > 2e4 ? `
     name: "place_swap_trigger_order",
     kind: "trade",
     journaled: true,
-    description: 'Deja una orden condicional en una cadena: cuando el precio en USD de trigger_asset cruce trigger_price (above = sube hasta o por encima, below = baja hasta o por debajo), se ejecuta el swap indicado a mercado con la cotizaci\xF3n real de ese instante. Si la orden vende trigger_asset (toma de beneficios o stop), el precio que se vigila es el de venderlo de verdad: la cotizaci\xF3n de vender esa cantidad a un estable, ya con el impacto de precio (currentPrice te lo da as\xED al crearla). Una toma de beneficios (above, vendiendo a un estable) es una orden l\xEDmite: se llena exactamente a ese precio (como en Jupiter, aunque el mercado est\xE9 por encima); si al ir a vender el precio ya ha bajado, no se llena y sigue esperando. Un stop (below) vende a mercado, al precio que haya. Funciona aunque no est\xE9s en sesi\xF3n. Se comprueba cada 15 s, as\xED que un pico de pocos segundos puede no dispararla. El saldo no se bloquea: si al dispararse no hay saldo suficiente, la orden falla. Con sell_all vende todo el saldo que tengas en ese momento. Con condition: time se ejecuta dentro de in_minutes pase lo que pase con el precio (sin trigger_asset ni trigger_price): sirve para cumplir tu plan ("si a los 3 min no ha saltado la toma de beneficio, vendo") aunque no est\xE9s pendiente. Cancela la que sobre cuando se ejecute la otra.',
+    description: 'Deja una orden condicional en una cadena: cuando el precio en USD de trigger_asset cruce trigger_price (above = sube hasta o por encima, below = baja hasta o por debajo), se ejecuta el swap indicado a mercado con la cotizaci\xF3n real de ese instante. Si la orden vende trigger_asset (toma de beneficios o stop), el precio que se vigila es el de venderlo de verdad: la cotizaci\xF3n de vender esa cantidad a un estable, ya con el impacto de precio (currentPrice te lo da as\xED al crearla). Una toma de beneficios (above, vendiendo a un estable) es una orden l\xEDmite: se llena exactamente a ese precio (como en Jupiter, aunque el mercado est\xE9 por encima); si al ir a vender el precio ya ha bajado, no se llena y sigue esperando. Un stop (below) vende a mercado, al precio que haya. Funciona aunque no est\xE9s en sesi\xF3n. Se comprueba cada 15 s (cada 5 s en una misi\xF3n r\xE1pida), as\xED que un pico de pocos segundos puede no dispararla. El saldo no se bloquea: si al dispararse no hay saldo suficiente, la orden falla. Con sell_all vende todo el saldo que tengas en ese momento. Con condition: time se ejecuta dentro de in_minutes pase lo que pase con el precio (sin trigger_asset ni trigger_price): sirve para cumplir tu plan ("si a los 3 min no ha saltado la toma de beneficio, vendo") aunque no est\xE9s pendiente. Cancela la que sobre cuando se ejecute la otra.',
     schema: external_exports.object({
       chain: chainParam,
       trigger_asset: external_exports.string().optional().describe(`Direcci\xF3n del token cuyo precio se vigila, o un alias (${TOKEN_ALIASES}). No en las de tiempo`),
@@ -43480,11 +45205,12 @@ ${body.slice(0, 2e4)}${body.length > 2e4 ? `
       sell_all: external_exports.boolean().optional().describe("Vender todo el saldo del token de entrada al dispararse (en lugar de amount)"),
       slippage_bps: external_exports.number().int().min(1).max(5e3).default(100),
       expires_hours: external_exports.number().positive().optional(),
-      thesis
+      thesis: thesisParam
     }),
     run: async (i, ctx) => {
+      const t = fullThesis(i.thesis, ctx);
       if (!i.sell_all && i.amount === void 0) throw new Error("Indica amount o sell_all");
-      await checkBuyAgainstMemory({ chain: i.chain, output: i.output, overrides: i.thesis.overrides, risksChecked: i.thesis.risks_checked, missionId: mid(ctx), input: i.input, amount: i.amount });
+      await checkBuyAgainstMemory({ chain: i.chain, output: i.output, overrides: t.overrides, risksChecked: t.risks_checked, missionId: mid(ctx), input: i.input, amount: i.amount });
       return json2(
         await placeOrder({
           missionId: mid(ctx),
@@ -43496,9 +45222,63 @@ ${body.slice(0, 2e4)}${body.length > 2e4 ? `
           inMinutes: i.in_minutes,
           action: { input: i.input, output: i.output, amount: i.amount ?? 0, sellAll: i.sell_all || void 0, slippageBps: i.slippage_bps },
           expiresHours: i.expires_hours,
-          reasoning: formatThesis(i.thesis)
+          reasoning: formatThesis(t)
         })
       );
+    }
+  }),
+  tool({
+    name: "enter_with_exits",
+    kind: "trade",
+    startsClock: true,
+    journaled: true,
+    description: "Entrada de una misi\xF3n r\xE1pida en UNA llamada: si el reloj no ha arrancado, lo arranca (igual que start_session), compra el token con todo tu efectivo de la cadena (el nativo se queda para la red) o con usd_amount, y deja puesta la toma de beneficio: una orden l\xEDmite que vende todo el token a un precio fijo. Ese precio sale de tp_ratio (\xD7 el precio de compra), del plan citado o, si no, del objetivo de la misi\xF3n (el que la deja cumplida neta de costes; tambi\xE9n con tp_at_target, p. ej. en una reentrada). Devuelve la compra, la orden y el plazo del reloj. Antes de arrancar el reloj lo comprueba todo (tesis o plan, efectivo, token, una cotizaci\xF3n de ida y vuelta \u2014m\xE1s del 10 % es un pool vaciado\u2014 y tu memoria): si algo falla, no compra ni arranca el reloj. Con thesis { plan_ref } la tesis es la del plan. Solo en misiones simuladas.",
+    schema: external_exports.object({
+      chain: chainParam.default("solana"),
+      token: external_exports.string().describe("Direcci\xF3n del token (la que da wait_for_signal)"),
+      usd_amount: external_exports.number().positive().optional().describe("Cu\xE1nto gastar (por defecto, el importe del plan o todo el efectivo de la cadena)"),
+      tp_ratio: external_exports.number().min(1.01).max(20).optional().describe("Toma de beneficio = precio de compra \xD7 tp_ratio (por defecto, la del plan o la del objetivo)"),
+      tp_at_target: external_exports.boolean().optional().describe("Toma de beneficio en el precio que deja el objetivo cumplido, aunque el plan tenga tp_ratio"),
+      slippage_bps: external_exports.number().int().min(1).max(5e3).default(300),
+      thesis: thesisParam
+    }),
+    // Todo lo que puede fallar sin operar se comprueba antes de arrancar el reloj (runTool): si falla, el reloj sigue
+    // parado y el executor espera al siguiente candidato gratis.
+    preflight: async (i, ctx) => {
+      const m = mid(ctx);
+      if (isLiveMission(m)) throw new Error("enter_with_exits solo existe en misiones simuladas");
+      const t = fullThesis(i.thesis, ctx);
+      const plan = "plan_ref" in i.thesis ? getPlan(i.thesis.plan_ref) : void 0;
+      const entry = await prepareEntry({
+        missionId: m,
+        chain: i.chain,
+        token: i.token,
+        usdAmount: i.usd_amount,
+        planUsdAmount: plan?.body.usd_amount,
+        slippageBps: i.slippage_bps,
+        // El plan puede subir el tope mecánico de la ida y vuelta, no bajarlo aquí: esto es la red contra un pool vaciado.
+        maxRoundTripCostPct: Math.max(DEFAULT_MAX_ROUND_TRIP_COST_PCT, plan?.body.filters.max_round_trip_cost_pct ?? 0)
+      });
+      await checkBuyAgainstMemory({ chain: i.chain, output: entry.token.address, overrides: t.overrides, risksChecked: t.risks_checked, missionId: m, input: entry.stable.address, amount: entry.amount });
+      return { thesis: t, plan, entry };
+    },
+    run: async (i, ctx, { thesis: t, plan, entry }) => {
+      const m = mid(ctx);
+      const tpRatio = i.tp_ratio ?? (i.tp_at_target ? void 0 : plan?.body.tp_ratio);
+      const out = await enterWithExits({
+        missionId: m,
+        sessionId: ctx.sessionId,
+        chain: i.chain,
+        token: entry.token.address,
+        usdAmount: entry.amount,
+        tpRatio,
+        tpRatioFrom: i.tp_ratio !== void 0 ? "par\xE1metro" : plan ? `plan #${plan.id}` : void 0,
+        slippageBps: i.slippage_bps,
+        reasoning: formatThesis(t),
+        meta: tradeMeta(t)
+      });
+      if (plan && getMission(m)?.plan_id !== plan.id) attachPlan(m, plan);
+      return json2({ ...out, roundTripAtEntry: { quotedBackUsd: Number(entry.roundTrip.backUsd.toFixed(2)), costPct: entry.roundTrip.costPct } });
     }
   }),
   tool({
@@ -43515,22 +45295,25 @@ ${body.slice(0, 2e4)}${body.length > 2e4 ? `
       side: external_exports.enum(["BUY", "SELL"]),
       amount: external_exports.number().positive().describe("BUY: cantidad de quote a gastar. SELL: cantidad base a vender"),
       expires_hours: external_exports.number().positive().optional(),
-      thesis
+      thesis: thesisParam
     }),
-    run: async (i, ctx) => json2(
-      await placeOrder({
-        missionId: mid(ctx),
-        sessionId: ctx.sessionId,
-        venue: "binance",
-        triggerAsset: i.trigger_symbol,
-        condition: i.condition,
-        triggerPrice: i.trigger_price,
-        inMinutes: i.in_minutes,
-        action: { symbol: i.symbol, side: i.side, amount: i.amount },
-        expiresHours: i.expires_hours,
-        reasoning: formatThesis(i.thesis)
-      })
-    )
+    run: async (i, ctx) => {
+      const t = fullThesis(i.thesis, ctx);
+      return json2(
+        await placeOrder({
+          missionId: mid(ctx),
+          sessionId: ctx.sessionId,
+          venue: "binance",
+          triggerAsset: i.trigger_symbol,
+          condition: i.condition,
+          triggerPrice: i.trigger_price,
+          inMinutes: i.in_minutes,
+          action: { symbol: i.symbol, side: i.side, amount: i.amount },
+          expiresHours: i.expires_hours,
+          reasoning: formatThesis(t)
+        })
+      );
+    }
   }),
   tool({
     name: "list_orders",
@@ -43584,6 +45367,7 @@ ${body.slice(0, 2e4)}${body.length > 2e4 ? `
   tool({
     name: "journal_history",
     kind: "memory",
+    role: MARKET_READERS,
     researchTarget: () => void 0,
     description: "Devuelve las \xFAltimas entradas de tu diario de operaciones. Por defecto, de la misi\xF3n actual; con mission_id, las de una misi\xF3n anterior (\xFAtil para analizarla y sacar lecciones).",
     schema: external_exports.object({ limit: external_exports.number().int().min(1).max(200).default(30), mission_id: external_exports.number().int().optional() }),
@@ -43593,11 +45377,108 @@ ${body.slice(0, 2e4)}${body.length > 2e4 ? `
       return toText(db.prepare("SELECT ts, kind, summary, reasoning, details FROM journal WHERE mission_id = ? ORDER BY id DESC LIMIT ?").all(target, limit));
     }
   }),
+  // ─── Plan del cerebro (misiones rápidas): lo escribe el planner antes del reloj; lo leen todos ─
+  tool({
+    name: "write_plan",
+    kind: "memory",
+    role: "planner",
+    journaled: true,
+    description: `Guarda el plan de una clase de misi\xF3n (plazo \xD7 objetivo \xD7 mercado, p. ej. graduado-10m-+25%) y lo deja vigente: las reglas con las que el executor opera las pr\xF3ximas ${PLAN_BLOCK_SIZE} misiones de esa clase. Son reglas, no una lista de tokens (caducan en minutos): el evento, los filtros mec\xE1nicos (wait_for_signal los comprueba sin LLM) y los que hay que mirar a mano, el tama\xF1o, el ratio de la toma de beneficio calculado con quote_swap para el capital, la regla de reentrada, risks_checked ya validado, la P que esperas y la de la l\xEDnea base, y opcionalmente una lista corta de curvas de pump.fun llenas al 90 % o m\xE1s. Queda fijo durante su bloque: si la clase ya tiene un plan que no lo ha terminado, se rechaza salvo que des replace_reason. Sin duration_minutes ni target_pct, la clase es la de la misi\xF3n activa. Solo misiones r\xE1pidas (simuladas de ${FAST_MISSION_MAX_MINUTES} min o menos), y el mercado de la clase es el de la fuente: graduado.`,
+    schema: external_exports.object({
+      duration_minutes: external_exports.number().positive().optional().describe("Plazo de la clase (por defecto, el de la misi\xF3n activa)"),
+      target_pct: external_exports.number().positive().optional().describe("Objetivo de la clase en % sobre el capital (por defecto, el de la misi\xF3n activa)"),
+      market: external_exports.string().regex(/^[a-z0-9_]+$/).optional().describe(
+        `Mercado de la clase: el de los eventos que da la fuente (${DEFAULT_FAST_MARKET}, con graduado y con shortlist). Otro mercado se rechaza: wait_for_signal no sabe esperar sus eventos, y la misi\xF3n se comparar\xEDa con la l\xEDnea base de otro mercado y sin gemelo`
+      ),
+      event: external_exports.string().min(1).describe("El evento que dispara la entrada, p. ej. 'token de pump.fun migrado a PumpSwap hace 2 min o menos'"),
+      source: external_exports.enum(SIGNAL_SOURCES).default("graduado").describe("Fuente de wait_for_signal: graduado o shortlist (solo la lista corta)"),
+      filters: external_exports.object({
+        max_pool_age_minutes: external_exports.number().positive().max(60).optional().describe("Edad m\xE1xima del pool o de la graduaci\xF3n (por defecto, 2)"),
+        launchpads: external_exports.array(external_exports.string()).optional().describe('Launchpads de origen seg\xFAn Jupiter (por defecto en graduado, ["pump.fun"]; [] = cualquiera)'),
+        min_liquidity_usd: external_exports.number().min(0).optional(),
+        max_liquidity_usd: external_exports.number().positive().optional(),
+        min_fdv_usd: external_exports.number().min(0).optional(),
+        max_fdv_usd: external_exports.number().positive().optional(),
+        min_buys_5m: external_exports.number().int().min(0).optional(),
+        min_buyers_5m: external_exports.number().int().min(0).optional(),
+        min_buy_sell_ratio_5m: external_exports.number().min(0).optional(),
+        min_volume_5m_usd: external_exports.number().min(0).optional(),
+        min_price_change_5m_pct: external_exports.number().optional(),
+        max_price_change_5m_pct: external_exports.number().optional(),
+        max_round_trip_cost_pct: external_exports.number().min(0).max(100).optional().describe("Coste m\xE1ximo de comprar y vender al momento con el capital")
+      }).default({}).describe("Filtros mec\xE1nicos propios (los datos del pool de GeckoTerminal y las cotizaciones de Jupiter)"),
+      manual_filters: external_exports.string().optional().describe("Filtros propios que no se pueden comprobar sin mirar: el executor los revisa antes de entrar"),
+      sizing: external_exports.string().min(1).default("todo el capital menos el gas"),
+      usd_amount: external_exports.number().positive().optional().describe("Importe fijo de cada entrada (por defecto, todo el efectivo de la cadena)"),
+      tp_ratio: external_exports.number().min(1.01).max(20).optional().describe("Toma de beneficio = precio de compra \xD7 tp_ratio (sin \xE9l, en el precio que da el objetivo neto)"),
+      reentry: external_exports.string().min(1).describe("Regla de reentrada (o por qu\xE9 no la hay)"),
+      reentry_allowed: external_exports.boolean(),
+      risks_checked: external_exports.string().min(15).describe("Lo comprobado en contra (creencias negativas, riskCheck): vale para cada compra que cite el plan"),
+      why: external_exports.string().min(1),
+      evidence: external_exports.string().min(1).describe("Datos que lo respaldan (tus misiones, las tasas medidas)"),
+      sources: external_exports.array(external_exports.string().min(1)).min(1),
+      beliefs_applied: external_exports.array(external_exports.number().int()).optional(),
+      memory_note: external_exports.string().optional(),
+      predicted_p: external_exports.number().min(0).max(1).describe("P de llegar al objetivo con este plan (0-1)"),
+      baseline_p: external_exports.number().min(0).max(1).optional().describe("P de la l\xEDnea base: la regla mec\xE1nica sin tus filtros (0-1). Por defecto, la de la tabla medida para la clase (strategy_fit)"),
+      shortlist: external_exports.array(external_exports.object({ mint: external_exports.string().min(32), note: external_exports.string().optional() })).max(10).optional().describe("Curvas de pump.fun llenas al 90 % o m\xE1s (las siguientes en graduarse)"),
+      replace_reason: external_exports.string().min(20).optional().describe("Solo para sustituir un plan que no ha terminado su bloque: por qu\xE9 no sirve")
+    }),
+    run: async (i, ctx) => {
+      const { duration_minutes, target_pct, market: asked, predicted_p, baseline_p, replace_reason, ...body } = i;
+      if (body.source === "shortlist" && !body.shortlist?.length) throw new Error("Con source: shortlist, el plan necesita la lista corta (shortlist)");
+      const market = SOURCE_MARKET[body.source];
+      if (asked && asked !== market) {
+        throw new Error(
+          `El mercado de un plan es el de su fuente: con source ${body.source}, wait_for_signal espera tokens reci\xE9n graduados (${market}). Para ${asked} no hay fuente de eventos mec\xE1nica: su casilla de strategy_fit sirve de referencia, pero no se puede planificar`
+        );
+      }
+      const unknown2 = body.beliefs_applied?.length ? unknownBeliefs(body.beliefs_applied) : [];
+      if (unknown2.length) throw new Error(`Las creencias #${unknown2.join(", #")} no existen o ya no est\xE1n activas`);
+      let cls;
+      if (duration_minutes !== void 0 && target_pct !== void 0) {
+        if (!isFastMinutes(duration_minutes)) throw new Error(`Los planes son de misiones r\xE1pidas: ${FAST_MISSION_MAX_MINUTES} min o menos`);
+        cls = missionClass({ durationMinutes: duration_minutes, initialUsd: 100, targetUsd: 100 * (1 + target_pct / 100), market });
+      } else if (duration_minutes === void 0 && target_pct === void 0) {
+        const m = getActiveMission();
+        if (!m) throw new Error("No hay misi\xF3n activa: indica duration_minutes y target_pct de la clase");
+        if (!isFastMission(m)) throw new Error("La misi\xF3n activa no es r\xE1pida (simulada de 15 min o menos): la opera el trader, sin plan");
+        cls = missionClass({ durationMinutes: missionDurationMinutes(m), initialUsd: m.initial_usd, targetUsd: m.target_usd, market });
+      } else {
+        throw new Error("Indica duration_minutes y target_pct juntos (o ninguno, para usar los de la misi\xF3n activa)");
+      }
+      const baselineP2 = baseline_p ?? baselineForClass(cls)?.p;
+      if (baselineP2 === void 0) throw new Error(`Indica baseline_p: la tabla medida no tiene el mercado de ${cls} (strategy_fit dice cu\xE1les tiene)`);
+      const r = writePlan({ cls, body, predictedP: predicted_p, baselineP: baselineP2, missionId: ctx.missionId, sessionId: ctx.sessionId, replaceReason: replace_reason });
+      return `Plan #${r.id} vigente para ${cls}${r.replaced ? ` (sustituye al #${r.replaced})` : ""}: queda fijo durante las pr\xF3ximas ${PLAN_BLOCK_SIZE} misiones de esta clase. El executor lo lee con get_plan y lo cita con plan_ref.`;
+    }
+  }),
+  tool({
+    name: "get_plan",
+    kind: "memory",
+    role: AGENTS,
+    description: "El plan del cerebro: las reglas de las misiones r\xE1pidas de una clase (evento, filtros, tama\xF1o, toma de beneficio, reentrada, P esperada y de la l\xEDnea base, lista corta) y c\xF3mo va su bloque. Por defecto, el de la misi\xF3n activa (o el vigente de su clase); con mission_class, el vigente de esa clase; con plan_id, ese. Sin misi\xF3n activa, el vigente m\xE1s reciente.",
+    schema: external_exports.object({
+      plan_id: external_exports.number().int().optional(),
+      mission_class: external_exports.string().optional().describe("Clase de misi\xF3n, p. ej. graduado-10m-+25%")
+    }),
+    run: async ({ plan_id, mission_class }, ctx) => {
+      const active2 = ctx.missionId !== null && getMission(ctx.missionId)?.status === "active";
+      const plan = plan_id !== void 0 ? getPlan(plan_id) : mission_class ? activePlan(mission_class) : active2 ? planForMission(ctx.missionId) : latestActivePlan();
+      if (!plan) {
+        if (plan_id !== void 0) throw new Error(`No existe el plan #${plan_id}`);
+        const cls = mission_class ?? (active2 ? getMission(ctx.missionId)?.class : void 0);
+        return `No hay plan vigente${cls ? ` para ${cls}` : ""}: lo escribe el planner con write_plan.`;
+      }
+      const current = plan.active ? void 0 : activePlan(plan.class);
+      return toText({ ...describePlan(plan), ...current ? { note: `Ya no est\xE1 vigente: el de ${plan.class} es el #${current.id}` } : {} });
+    }
+  }),
   // ─── Memoria entre misiones (el agente que opera la lee; la escribe el revisor) ─
   tool({
     name: "recall_memory",
     kind: "memory",
-    role: "trader",
+    role: MARKET_READERS,
     researchTarget: () => void 0,
     description: "Tu memoria entre misiones, ordenada por parecido con la misi\xF3n actual. La escribe un agente revisor a partir de lo que pas\xF3 en tus misiones. Incluye: howtos (c\xF3mo se hace algo y qu\xE9 errores evitar), creencias sobre el mercado con su evidencia real (calculada por el simulador con tus operaciones), el historial de misiones con lo que conviene hacer la pr\xF3xima vez, estad\xEDsticas de tus operaciones, los errores que se repiten y qu\xE9 APIs han respondido bien. Por defecto, un resumen: howtos por t\xEDtulo y las creencias m\xE1s relevantes. Con howto_ids, el texto de esos howtos; con detail: completo, todo (largo).",
     schema: external_exports.object({
@@ -43612,7 +45493,7 @@ ${body.slice(0, 2e4)}${body.length > 2e4 ? `
   tool({
     name: "trade_history",
     kind: "memory",
-    role: "trader",
+    role: MARKET_READERS,
     researchTarget: () => void 0,
     description: "Tus posiciones: coste, resultado real, tiempo mantenida, motivo de cierre, datos del token al entrar (antig\xFCedad, liquidez, variaci\xF3n, holders, riesgos), cu\xE1nto hab\xEDas investigado antes, tu tesis y las creencias que aplicaste. Por defecto, las de la misi\xF3n actual; con mission_id, las de otra; con all_missions: true, las \xFAltimas de todas (largo).",
     schema: external_exports.object({
@@ -43634,7 +45515,7 @@ ${body.slice(0, 2e4)}${body.length > 2e4 ? `
   tool({
     name: "report_observation",
     kind: "memory",
-    role: "trader",
+    role: OPERATORS,
     journaled: true,
     description: "Deja una observaci\xF3n para el revisor, que decidir\xE1 si pasa a tu memoria: algo que has descubierto sobre c\xF3mo se hace algo, un error y c\xF3mo lo has resuelto, un patr\xF3n del mercado que te ha llamado la atenci\xF3n\u2026 \xDAsala en cuanto lo veas, no al final.",
     schema: external_exports.object({
@@ -43646,7 +45527,7 @@ ${body.slice(0, 2e4)}${body.length > 2e4 ? `
   tool({
     name: "request_capability",
     kind: "memory",
-    role: "both",
+    role: AGENTS,
     journaled: true,
     description: "Anota una capacidad que no tienes y que necesitar\xEDas para intentar algo: una cuenta (X, Instagram, Telegram, un exchange\u2026), una herramienta (navegador con sesi\xF3n iniciada, un bot, una API de pago\u2026), unos datos o un mercado que el simulador no permite. El usuario revisa estas peticiones y puede d\xE1rtelas en el futuro. Explica qu\xE9 har\xEDas exactamente con ella. No sustituye a record_hypothetical_action: esa anota lo que har\xEDas; esta, lo que te falta para poder hacerlo.",
     schema: external_exports.object({
@@ -43664,7 +45545,7 @@ ${body.slice(0, 2e4)}${body.length > 2e4 ? `
   tool({
     name: "exploration_map",
     kind: "memory",
-    role: "both",
+    role: AGENTS,
     description: 'Mapa de lo que has probado: operaciones cerradas por cadena, por edad y liquidez del token al entrar (contado) y por moneda (futuros), con ganadas, perdidas y resultado medio. Las casillas "sin probar" son zonas en las que nunca has operado.',
     schema: external_exports.object({}),
     run: async () => json2(explorationMap())
@@ -43673,7 +45554,7 @@ ${body.slice(0, 2e4)}${body.length > 2e4 ? `
     name: "review_queue",
     kind: "memory",
     role: "reviewer",
-    description: "Lo que tienes pendiente como revisor: misiones terminadas sin retrospectiva, la misi\xF3n activa (actividad desde tu \xFAltima revisi\xF3n, cada cu\xE1nto conviene revisarla y si tiene briefing), observaciones del agente sin procesar, errores repetidos sin howto y creencias sin condici\xF3n.",
+    description: "Lo que tienes pendiente como revisor: misiones terminadas sin retrospectiva, la misi\xF3n activa (actividad desde tu \xFAltima revisi\xF3n, cada cu\xE1nto conviene revisarla y si tiene briefing), observaciones del agente sin procesar, errores repetidos sin howto y creencias sin condici\xF3n. missionClasses: por clase de misi\xF3n, aciertos con su IC de Wilson, la suma de las P predichas frente a los aciertos (calibraci\xF3n), la l\xEDnea base, los aciertos del gemelo mec\xE1nico y la comparaci\xF3n misi\xF3n a misi\xF3n con \xE9l.",
     schema: external_exports.object({}),
     run: async () => toText(reviewQueue())
   }),
@@ -43681,7 +45562,7 @@ ${body.slice(0, 2e4)}${body.length > 2e4 ? `
     name: "mission_review_data",
     kind: "memory",
     role: "reviewer",
-    description: "Todo lo ocurrido en una misi\xF3n en una sola llamada: misi\xF3n, estad\xEDsticas, posiciones (con tesis, creencias aplicadas, datos de entrada y resultado), diario, registro de trabajo del agente, notas, observaciones, errores, briefing y tus revisiones anteriores. Con since (fecha ISO) solo lo posterior a esa fecha (\xFAtil a mitad de misi\xF3n). Sin since incluye `counterfactuals`: para cada operaci\xF3n cerrada, con el precio real minuto a minuto, cu\xE1nto lleg\xF3 a subir mientras la ten\xEDa y qu\xE9 habr\xEDa dado mantenerla 15 o 30 min m\xE1s. Sirve para distinguir una mala entrada de una mala salida.",
+    description: "Todo lo ocurrido en una misi\xF3n en una sola llamada: misi\xF3n, estad\xEDsticas, posiciones (con tesis, creencias aplicadas, datos de entrada y resultado), diario, registro de trabajo del agente, notas, observaciones, errores, briefing y tus revisiones anteriores. Con since (fecha ISO) solo lo posterior a esa fecha (\xFAtil a mitad de misi\xF3n). Sin since incluye `counterfactuals`: para cada operaci\xF3n cerrada, con el precio real minuto a minuto, cu\xE1nto lleg\xF3 a subir mientras la ten\xEDa y qu\xE9 habr\xEDa dado mantenerla 15 o 30 min m\xE1s (en una misi\xF3n r\xE1pida, 1, 3 y 5). Sirve para distinguir una mala entrada de una mala salida. En una misi\xF3n r\xE1pida, twin es su gemelo mec\xE1nico (los eventos siguientes con la regla sin inteligencia, en la misma franja) y missionClass, c\xF3mo va su clase.",
     schema: external_exports.object({ mission_id: external_exports.number().int(), since: external_exports.string().optional() }),
     run: async ({ mission_id, since }) => {
       const data = missionReviewData(mission_id, since);
@@ -43965,22 +45846,44 @@ ${steps}` : ""),
   const parsed = def.schema.safeParse(rawInput);
   if (!parsed.success) return fail(`Entrada no v\xE1lida: ${parsed.error.message}`);
   const trading = def.kind === "trade";
+  const notActive = async () => ({
+    content: `Error: no hay ninguna misi\xF3n activa. ${(await missionStatus(ctx.missionId ?? void 0)).message ?? ""}`,
+    isError: true
+  });
   const current = ctx.missionId !== null ? getMission(ctx.missionId) : void 0;
-  if (trading && current?.status !== "active") {
-    return { content: `Error: no hay ninguna misi\xF3n activa. ${(await missionStatus(ctx.missionId ?? void 0)).message ?? ""}`, isError: true };
-  }
+  if (trading && current?.status !== "active") return notActive();
+  const clockStopped = trading && !!current && !current.started_at;
+  if (clockStopped && !def.startsClock) return { content: `Error: ${CLOCK_NOT_STARTED}`, isError: true };
   const beliefs = parsed.data.thesis?.beliefs_applied;
   if (beliefs?.length) {
     const unknown2 = unknownBeliefs(beliefs);
     if (unknown2.length) return fail(`Las creencias #${unknown2.join(", #")} no existen o ya no est\xE1n activas. Activas: ${activeBeliefIds().map((id) => `#${id}`).join(", ") || "ninguna"}`);
   }
   if (trading || def.deliversNews) await settleTransfers({ missionId: ctx.missionId ?? void 0 }).catch(() => []);
+  const rejected = (message) => {
+    if (trading) logJournal({ missionId: ctx.missionId, sessionId: ctx.sessionId, kind: "rejected", summary: `${name} rechazada: ${message}`, details: rawInput });
+    return fail(message);
+  };
+  let prepared;
+  if (def.preflight) {
+    try {
+      prepared = await def.preflight(parsed.data, ctx);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return rejected(clockStopped ? `${message} (el reloj no ha arrancado)` : message);
+    }
+  }
+  if (clockStopped) {
+    if (ctx.startClock) ctx = { ...ctx, sessionId: await ctx.startClock() };
+    else startMissionClock(current.id);
+    if (getMission(current.id)?.status !== "active") return notActive();
+  }
   if (def.researchTarget) {
     const target = def.researchTarget(parsed.data);
     for (const t of Array.isArray(target) ? target : [target]) logResearch(ctx.missionId, name, t?.trim() || void 0);
   }
   try {
-    let content = await def.run(parsed.data, ctx);
+    let content = await def.run(parsed.data, ctx, prepared);
     if (trading) {
       const ended = await checkMission(ctx.missionId ?? void 0).catch(() => []);
       if (ended.length && typeof content === "string") content = `${content}
@@ -43990,11 +45893,7 @@ ${ended.join("\n")}`;
     if (trading || def.deliversNews) content = withNews(content, ctx.missionId);
     return { content, isError: false };
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    if (trading) {
-      logJournal({ missionId: ctx.missionId, sessionId: ctx.sessionId, kind: "rejected", summary: `${name} rechazada: ${message}`, details: rawInput });
-    }
-    return fail(message);
+    return rejected(err instanceof Error ? err.message : String(err));
   }
 }
 
@@ -44401,7 +46300,6 @@ function openInBrowser(url2) {
 // src/mcp.ts
 init_mission();
 init_sync();
-init_config();
 init_db();
 
 // src/keep-awake.ts
@@ -44435,6 +46333,7 @@ process.on("exit", () => child?.kill());
 // src/sim/session.ts
 init_db();
 init_mission();
+init_plans();
 init_portfolio();
 function startSession(missionId) {
   return Number(db.prepare("INSERT INTO sessions (started_at, mission_id) VALUES (?, ?)").run(now(), missionId).lastInsertRowid);
@@ -44443,6 +46342,7 @@ async function sessionBriefing(sessionId, missionId) {
   const header = `Sesi\xF3n #${sessionId}. Fecha y hora actual: ${now()}.`;
   if (missionId === null) return [header, "", toText(await missionStatus())].join("\n");
   const mission = getMission(missionId);
+  if (isFastMission(mission)) return fastBriefing(header, mission);
   const portfolio = await valuation(missionId, true);
   const notes = db.prepare("SELECT id, ts, text FROM notes WHERE mission_id = ? ORDER BY id").all(missionId);
   const openOrders = listOrders(missionId, "open");
@@ -44480,6 +46380,23 @@ async function sessionBriefing(sessionId, missionId) {
     recent.length ? "\xDAltimas entradas del diario:\n" + recent.reverse().map((j) => `- ${j.ts} [${j.kind}] ${j.summary}`).join("\n") : "El diario est\xE1 vac\xEDo: es tu primera sesi\xF3n."
   ].join("\n");
 }
+async function fastBriefing(header, mission) {
+  const plan = planForMission(mission.id);
+  const openOrders = listOrders(mission.id, "open");
+  return [
+    header,
+    "",
+    "Misi\xF3n r\xE1pida:",
+    toText(await missionStatus(mission.id)),
+    "",
+    plan ? `Plan vigente (c\xEDtalo con plan_ref: ${plan.id}):
+${toText(describePlan(plan))}` : `No hay plan vigente para ${mission.class ?? "esta clase"}: lo escribe el planner con write_plan antes del reloj.`,
+    "",
+    "Cartera:",
+    toText(await valuation(mission.id, true)),
+    ...openOrders.length ? ["", "\xD3rdenes condicionales abiertas:\n" + toText(openOrders)] : []
+  ].join("\n");
+}
 async function endSession(sessionId, missionId, finalText, tokens) {
   const end = missionId !== null ? await valuation(missionId, true) : null;
   db.prepare("UPDATE sessions SET ended_at = ?, final_text = ?, input_tokens = ?, output_tokens = ? WHERE id = ?").run(
@@ -44502,7 +46419,7 @@ init_portfolio();
 init_positions();
 var usd = (n3) => `${n3.toLocaleString("es-ES", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} $`;
 var pct3 = (n3) => `${n3 >= 0 ? "+" : "\u2212"}${Math.abs(n3).toLocaleString("es-ES", { maximumFractionDigits: 1 })} %`;
-var hhmm3 = (iso) => new Date(iso).toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit" });
+var hhmm3 = (iso2) => new Date(iso2).toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit" });
 function timeLeft(deadline) {
   const min = Math.max(0, Math.round((new Date(deadline).getTime() - Date.now()) / 6e4));
   return min >= 60 ? `${Math.floor(min / 60)} h ${min % 60} min` : `${min} min`;
@@ -44514,7 +46431,7 @@ async function statusReport(missionId) {
   const current = m.status === "active" ? v.totalUsd : m.final_usd ?? v.totalUsd;
   const change = (current - m.initial_usd) / m.initial_usd * 100;
   const progress = (current - m.initial_usd) / (m.target_usd - m.initial_usd) * 100;
-  const statusText = m.status === "active" ? `en curso, quedan ${timeLeft(m.deadline)}` : m.status === "succeeded" ? "CONSEGUIDA" : m.status === "expired" ? "terminada sin llegar al objetivo" : m.status === "bust" ? "SIN FONDOS: se qued\xF3 sin dinero para operar" : "detenida por el usuario";
+  const statusText = m.status === "active" ? m.started_at ? `en curso, quedan ${timeLeft(m.deadline)}` : `prepar\xE1ndose: el reloj (${Math.round(missionDurationMinutes(m))} min) a\xFAn no ha arrancado` : m.end_reason === "prep_timeout" ? `cancelada: el reloj no arranc\xF3 en ${PREP_TIMEOUT_MINUTES} min` : m.status === "succeeded" ? "CONSEGUIDA" : m.status === "expired" ? "terminada sin llegar al objetivo" : m.status === "bust" ? "SIN FONDOS: se qued\xF3 sin dinero para operar" : "detenida por el usuario";
   const lines = [];
   lines.push(`Misi\xF3n #${m.id}: ${statusText}`);
   lines.push(`Valor: ${usd(current)} (${pct3(change)}) \xB7 objetivo ${usd(m.target_usd)} \xB7 progreso ${Math.round(progress)} %`);
@@ -44565,6 +46482,7 @@ async function statusReport(missionId) {
 }
 
 // src/mcp.ts
+init_shadow();
 init_chain();
 init_client();
 init_keystore();
@@ -44585,20 +46503,24 @@ var sessionFor = (missionId) => {
   }
   return sessions.get(missionId);
 };
+async function openWorkSession() {
+  await checkOrders().catch(() => []);
+  await checkMission().catch(() => []);
+  const missionId = currentMission();
+  startMissionClock(missionId);
+  const sessionId = startSession(missionId);
+  sessions.set(missionId, sessionId);
+  return { missionId, sessionId };
+}
 server.registerTool(
   "start_session",
   {
-    description: "Empieza una sesi\xF3n de trabajo. Ll\xE1mala antes que cualquier otra herramienta: devuelve la hora, tu cartera, tus notas y el diario reciente.",
+    description: "Arranca el reloj de la misi\xF3n (solo la primera vez) y abre una sesi\xF3n de trabajo; devuelve el briefing: la hora, la misi\xF3n, tu cartera, tus notas y el diario reciente. Antes del reloj no se puede operar, pero s\xED investigar y esperar sin que cuente el tiempo: ll\xE1mala cuando vayas a operar, no antes. En una misi\xF3n r\xE1pida no hace falta: enter_with_exits arranca el reloj con la compra. Si el reloj no arranca en 60 min desde que se cre\xF3 la misi\xF3n, esta se cancela.",
     inputSchema: {}
   },
   async () => {
     try {
-      await checkOrders().catch(() => []);
-      await checkMission().catch(() => []);
-      const missionId = currentMission();
-      startMissionClock(missionId);
-      const sessionId = startSession(missionId);
-      sessions.set(missionId, sessionId);
+      const { missionId, sessionId } = await openWorkSession();
       return text(await sessionBriefing(sessionId, missionId));
     } catch (err) {
       return { ...text(`Error: ${err.message}`), isError: true };
@@ -44803,7 +46725,8 @@ for (const tool2 of SIM_TOOLS) {
   server.registerTool(tool2.name, { description: tool2.description, inputSchema: tool2.schema.shape }, async (input2) => {
     try {
       const missionId = currentMission();
-      const { content, isError } = await runTool(tool2.name, input2, { sessionId: sessionFor(missionId), missionId });
+      const startClock = async () => (await openWorkSession()).sessionId;
+      const { content, isError } = await runTool(tool2.name, input2, { sessionId: sessionFor(missionId), missionId, startClock });
       return { ...text(typeof content === "string" ? content : JSON.stringify(content)), isError };
     } catch (err) {
       return { ...text(`Error: ${err.message}`), isError: true };
@@ -44814,18 +46737,14 @@ var transport = new StdioServerTransport();
 var send2 = transport.send.bind(transport);
 transport.send = (message) => send2(slimToolList(message));
 await server.connect(transport);
-setInterval(async () => {
-  if (supersededBy() || !holdsTickLease()) return;
-  await checkOrders().catch((err) => console.error(`Error revisando \xF3rdenes: ${err.message}`));
-  await checkMission().catch((err) => console.error(`Error revisando la misi\xF3n: ${err.message}`));
-}, config2.watchIntervalSeconds * 1e3);
-var missionRunning = () => !!db.prepare("SELECT 1 FROM missions WHERE status IN ('active', 'closing') LIMIT 1").get();
+startWatchLoop({
+  canRun: () => !supersededBy() && holdsTickLease(),
+  log: (line) => {
+    if (line.startsWith("Error")) console.error(line);
+  }
+});
+var missionRunning = () => !!db.prepare("SELECT 1 FROM missions WHERE status IN ('active', 'closing') LIMIT 1").get() || shadowsRunning();
 setInterval(() => {
   if (supersededBy()) return keepAwake(false);
   keepAwake(missionRunning());
 }, 2e4);
-setInterval(async () => {
-  if (supersededBy() || !holdsTickLease()) return;
-  const open2 = db.prepare("SELECT 1 FROM orders o JOIN missions m ON m.id = o.mission_id WHERE o.status = 'open' AND o.condition != 'time' AND m.status = 'active' LIMIT 1").get();
-  if (open2) await checkOrders().catch((err) => console.error(`Error revisando \xF3rdenes: ${err.message}`));
-}, 15e3);
