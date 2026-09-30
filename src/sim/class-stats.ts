@@ -6,8 +6,13 @@
 // dos nunca se mezclan (con fee con prioridad, renta sin devolver y latencia, la toma de beneficio queda más lejos).
 // Con menos de MIN_MISSIONS_FOR_VERDICT misiones por clase no se saca ninguna conclusión: 7 de 20 deja un intervalo
 // del 18 al 57 %, y con P = 35 % ver 3 aciertos seguidos en 50 misiones pasa el 78 % de las veces por puro azar.
+// Desde v0.37.2, además, la medida con velas de 1 min (candles.ts) del agente y de los gemelos: la misma vara para los
+// dos. Al gemelo le faltan cotizaciones (429 y turnos ocupados), y una perdida solo puede quitarle aciertos, nunca
+// dárselos: sus aciertos con cotizaciones pueden quedarse cortos, así que la comparación agente-gemelo se hace con las velas.
+import { config } from "../config.js";
 import { db } from "../db.js";
 import { baselineForClass } from "./baselines.js";
+import { candleCounts } from "./candles.js";
 import { asCostMode, type CostMode } from "./costs.js";
 import { wilson } from "./stats.js";
 
@@ -102,6 +107,105 @@ export function missionComparison(
   };
 }
 
+type CandleMap = ReturnType<typeof candleCounts>;
+
+/** Una misión en la medida con velas: el agente (mecha/cierre) y sus gemelos. */
+function candlePerMission(c: ReturnType<CandleMap["get"]>) {
+  const a = c?.agent;
+  const t = c?.twins;
+  return {
+    ...(a
+      ? { candleAgent: a.status === "done" ? (a.close ? "mecha y cierre" : a.wick ? "mecha" : "no") : a.status === "unavailable" ? "sin velas" : "pendiente" }
+      : {}),
+    ...(t?.done ? { candleTwin: `${t.wick} de ${t.done} mecha, ${t.close} cierre${t.pending ? ` (${t.pending} pendientes)` : ""}` } : t?.pending ? { candleTwin: "pendiente" } : {}),
+  };
+}
+
+/**
+ * La medida con velas de un grupo de misiones: aciertos del agente (mecha y cierre, n = entradas del agente) y del gemelo
+ * (media por misión, n = misiones, como sus aciertos con cotizaciones), y la comparación con esa misma vara. Y cuánto
+ * se observó de verdad a los gemelos con cotizaciones reales.
+ */
+function candleSummary(ms: Array<{ id: number }>, candles: CandleMap) {
+  const agents = ms.map((m) => candles.get(m.id)?.agent).filter((a) => a !== undefined);
+  const agentDone = agents.filter((a) => a.status === "done");
+  const pendingAgents = agents.filter((a) => a.status === null).length;
+  const withTwin = ms.filter((m) => (candles.get(m.id)?.twins?.done ?? 0) > 0);
+  const pendingTwins = ms.reduce((s, m) => s + (candles.get(m.id)?.twins?.pending ?? 0), 0);
+  const twinRate = (group: Array<{ id: number }>, k: "wick" | "close") => {
+    const rates = group.map((m) => candles.get(m.id)!.twins!).map((t) => t[k] / t.done);
+    const mean = rates.reduce((s, r) => s + r, 0) / rates.length;
+    const hits = group.reduce((s, m) => s + candles.get(m.id)!.twins![k], 0);
+    const done = group.reduce((s, m) => s + candles.get(m.id)!.twins!.done, 0);
+    return { mean, ...missionRate(mean, group.length, hits, done) };
+  };
+  const pending = pendingAgents + pendingTwins;
+  // Una clase sin entradas del agente ni gemelos (las misiones largas): no hay nada que medir con velas.
+  if (!agents.length && !ms.some((m) => candles.get(m.id)?.twins)) return { block: undefined, observation: null };
+  const measure =
+    "velas de 1 min del pool (GeckoTerminal), la misma vara para el agente y el gemelo: mecha = algún máximo llega al precio de la toma de beneficio " +
+    "en su plazo; cierre = algún cierre de minuto llega (más exigente)";
+  if (!agentDone.length && !withTwin.length) {
+    return { block: pending ? `${pending} entradas pendientes de medir con velas (${CANDLE_WAIT})` : "sin entradas medidas con velas", observation: observation(ms, candles) };
+  }
+  const aw = rate(agentDone.filter((a) => a.wick).length, agentDone.length);
+  const ac = rate(agentDone.filter((a) => a.close).length, agentDone.length);
+  const tw = withTwin.length ? twinRate(withTwin, "wick") : null;
+  const tc = withTwin.length ? twinRate(withTwin, "close") : null;
+  // Comparación: solo las misiones con las dos medidas.
+  const both = withTwin.filter((m) => candles.get(m.id)?.agent?.status === "done");
+  let vsTwin: string;
+  if (!both.length) vsTwin = "aún no hay misiones con el agente y el gemelo medidos con velas";
+  else {
+    const a = rate(both.filter((m) => candles.get(m.id)!.agent!.wick).length, both.length);
+    const t = twinRate(both, "wick");
+    const [aLo, aHi] = a.ci95Pct;
+    const [tLo, tHi] = t.ci95Pct;
+    vsTwin =
+      `con velas (mecha), en las ${both.length} misiones con las dos medidas: el agente ${a.text} frente al gemelo ${t.text}: ` +
+      (aLo > tHi
+        ? "el agente acierta más (los intervalos no se solapan)"
+        : aHi < tLo
+          ? "el agente acierta menos (los intervalos no se solapan)"
+          : "los intervalos se solapan: con esta muestra no se distingue al agente del gemelo");
+    const ab = rate(both.filter((m) => candles.get(m.id)!.agent!.close).length, both.length);
+    vsTwin += `. Con cierre: el agente ${ab.text} frente al gemelo ${twinRate(both, "close").text}`;
+  }
+  return {
+    block: {
+      measure,
+      agent: agentDone.length
+        ? { entries: agentDone.length, wick: aw.text, wickCi95Pct: aw.ci95Pct, close: ac.text, closeCi95Pct: ac.ci95Pct }
+        : "sin entradas del agente medidas todavía",
+      twin: tw && tc ? { missions: withTwin.length, wick: tw.text, wickCi95Pct: tw.ci95Pct, close: tc.text, closeCi95Pct: tc.ci95Pct } : "sin gemelos medidos todavía",
+      vsTwin,
+      ...(pending ? { pending: `${pending} entradas pendientes (${CANDLE_WAIT})` } : {}),
+    },
+    observation: observation(ms, candles),
+  };
+}
+
+const CANDLE_WAIT = "se miden unos minutos después de acabar su plazo";
+
+/**
+ * Qué parte del tiempo que estuvieron abiertos se observó a los gemelos con cotizaciones reales (una cada 5 s en una
+ * misión rápida). Lo que tocaba es de su entrada a su cierre, como mucho su plazo (twinOpenMinutes): uno que acierta
+ * pronto deja de cotizarse al cerrarse.
+ */
+function observation(ms: Array<{ id: number }>, candles: CandleMap): string | null {
+  const ts = ms.map((m) => candles.get(m.id)?.twins).filter((t) => t !== undefined);
+  const n = ts.reduce((s, t) => s + t.n, 0);
+  if (!n) return null;
+  const quotes = ts.reduce((s, t) => s + t.quotes, 0);
+  const missed = ts.reduce((s, t) => s + t.missed, 0);
+  const expected = Math.max(1, ts.reduce((s, t) => s + (t.openMinutes * 60) / config.fastWatchIntervalSeconds, 0));
+  return (
+    `los ${n} gemelos terminados cotizaron ${quotes} de las ~${Math.round(expected)} veces que tocaba mientras estuvieron abiertos (${Math.round((quotes / expected) * 100)} %)` +
+    (missed ? `; ${missed} perdidas y contadas (Jupiter ocupado, 429 o sin turno)` : "") +
+    ": con huecos puede perder picos cortos (una cotización perdida solo le quita aciertos, nunca se los da); para compararlo con el agente, las velas"
+  );
+}
+
 /**
  * Estadísticas por clase y modo de costes de las misiones jugadas hasta el final (conseguidas, por tiempo o en
  * bancarrota; las canceladas no cuentan). Con cls, solo esa clase; con costMode, solo ese modo. perMissionLimit recorta
@@ -117,6 +221,7 @@ export function classStats(opts: { cls?: string | null; costMode?: CostMode | nu
     )
     .all(...(opts.cls ? [opts.cls] : [])) as unknown as Row[];
   const twins = twinCounts();
+  const candles = candleCounts();
   // Una serie por clase y modo de costes: las de costes realistas no se mezclan con las de siempre.
   const groups = new Map<string, { cls: string; costs: CostMode; ms: Row[] }>();
   for (const r of rows) {
@@ -168,6 +273,7 @@ export function classStats(opts: { cls?: string | null; costMode?: CostMode | nu
             : "los intervalos se solapan: con esta muestra no se distingue al agente del gemelo");
     }
 
+    const candle = candleSummary(ms, candles);
     const limit = opts.perMissionLimit ?? n;
     return {
       class: cls,
@@ -204,11 +310,13 @@ export function classStats(opts: { cls?: string | null; costMode?: CostMode | nu
           ? `${pending} gemelos aún en curso`
           : "sin gemelo",
       vsTwin,
+      ...(candle.block ? { candles: candle.block } : {}),
+      ...(candle.observation ? { twinObservation: candle.observation } : {}),
       verdict:
         n < MIN_MISSIONS_FOR_VERDICT
           ? `${n} de ${MIN_MISSIONS_FOR_VERDICT} misiones: aún no se saca ninguna conclusión ni se cambian las reglas del bloque`
           : "muestra suficiente para un primer veredicto, solo si la diferencia es grande (×2); para mejoras moderadas hacen falta 50-130",
-      perMission: ms.slice(-limit).map((m) => ({ missionId: m.id, ...missionComparison(m, twins) })),
+      perMission: ms.slice(-limit).map((m) => ({ missionId: m.id, ...missionComparison(m, twins), ...candlePerMission(candles.get(m.id)) })),
     };
   });
 }

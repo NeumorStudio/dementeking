@@ -310,6 +310,66 @@ export class LimitUnquoted extends LimitNotFilled {
   }
 }
 
+/**
+ * Un swap a mercado que revierte porque la cotización de la ejecución da menos que la de referencia menos el slippage
+ * (con costes realistas, la de antes de la latencia): el precio se ha movido en contra. Paga la red, como en la cadena.
+ * enter_with_exits lo distingue de otros fallos: ese token queda descartado en la misión (entry.ts).
+ */
+export class SlippageExceeded extends Error {
+  constructor(
+    message: string,
+    /** Cuánto peor ha salido que la referencia, en % (menos tokens o menos estable de los esperados). */
+    readonly worsePct: number,
+    readonly slippageBps: number,
+    /** La latencia que pasó entre decidir y ejecutar (0 si la referencia era una cotización tuya). */
+    readonly latencyMs: number,
+    /** Lo que se pagó de red, en el nativo de la cadena. */
+    readonly burnedNative: number,
+    readonly nativeSymbol: string,
+  ) {
+    super(message);
+  }
+}
+
+/**
+ * La misión ya no está activa al ir a aplicar un swap (sustituida por otra, parada, cancelada por prep_timeout o
+ * cerrándose): no se aplica nada, como una transacción que no se llega a enviar. Con costes realistas es fácil que pase
+ * durante los 2 s de latencia; la compra de enter_with_exits, que va antes del reloj, no puede quedar en una misión cancelada.
+ */
+export class MissionNotActive extends Error {}
+
+function missionState(missionId: number) {
+  return db.prepare("SELECT status, end_reason FROM missions WHERE id = ?").get(missionId) as { status: string; end_reason: string | null } | undefined;
+}
+
+/**
+ * Un swap solo se aplica a una misión activa; el cierre (status 'closing', liquidateAll) vende con swaps que ya empezaron
+ * en ese estado. Si no, falla sin aplicar nada (MissionNotActive): p. ej. la misión se sustituyó, se paró o se canceló
+ * mientras se cotizaba, durante la latencia o antes (en el preflight de enter_with_exits).
+ */
+function assertStillActive(missionId: number, startStatus: string | undefined) {
+  const m = missionState(missionId);
+  if (m?.status === "active" || (m?.status === "closing" && startStatus === "closing")) return;
+  const why = m ? `${m.status}${m.end_reason ? `: ${m.end_reason}` : ""}` : "no existe";
+  throw new MissionNotActive(
+    `La misión #${missionId} ya no está activa (${why}): el swap no se ha enviado, así que no se ha comprado ni vendido nada ni se ha pagado la red`,
+  );
+}
+
+/** fn en una transacción de escritura (BEGIN IMMEDIATE), o en la que ya esté abierta: nadie cambia la misión en medio. */
+function inWriteTransaction<T>(fn: () => T): T {
+  if (db.isTransaction) return fn();
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const out = fn();
+    db.exec("COMMIT");
+    return out;
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  }
+}
+
 export async function swap(args: {
   missionId: number;
   sessionId: number | null;
@@ -340,6 +400,8 @@ export async function swap(args: {
   }
   const chain = getChain(args.chain);
   const m = args.missionId;
+  // Si la misión deja de estar activa mientras se cotiza o durante la latencia, el swap no se aplica (assertStillActive).
+  const startStatus = missionState(m)?.status;
   const [input, output] = await Promise.all([chain.resolveToken(args.input), chain.resolveToken(args.output)]);
   if (input.address === output.address) throw new Error("El token de entrada y salida son el mismo");
 
@@ -364,6 +426,9 @@ export async function swap(args: {
     quote = await limitQuote(chain.quote({ input, output, amountIn: amount, slippageBps: args.slippageBps, fresh: true }));
     if (args.minOut !== undefined && quote.amountOut < args.minOut) throw new LimitNotReached(quote.amountOut, args.minOut);
   }
+  // Tras las esperas (cotizar, la latencia), la misión tiene que seguir activa: si la han sustituido, parado o cancelado,
+  // no se envía nada (ni se paga la red). Se vuelve a mirar al aplicar, en la misma transacción (otro proceso puede cancelarla).
+  assertStillActive(m, startStatus);
   if (args.fillAtLimit && args.minOut !== undefined && quote.amountOut > args.minOut) {
     const f = args.minOut / quote.amountOut;
     quote = { ...quote, amountOut: args.minOut, grossOut: quote.grossOut * f };
@@ -410,11 +475,9 @@ export async function swap(args: {
         `saldrían ${Number(quote.amountOut.toPrecision(6))} (${worse.toFixed(1)} % menos; tu límite era ${args.slippageBps / 100} %). ` +
         `Has pagado la red (${Number(burned.toPrecision(3))} ${chain.native.symbol}).`;
       logJournal({ missionId: m, sessionId: args.sessionId, kind: "failed_tx", summary: `Swap fallido en ${chain.label}: slippage superado (${worse.toFixed(1)} % peor que tu cotización)`, reasoning: args.reasoning });
-      throw new Error(error);
+      throw new SlippageExceeded(error, worse, args.slippageBps, quoted ? 0 : latency, burned, chain.native.symbol);
     }
   }
-  applyDeltas(m, chain.id, settled.deltas);
-
   const result = {
     chain: chain.id,
     sold: `${amount} ${input.symbol}`,
@@ -428,13 +491,19 @@ export async function swap(args: {
     // Costes realistas: lo que daba la cotización con la que se decidió y lo que dio tras la latencia.
     ...(decided ? { latency: { ms: latency, quotedOut: decided.amountOut, filledOut: quote.amountOut } } : {}),
   };
-  logJournal({
-    missionId: m,
-    sessionId: args.sessionId,
-    kind: "swap",
-    summary: `Swap ${Number(amount.toPrecision(6))} ${input.symbol} → ${Number(quote.amountOut.toPrecision(6))} ${output.symbol}${chain.id === "solana" ? "" : ` en ${chain.label}`}`,
-    reasoning: args.reasoning,
-    details: { inputMint: input.address, outputMint: output.address, ...result },
+  // La comprobación, los saldos y la fila del diario, juntos: una misión que se cancela en paralelo (prep_timeout, en otro
+  // proceso) o no ve la compra o la ve entera (cancelForPrepTimeout no cancela una misión con una compra recién hecha).
+  inWriteTransaction(() => {
+    assertStillActive(m, startStatus);
+    applyDeltas(m, chain.id, settled.deltas);
+    logJournal({
+      missionId: m,
+      sessionId: args.sessionId,
+      kind: "swap",
+      summary: `Swap ${Number(amount.toPrecision(6))} ${input.symbol} → ${Number(quote.amountOut.toPrecision(6))} ${output.symbol}${chain.id === "solana" ? "" : ` en ${chain.label}`}`,
+      reasoning: args.reasoning,
+      details: { inputMint: input.address, outputMint: output.address, ...result },
+    });
   });
 
   // Valor de la operación en USD: el lado estable si lo hay (es exacto); si no, el precio de mercado.

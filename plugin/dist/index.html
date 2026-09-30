@@ -69,7 +69,8 @@
   .clock-value.urgent { color: var(--down); }
   .clock-value.ended { font-size: clamp(24px, 3vw, 32px); font-stretch: 120%; }
 
-  main { max-width: 1360px; padding: 8px 40px 64px; display: grid; gap: 44px; }
+  /* Una sola columna que no crece con su contenido: la tabla de las tandas se desplaza dentro de su caja. */
+  main { max-width: 1360px; padding: 8px 40px 64px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 44px; }
 
   /* ── La carrera ───────────────────────────────────────── */
   .hero { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 28px; }
@@ -264,6 +265,99 @@
   .jump { position: absolute; bottom: 14px; left: 50%; transform: translateX(-50%); background: var(--ink); color: var(--bg); border: 0; border-radius: 999px;
     padding: 6px 16px; min-height: 36px; font-size: 13px; font-weight: 700; cursor: pointer; box-shadow: 0 6px 20px #0008; }
 
+  /* ── Ahora mismo: la fase de la tanda ─────────────────── */
+  .now { margin: 20px 40px 0; max-width: 1280px; background: var(--surface); border: 1px solid var(--rule); border-radius: 14px;
+    padding: 16px 20px 18px; display: grid; gap: 12px; }
+  .now[hidden] { display: none; }
+  .now-top { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px 16px; }
+  .now-kicker { font-size: 12px; font-weight: 700; font-stretch: 125%; letter-spacing: .08em; text-transform: uppercase; color: var(--muted);
+    display: inline-flex; align-items: center; gap: 8px; }
+  .now-kicker i { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .now.is-live .now-kicker i { background: var(--up); animation: beat 1.6s ease-in-out infinite; }
+  @keyframes beat { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
+  .steps { display: flex; flex-wrap: wrap; gap: 4px; list-style: none; margin: 0; padding: 0; counter-reset: step; }
+  .steps li { font-size: 12px; font-weight: 700; font-stretch: 115%; padding: 3px 10px 3px 8px; border-radius: 999px; background: var(--surface-2);
+    color: var(--muted); opacity: .5; display: inline-flex; gap: 6px; align-items: center; }
+  .steps li::before { counter-increment: step; content: counter(step); font-size: 11px; opacity: .8; }
+  .steps li.done { opacity: .9; }
+  .steps li.done::before { content: "✓"; }
+  .steps li.skip { opacity: .45; text-decoration: line-through; }
+  .steps li.skip::before { content: "–"; }
+  .steps li.cur { opacity: 1; background: var(--ink); color: var(--accent-ink); }
+  .now-tags { display: flex; flex-wrap: wrap; gap: 6px; }
+  .now-tags .pill { margin: 0; }
+  /* Serie de costes reales (simulada): contorno neutro. El amarillo --warn queda para el dinero real (la banda DINERO REAL). */
+  .pill.real { background: transparent; color: var(--ink); box-shadow: inset 0 0 0 1px var(--muted); }
+  .now-main { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 18px; }
+  .now-phase { font-size: clamp(24px, 2.8vw, 34px); font-weight: 800; font-stretch: 130%; line-height: 1.05; }
+  .now-timer { font-size: clamp(24px, 2.8vw, 34px); font-weight: 800; font-stretch: 135%; color: var(--muted); line-height: 1.05; }
+  .now-timer.urgent { color: var(--down); }
+  .now-timer small { font-size: .4em; font-stretch: 110%; font-weight: 600; margin-left: 6px; }
+  .now-lines { display: grid; gap: 3px; font-size: 14px; color: var(--muted); margin: 0; padding: 0; list-style: none; }
+  .now-lines b { color: var(--ink); font-weight: 600; }
+  .now-lines .up { color: var(--up); } .now-lines .down { color: var(--down); }
+  .now-lines code { font: inherit; color: var(--muted); }
+  /* Reloj en marcha: el token entre su entrada y su toma de beneficio. */
+  .tp-track { position: relative; height: 54px; margin: 4px 0 0; }
+  .tp-lane { position: absolute; left: 0; right: 0; top: 22px; height: 8px; border-radius: 4px; background: var(--surface-2); }
+  .tp-fill { position: absolute; top: 22px; height: 8px; border-radius: 4px; transition: left 700ms var(--ease), width 700ms var(--ease); }
+  .tp-fill.up { background: var(--up); } .tp-fill.down { background: var(--down); }
+  .tp-mark { position: absolute; top: 14px; height: 24px; width: 2px; margin-left: -1px; background: var(--muted); }
+  .tp-mark.tp { width: 10px; margin-left: -5px; border-radius: 2px; background: repeating-conic-gradient(var(--ink) 0 25%, var(--bg) 0 50%) 0 0 / 5px 5px; }
+  .tp-label { position: absolute; top: 40px; font-size: 12px; color: var(--muted); white-space: nowrap; transform: translateX(-50%); }
+  .tp-label.left { transform: none; } .tp-label.right { transform: translateX(-100%); }
+  .tp-track.two-rows { height: 72px; }
+  .tp-track.two-rows #tpTpLabel { top: 57px; }
+  .tp-runner { position: absolute; top: 17px; width: 18px; height: 18px; margin-left: -9px; border-radius: 50%; background: var(--accent);
+    box-shadow: 0 0 0 3px var(--surface); transition: left 700ms var(--ease); }
+  .tp-tag { position: absolute; top: -2px; font-size: 12px; font-weight: 700; font-stretch: 120%; white-space: nowrap; transform: translateX(-50%);
+    transition: left 700ms var(--ease); }
+
+  /* ── Las tandas ───────────────────────────────────────── */
+  .series-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 360px), 1fr)); gap: 20px 32px; }
+  .series { border-top: 1px solid var(--rule); padding-top: 14px; min-width: 0; }
+  .series h3 { font-size: 15px; font-weight: 700; font-stretch: 115%; display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; }
+  .series h3 span { font-size: 13px; font-weight: 400; color: var(--muted); font-stretch: 100%; }
+  .series-big { font-size: clamp(30px, 3.4vw, 42px); font-weight: 800; font-stretch: 140%; line-height: 1; margin: 10px 0 4px; }
+  .series-big small { font-size: .4em; font-stretch: 110%; font-weight: 600; color: var(--muted); margin-left: 8px; }
+  .series-stats { font-size: 14px; color: var(--muted); }
+  .series-stats b { color: var(--ink); font-weight: 600; }
+  .series-stats b.up { color: var(--up); } .series-stats b.down { color: var(--down); }
+  .cum-chart { display: block; width: 100%; height: 190px; overflow: visible; margin-top: 12px; }
+  .cum-chart .zero { stroke: var(--muted); stroke-width: 1; opacity: .7; }
+  .cum-chart .grid { stroke: var(--rule); stroke-width: 1; }
+  .cum-chart .axis, .cum-chart .plan-label { fill: var(--muted); font-size: 11px; }
+  .cum-chart .plan-label { font-weight: 700; }
+  .cum-chart .plan-line { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 3 4; }
+  .cum-chart .area-up { fill: var(--up); opacity: .08; } .cum-chart .area-down { fill: var(--down); opacity: .1; }
+  .cum-chart .cum { fill: none; stroke: var(--accent); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+  .cum-chart .pt { stroke: var(--surface); stroke-width: 1.5; }
+  .cum-chart .pt.win { fill: var(--accent); } .cum-chart .pt.up { fill: var(--up); } .cum-chart .pt.down { fill: var(--down); }
+  .cum-chart .pt.bust { fill: #000; stroke: var(--down); }
+  .cum-chart .end { fill: var(--ink); font-size: 12px; font-weight: 700; }
+  .cum-chart g.p:hover .pt { r: 6; }
+  .plan-rows { list-style: none; margin: 10px 0 0; padding: 0; display: grid; gap: 4px; }
+  .plan-rows li { font-size: 13px; color: var(--muted); }
+  .plan-rows li b { color: var(--ink); font-weight: 600; }
+  .table-wrap { overflow-x: auto; margin-top: 18px; }
+  table.missions { border-collapse: collapse; width: 100%; font-size: 13px; }
+  table.missions th { text-align: left; font-weight: 600; color: var(--muted); padding: 6px 12px 6px 0; border-bottom: 1px solid var(--rule); white-space: nowrap; }
+  table.missions td { padding: 5px 12px 5px 0; border-bottom: 1px solid var(--rule); white-space: nowrap; }
+  table.missions td.num, table.missions th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  table.missions td.tok { max-width: 150px; overflow: hidden; text-overflow: ellipsis; }
+  table.missions .up { color: var(--up); } table.missions .down { color: var(--down); }
+  table.missions .bust { background: #000; color: var(--ink); padding: 0 6px; border-radius: 3px; box-shadow: inset 0 0 0 1px var(--down); }
+  table.missions .muted { color: var(--muted); }
+  table.missions tr.live td { color: var(--ink); font-weight: 600; }
+  .serie-tag { font-size: 11px; font-weight: 700; font-stretch: 120%; padding: 1px 7px; border-radius: 999px; background: var(--surface-2); }
+  .serie-tag.real { background: transparent; color: var(--ink); box-shadow: inset 0 0 0 1px var(--muted); }
+
+  /* Radio: cada agente con su nombre; el cerebro y el revisor, a la derecha. */
+  .msg.plan .bubble { background: #2B2733; border-radius: 14px 4px 14px 14px; }
+  .msg.plan { align-self: flex-end; justify-items: end; }
+  .line.sig { color: var(--ink); font-weight: 600; }
+  .line.sig span::before { content: "● "; color: var(--up); }
+
   @media (max-width: 1180px) {
     .page { grid-template-columns: 1fr; }
     .chat, .is-live .chat { position: relative; top: auto; height: min(680px, 82dvh); margin: 0 40px 56px; }
@@ -275,6 +369,8 @@
     .top { padding: 18px 16px 0; grid-template-columns: 1fr; gap: 12px; }
     .clock { text-align: left; display: flex; align-items: baseline; gap: 8px; }
     .clock-value { font-size: 30px; }
+    .now { margin: 14px 16px 0; padding: 14px 14px 16px; }
+    .steps li { padding: 2px 7px 2px 6px; font-size: 11px; gap: 4px; }
     .sec-head { flex-direction: column; gap: 2px; margin-bottom: 8px; }
     main { padding: 4px 16px 48px; gap: 32px; }
     .chart { height: 200px; }
@@ -303,6 +399,22 @@
     <span class="clock-value tab" id="clock">--:--</span>
   </div>
 </header>
+
+<section class="now" id="now" aria-labelledby="h-now" aria-live="polite" hidden>
+  <div class="now-top">
+    <span class="now-kicker" id="h-now"><i></i>Ahora mismo</span>
+    <ol class="steps" id="steps" aria-label="Fases de la misión"></ol>
+    <div class="now-tags" id="nowTags"></div>
+  </div>
+  <div class="now-main"><p class="now-phase" id="nowPhase"></p><p class="now-timer tab" id="nowTimer"></p></div>
+  <div class="tp-track" id="tpTrack" hidden aria-hidden="true">
+    <div class="tp-lane"></div><div class="tp-fill" id="tpFill"></div>
+    <div class="tp-mark" id="tpEntry"></div><div class="tp-mark tp" id="tpTp"></div>
+    <span class="tp-label" id="tpEntryLabel"></span><span class="tp-label" id="tpTpLabel"></span>
+    <span class="tp-tag" id="tpTag"></span><span class="tp-runner" id="tpRunner"></span>
+  </div>
+  <ul class="now-lines" id="nowLines"></ul>
+</section>
 
 <main>
   <section aria-labelledby="h-race">
@@ -336,6 +448,18 @@
       <div class="tooltip" id="tooltip"></div>
     </div>
     <details class="data"><summary>Ver los datos</summary><table><thead><tr><th>Hora</th><th>Valor</th></tr></thead><tbody id="chartTable"></tbody></table></details>
+  </section>
+
+  <section aria-labelledby="h-batches" id="batchesSec" hidden>
+    <div class="sec-head"><h2 id="h-batches">Las tandas</h2><span class="hint" id="batchesHint">misiones rápidas por serie de costes y plan</span></div>
+    <div class="series-grid" id="seriesGrid"></div>
+    <div class="table-wrap">
+      <table class="missions">
+        <thead><tr><th class="num">#</th><th>serie</th><th>token</th><th class="num">resultado</th><th>cierre</th><th class="num" title="De pedir la misión a arrancar el reloj">prep.</th><th class="num" title="De la señal a la compra">entrada</th><th class="num" title="Aciertos del gemelo mecánico de los terminados">gemelo</th></tr></thead>
+        <tbody id="batchRows"></tbody>
+      </table>
+    </div>
+    <button class="linkish" id="batchMore" type="button" hidden></button>
   </section>
 
   <section aria-labelledby="h-runs">
@@ -372,7 +496,7 @@
 </div>
 
 <aside class="chat" aria-labelledby="h-chat">
-  <div class="chat-head"><h2 id="h-chat">Radio del equipo</h2><p>El agente y el revisor, en directo. Solo se escucha.</p></div>
+  <div class="chat-head"><h2 id="h-chat">Radio del equipo</h2><p>El ejecutor, el cerebro y el revisor (o el trader), en directo. Solo se escucha.</p></div>
   <div class="tabs" role="group" aria-label="Qué escuchar">
     <button data-tab="all" aria-pressed="true">Todo</button>
     <button data-tab="mind" aria-pressed="false">Piensa</button>
@@ -424,6 +548,17 @@ function renderClock() {
   const frac = Math.max(0, Math.min(1, (Date.now() - t0) / (t1 - t0)));
   $("timeStart").textContent = `salida ${hm(m.created_at)}`;
   $("timeEnd").textContent = `fin ${hm(m.deadline)}`;
+  if (m.status === "active" && !m.started_at) {
+    // Misión rápida esperando la señal: el reloj (y su plazo) arranca con la entrada.
+    clock.textContent = "sin arrancar";
+    clock.className = "clock-value ended";
+    $("clockLabel").textContent = "el reloj arranca con la entrada";
+    $("timeStart").textContent = `pedida ${hm(m.requested_at ?? m.created_at)}`;
+    $("timeEnd").textContent = `${Math.round((t1 - t0) / 60000)} min de reloj`;
+    $("timeFill").style.transform = "scaleX(0)";
+    $("timeMid").textContent = "";
+    return;
+  }
   if (m.status !== "active") {
     clock.textContent = m.ended_at ? `acabó ${hm(m.ended_at)}` : "terminada";
     clock.className = "clock-value ended";
@@ -441,7 +576,7 @@ function renderClock() {
   $("timeFill").className = "time-fill" + (urgent ? " urgent" : "");
   $("timeMid").textContent = `${Math.round(frac * 100)} % del tiempo gastado`;
 }
-setInterval(renderClock, 1000);
+setInterval(() => { renderClock(); renderNowTimer(); }, 1000);
 
 // La cifra grande cuenta hasta su nuevo valor en lugar de saltar.
 let shown = null;
@@ -461,6 +596,8 @@ function countTo(target) {
 
 function render() {
   const { mission: m, valuation: v } = state;
+  renderNow();
+  renderBatches();
   if (!m) {
     $("missionName").textContent = "No hay ninguna misión";
     $("missionSub").textContent = "Empieza una con /dementeking:trading en Claude Code.";
@@ -472,7 +609,8 @@ function render() {
   $("missionName").textContent = `Misión #${m.id}`;
   const pill = $("pill");
   pill.hidden = false;
-  pill.textContent = { active: "en carrera", succeeded: "meta alcanzada", expired: "no llegó", bust: "☠ sin fondos", cancelled: "detenida", closing: "cerrando" }[m.status] ?? m.status;
+  pill.textContent = m.status === "active" && !m.started_at ? "preparando"
+    : ({ active: "en carrera", succeeded: "meta alcanzada", expired: "no llegó", bust: "☠ sin fondos", cancelled: "detenida", closing: "cerrando" }[m.status] ?? m.status);
   pill.className = "pill" + (m.status === "succeeded" ? " win" : m.status === "bust" ? " bust" : "");
   $("missionSub").textContent = `De ${usd(m.initial_usd)} a ${usd(m.target_usd)} en ${span} · ${m.instructions ? `instrucciones: ${m.instructions}` : "modo libre"}`;
   renderClock();
@@ -756,6 +894,288 @@ function renderMoney(v) {
   }
 }
 
+// ── Ahora mismo: en qué fase de la tanda está el equipo ──────
+const PHASES = [["esperando-plan", "plan"], ["esperando-senal", "señal"], ["reloj", "reloj"], ["revisando", "revisión"], ["pausa", "pausa"]];
+const WHO = { trader: "el agente", executor: "el ejecutor", planner: "el cerebro", reviewer: "el revisor" };
+const END = { target: "meta", deadline: "tiempo", bust: "sin fondos", loss_limit: "límite de pérdida", user: "detenida", replaced: "sustituida", prep_timeout: "sin señal en 60 min" };
+// Por qué acabó, en palabras: una prep_timeout con compras revertidas sí tuvo candidatos (no se quedó sin señal).
+const endText = (reason, reverted) => (reason === "prep_timeout" && reverted ? `compra revertida ×${reverted} en 60 min` : END[reason] ?? reason);
+const STATUS = { succeeded: "conseguida", expired: "no llegó", bust: "sin fondos", cancelled: "cancelada", active: "en marcha", closing: "cerrando" };
+const COSTS = { sim: "costes de siempre", real: "costes reales" };
+// En la tabla, más corto: la palabra «real» sola se confundiría con el dinero real.
+const COSTS_SHORT = { sim: "de siempre", real: "costes reales" };
+const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1);
+const mmss = (ms) => {
+  const s = Math.max(0, Math.floor(ms / 1000)), h = Math.floor(s / 3600), mi = Math.floor(s / 60) % 60, ss = s % 60;
+  return h ? `${h}:${String(mi).padStart(2, "0")}:${String(ss).padStart(2, "0")}` : `${mi}:${String(ss).padStart(2, "0")}`;
+};
+const longDur = (ms) => {
+  const mi = Math.round(ms / 60000);
+  return mi < 1 ? "menos de 1 min" : mi < 60 ? `${mi} min` : `${Math.floor(mi / 60)} h ${String(mi % 60).padStart(2, "0")} min`;
+};
+// Precios de memecoin: con las cifras que importan (0,000381 $), sin notación científica.
+const price = (p) => {
+  if (p == null || !isFinite(p)) return "…";
+  if (p >= 1) return `${fmt(p, 2)} $`;
+  const d = Math.min(12, Math.max(2, 2 - Math.floor(Math.log10(p))));
+  return `${p.toFixed(d).replace(".", ",")} $`;
+};
+const money = (n) => `${n >= 0 ? "+" : "−"}${fmt(Math.abs(n), 2)} $`;
+const shortTok = (t) => (t && t.length > 16 ? `${t.slice(0, 4)}…${t.slice(-4)}` : t ?? "");
+const agoS = (iso) => {
+  const s = Math.max(0, Math.round((Date.now() - new Date(iso)) / 1000));
+  return s < 90 ? `hace ${s} s` : ago(iso);
+};
+
+function renderNow() {
+  const p = state.phase;
+  const box = $("now");
+  // Solo con misiones rápidas (o su plan): las largas ya tienen su carrera debajo.
+  box.hidden = !p || !(p.fast || p.id === "esperando-plan");
+  if (box.hidden) return;
+  const cur = PHASES.findIndex(([id]) => id === p.id);
+  const skipped = p.skipped ?? [];
+  $("steps").replaceChildren(...PHASES.map(([id, label], i) => el("li", {
+    class: i === cur ? "cur" : skipped.includes(id) ? "skip" : i < cur ? "done" : "",
+    ...(i === cur ? { "aria-current": "step" } : skipped.includes(id) ? { title: id === "reloj" ? "El reloj no llegó a arrancar" : "Sin nada que revisar" } : {}),
+  }, label)));
+  box.classList.toggle("is-live", ["esperando-plan", "esperando-senal", "reloj", "revisando"].includes(p.id));
+  const tags = [];
+  if (p.missionId != null) tags.push(el("span", { class: "pill" }, `misión #${p.missionId}`));
+  if (p.costMode) tags.push(el("span", { class: `pill${p.costMode === "real" ? " real" : ""}` }, COSTS[p.costMode] ?? p.costMode));
+  if (p.planId != null) tags.push(el("span", { class: "pill" }, `plan #${p.planId}`));
+  if (p.agent) tags.push(el("span", { class: "pill win" }, `trabaja ${WHO[p.agent.name] ?? p.agent.name}`));
+  $("nowTags").replaceChildren(...tags);
+  $("nowPhase").textContent = p.label;
+
+  const lines = [];
+  const li = (...c) => lines.push(el("li", {}, ...c));
+  $("tpTrack").hidden = p.id !== "reloj";
+  if (p.id === "esperando-plan") {
+    li(p.agent?.name === "planner" ? `El cerebro está escribiendo el plan desde las ${hm(p.agent.since)}.` : "La misión se ha creado sin plan para su clase: lo escribe el cerebro.");
+    if (p.classPlanId != null) li(`El plan vigente de la clase es el #${p.classPlanId}.`);
+  } else if (p.id === "esperando-senal") {
+    const s = p.signal ?? {};
+    li(p.agent ? `${cap(WHO[p.agent.name] ?? p.agent.name)} espera la señal` : "Espera la señal", p.planId != null ? ` del plan #${p.planId}` : "",
+      ` desde las ${hm(p.since)}`, p.agent ? "." : " (ahora no hay ningún agente con la sesión abierta).");
+    if (s.lastWait) li("Última vuelta: ", el("b", {}, s.lastWait.summary.replace(/^wait_for_signal( \(plan #\d+\))?: /, "")), ` · ${agoS(s.lastWait.ts)}`);
+    if (s.candidate) li("Último candidato: ", el("b", {}, s.candidate.symbol ?? shortTok(s.candidate.token)), s.candidate.symbol ? ` (${shortTok(s.candidate.token)})` : "", ` · ${agoS(s.candidate.at)}`);
+    if (s.rejection) li(el("span", { class: "down" }, `Entrada rechazada ${agoS(s.rejection.ts)}: ${s.rejection.summary.replace(/^enter_with_exits rechazada: /, "").slice(0, 170)}`));
+    if (s.prepEndsAt) li(`Si no hay señal, se cancela a las ${hm(s.prepEndsAt)}.`);
+  } else if (p.id === "reloj") {
+    const c = p.clock, e = c.entry;
+    if (e) {
+      const pct = (x) => (e.entryPriceUsd ? ((x - e.entryPriceUsd) / e.entryPriceUsd) * 100 : null);
+      li(el("b", {}, e.symbol ?? shortTok(e.token)), ` · entró a ${price(e.entryPriceUsd)}`, e.enteredAt ? ` a las ${new Date(e.enteredAt).toLocaleTimeString("es-ES")}` : "",
+        c.latencyS != null ? ` (${fmt(c.latencyS, 1)} s después de la señal)` : "",
+        e.tpPriceUsd != null ? ` · toma de beneficio a ${price(e.tpPriceUsd)}${pct(e.tpPriceUsd) != null ? ` (${signed(pct(e.tpPriceUsd), " %")})` : ""}` : " · sin toma de beneficio");
+      if (e.priceUsd != null) {
+        const now = pct(e.priceUsd);
+        li("Ahora ", el("b", { class: now == null ? "" : now >= 0 ? "up" : "down" }, price(e.priceUsd)), now != null ? ` (${signed(now, " %")})` : "",
+          e.valueUsd != null ? ` · la posición vale ${usd(e.valueUsd)}` : "", e.valuedAt ? ` · valorado ${agoS(e.valuedAt)}` : "");
+      } else li("Valorando la posición…");
+    } else li("Comprando…");
+    if (c.totalUsd != null) li(`Cartera ${usd(c.totalUsd)} de ${usd(c.targetUsd)} (${signed(((c.totalUsd - c.initialUsd) / c.initialUsd) * 100, " %")}).`);
+    if (c.closing) li("Cerrando posiciones…");
+    renderTp(e);
+  } else if (p.id === "revisando" || p.id === "pausa") {
+    const r = p.result;
+    if (r) li(`La misión #${p.missionId} acabó${r.endedAt ? ` a las ${hm(r.endedAt)}` : ""}: `, el("b", { class: r.resultPct == null ? "" : r.resultPct >= 0 ? "up" : "down" },
+      `${STATUS[r.status] ?? r.status}${r.resultPct != null ? ` ${signed(r.resultPct, " %")}` : ""}`), r.endReason ? ` (${endText(r.endReason, r.revertedEntries)})` : "", ".");
+    if (r && !r.reviewable && !r.reviewedAt) li("Sin posiciones no hay nada que revisar: no cuenta en los aciertos ni en el acumulado.");
+    if (p.id === "revisando") li(p.agent?.name === "reviewer" ? `El revisor está escribiendo la retrospectiva desde las ${hm(p.agent.since)}.` : "Pendiente de que el revisor la revise.");
+    else {
+      if (r?.reviewedAt) li(`Revisada a las ${hm(r.reviewedAt)}.`);
+      const serie = state.batches?.series.find((s) => s.costMode === p.costMode && s.points.some((x) => x.missionId === p.missionId));
+      if (serie) li(`Serie de ${COSTS[serie.costMode] ?? serie.costMode}: `, el("b", {}, `${serie.hits} de ${serie.missions}`), ` con la meta, acumulado `,
+        el("b", { class: serie.totalPnlUsd >= 0 ? "up" : "down" }, money(serie.totalPnlUsd)), ".");
+    }
+  } else li("No hay misión. Empieza una tanda con /dementeking:trading.");
+  $("nowLines").replaceChildren(...lines);
+  renderNowTimer();
+}
+
+function renderTp(e) {
+  const track = $("tpTrack");
+  if (!e || e.entryPriceUsd == null || e.tpPriceUsd == null) { track.hidden = true; return; }
+  const cur = e.priceUsd ?? e.entryPriceUsd;
+  const lo = Math.min(e.entryPriceUsd * 0.75, cur), hi = Math.max(e.tpPriceUsd * 1.03, cur * 1.01);
+  const pos = (x) => Math.max(0, Math.min(100, ((x - lo) / (hi - lo)) * 100));
+  const a = pos(e.entryPriceUsd), t = pos(e.tpPriceUsd), r = pos(cur);
+  $("tpEntry").style.left = `${a}%`;
+  $("tpTp").style.left = `${t}%`;
+  const fill = $("tpFill");
+  fill.style.left = `${Math.min(a, r)}%`;
+  fill.style.width = `${Math.abs(r - a)}%`;
+  fill.className = `tp-fill ${cur >= e.entryPriceUsd ? "up" : "down"}`;
+  $("tpRunner").style.left = `${r}%`;
+  const tag = $("tpTag");
+  const pct = ((cur - e.entryPriceUsd) / e.entryPriceUsd) * 100;
+  tag.textContent = signed(pct, " %");
+  tag.style.left = `${r}%`;
+  tag.style.color = pct >= 0 ? "var(--up)" : "var(--down)";
+  tag.style.transform = r < 6 ? "none" : r > 94 ? "translateX(-100%)" : "translateX(-50%)";
+  const el1 = $("tpEntryLabel"), el2 = $("tpTpLabel");
+  el1.textContent = "entrada"; el1.style.left = `${a}%`; el1.className = `tp-label${a < 8 ? " left" : ""}`;
+  el2.textContent = "toma de beneficio"; el2.style.left = `${t}%`; el2.className = `tp-label${t > 80 ? " right" : ""}`;
+  layoutTpLabels();
+}
+
+// Si las dos etiquetas se pisan (el token hundido aprieta entrada y toma de beneficio a la derecha, o el plan pone la toma
+// de beneficio muy cerca), la de la toma de beneficio baja a una segunda fila, alineada con su marca.
+function layoutTpLabels() {
+  const track = $("tpTrack");
+  if (track.hidden) return;
+  track.classList.remove("two-rows");
+  const r1 = $("tpEntryLabel").getBoundingClientRect(), r2 = $("tpTpLabel").getBoundingClientRect();
+  track.classList.toggle("two-rows", r1.width > 0 && r2.width > 0 && r1.right + 10 > r2.left);
+}
+let tpWidth = 0;
+new ResizeObserver(() => { const w = $("tpTrack").clientWidth; if (w !== tpWidth) { tpWidth = w; layoutTpLabels(); } }).observe($("tpTrack"));
+
+function renderNowTimer() {
+  const p = state?.phase, out = $("nowTimer");
+  if (!p || $("now").hidden) return;
+  const since = p.since ? Date.now() - new Date(p.since) : null;
+  out.className = "now-timer tab";
+  if (p.id === "reloj") {
+    const left = new Date(p.clock.deadline) - Date.now();
+    out.replaceChildren(mmss(left), el("small", {}, "quedan"));
+    out.classList.toggle("urgent", left < 60_000);
+  } else if (p.id === "pausa") out.replaceChildren(since != null ? longDur(since) : "", el("small", {}, "de pausa"));
+  else if (since != null) {
+    const extra = p.id === "esperando-senal" && p.signal?.prepEndsAt ? `esperando · se cancela en ${longDur(new Date(p.signal.prepEndsAt) - Date.now())}` : p.id === "revisando" ? "desde que acabó" : "esperando";
+    out.replaceChildren(mmss(since), el("small", {}, extra));
+  } else out.replaceChildren();
+}
+
+// ── Las tandas: misiones rápidas por serie de costes y plan ──
+let batchAll = false;
+$("batchMore").addEventListener("click", () => { batchAll = !batchAll; renderBatches(); });
+
+function renderBatches() {
+  const b = state.batches;
+  const sec = $("batchesSec");
+  sec.hidden = !b || !b.missions.length;
+  if (sec.hidden) return;
+  const played = b.series.reduce((n, s) => n + s.missions, 0);
+  $("batchesHint").textContent = `${b.missions.length} misiones rápidas · ${played} jugadas hasta el final · una serie por modo de costes`;
+  const grid = $("seriesGrid");
+  const cards = b.series.map((s) => seriesCard(s));
+  grid.replaceChildren(...cards.map((c) => c.card));
+  // El gráfico se dibuja con el ancho real de su tarjeta, ya en la página.
+  cards.forEach((c, i) => c.chart && drawCum(c.chart, b.series[i], i));
+  batchWidth = grid.clientWidth;
+
+  const rows = batchAll ? b.missions : b.missions.slice(0, 12);
+  $("batchRows").replaceChildren(...rows.map((r) => {
+    const live = r.status === "active" || r.status === "closing";
+    const res = r.resultPct == null ? el("span", { class: "muted" }, live ? "en marcha" : "—")
+      : el("span", { class: r.status === "bust" || r.resultPct < -50 ? "bust" : r.resultPct >= 0 ? "up" : "down" }, signed(r.resultPct, " %"));
+    const twin = !r.twin ? "—" : r.twin.done ? `${r.twin.hits}/${r.twin.done}${r.twin.running ? " …" : ""}` : r.twin.running ? "en curso" : "sin eventos";
+    return el("tr", { class: live ? "live" : "" },
+      el("td", { class: "num" }, `#${r.id}`),
+      el("td", {}, el("span", { class: `serie-tag${r.costMode === "real" ? " real" : ""}` }, COSTS_SHORT[r.costMode] ?? r.costMode), r.planId != null ? el("span", { class: "muted" }, ` p${r.planId}`) : null),
+      el("td", { class: "tok", title: r.symbol ?? "" }, r.symbol ?? "—"),
+      el("td", { class: "num" }, res),
+      el("td", {}, live ? (r.status === "closing" ? "cerrando" : "—")
+        : r.endReason ? endText(r.endReason, r.revertedEntries) : STATUS[r.status] ?? r.status),
+      el("td", { class: "num" }, r.prepMinutes == null ? "—" : `${fmt(r.prepMinutes, 1)} min`),
+      el("td", { class: "num" }, r.entryLatencyS == null ? "—" : `${fmt(r.entryLatencyS, 1)} s`),
+      el("td", { class: "num", title: r.twin ? `medido con ${r.twin.measure}` : "sin gemelo" }, twin));
+  }));
+  const more = $("batchMore");
+  more.hidden = b.missions.length <= 12;
+  more.textContent = batchAll ? "Ver menos" : `Ver las ${b.missions.length} misiones`;
+}
+
+function seriesCard(s) {
+  const card = el("article", { class: "series" });
+  const pl = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+  const extra = [
+    pl(s.missions, "jugada", "jugadas"),
+    s.inProgress ? `${s.inProgress} en marcha` : null,
+    s.cancelled ? pl(s.cancelled, "cancelada sin reloj", "canceladas sin reloj") : null,
+    // Paradas con el reloj en marcha (a mano o sustituidas): su resultado no entra en el acumulado, pero se dice.
+    s.stopped ? `${pl(s.stopped, "detenida con reloj", "detenidas con reloj")} (${s.stoppedPnlUsd != null ? `${money(s.stoppedPnlUsd)}, ` : ""}fuera del acumulado)` : null,
+  ].filter(Boolean).join(" · ");
+  card.append(el("h3", {}, cap(COSTS[s.costMode] ?? s.costMode), el("span", {}, `${s.class} · ${extra}`)));
+  if (!s.missions) { card.append(el("p", { class: "quiet" }, "Todavía no ha terminado ninguna.")); return { card, chart: null }; }
+  card.append(el("p", { class: "series-big tab" }, `${s.hits} de ${s.missions}`, el("small", {}, "con la meta")));
+  card.append(el("p", { class: "series-stats" }, el("b", {}, `${fmt(s.hitPct, 0)} %`), ` de aciertos · IC95 ${s.ci95[0]}–${s.ci95[1]} %`));
+  const tone = (n) => (n >= 0 ? "up" : "down");
+  card.append(el("p", { class: "series-stats" }, "media ", el("b", { class: tone(s.avgPnlUsd) }, money(s.avgPnlUsd)), ` por misión (${signed(s.avgPct, " %")}) · acumulado `,
+    el("b", { class: tone(s.totalPnlUsd) }, money(s.totalPnlUsd)), " · ", el("b", {}, String(s.crashes)), ` hundida${s.crashes === 1 ? "" : "s"} (< −50 %)`));
+  if (s.twin) {
+    const t = s.twin;
+    card.append(el("p", { class: "series-stats" }, "gemelo ", el("b", {}, `${fmt(t.meanRatePct, 0)} %`), ` de media (${t.hits} de ${t.twins}, ${t.measure}; IC95 ${t.ci95[0]}–${t.ci95[1]} % en ${t.missions} misiones) · el agente, en esas: `,
+      el("b", {}, `${t.agentHits} de ${t.missions}`), ` (IC95 ${t.agentCi95[0]}–${t.agentCi95[1]} %)`));
+  } else card.append(el("p", { class: "series-stats" }, "gemelo: aún sin gemelos terminados"));
+  const chart = svg("svg", { class: "cum-chart", role: "img", "aria-label": `Resultado acumulado de la serie de ${COSTS[s.costMode] ?? s.costMode}, misión a misión` });
+  card.append(chart);
+  card.append(el("ul", { class: "plan-rows" }, ...s.plans.map((pl) => el("li", {},
+    el("b", {}, pl.planId != null ? `plan #${pl.planId}` : "sin plan"), ` · misiones ${pl.fromN}–${pl.toN} de la serie · `,
+    el("b", {}, `${pl.hits} de ${pl.missions}`), ` (${fmt(pl.hitPct, 0)} %${pl.predictedPct != null ? `; el plan esperaba ${fmt(pl.predictedPct, 0)} %` : ""}) · media ${money(pl.avgPnlUsd)} · ${pl.crashes} hundida${pl.crashes === 1 ? "" : "s"}`,
+    pl.twin ? ` · gemelo ${fmt(pl.twin.meanRatePct, 0)} %` : ""))));
+  return { card, chart };
+}
+
+function drawCum(chart, s, idx) {
+  if (!s.points.length) { chart.remove(); return; }
+  const W = Math.max(280, chart.clientWidth || 400), H = 190, m = { l: 52, r: 58, t: 20, b: 22 };
+  chart.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  const pts = [{ n: 0, cumUsd: 0 }, ...s.points];
+  const N = s.points.length;
+  const vals = pts.map((p) => p.cumUsd);
+  let y0 = Math.min(0, ...vals), y1 = Math.max(0, ...vals);
+  const pad = (y1 - y0 || 10) * 0.12;
+  y0 -= pad; y1 += pad;
+  const X = (n) => m.l + (n / N) * (W - m.l - m.r);
+  const Y = (v) => m.t + (1 - (v - y0) / (y1 - y0)) * (H - m.t - m.b);
+  const zero = Y(0);
+  for (const v of [Math.max(...vals), Math.min(...vals)]) {
+    if (Math.abs(Y(v) - zero) < 14) continue;
+    chart.append(svg("line", { class: "grid", x1: m.l, x2: W - m.r, y1: Y(v), y2: Y(v) }));
+    chart.append(svg("text", { class: "axis", x: m.l - 8, y: Y(v) + 4, "text-anchor": "end" }, money(v)));
+  }
+  chart.append(svg("line", { class: "zero", x1: m.l, x2: W - m.r, y1: zero, y2: zero }));
+  chart.append(svg("text", { class: "axis", x: m.l - 8, y: zero + 4, "text-anchor": "end" }, "0 $"));
+  // Lo ganado, sombreado en verde sobre el cero; lo perdido, en rojo debajo.
+  const line = pts.map((p, i) => `${i ? "L" : "M"}${X(p.n).toFixed(1)},${Y(p.cumUsd).toFixed(1)}`).join("");
+  const area = `${line}L${X(N).toFixed(1)},${zero}L${X(0).toFixed(1)},${zero}Z`;
+  const defs = svg("defs");
+  const up = svg("clipPath", { id: `cum-up-${idx}` }), down = svg("clipPath", { id: `cum-down-${idx}` });
+  up.append(svg("rect", { x: 0, y: 0, width: W, height: zero }));
+  down.append(svg("rect", { x: 0, y: zero, width: W, height: H - zero }));
+  defs.append(up, down);
+  chart.append(defs);
+  chart.append(svg("path", { class: "area-up", d: area, "clip-path": `url(#cum-up-${idx})` }));
+  chart.append(svg("path", { class: "area-down", d: area, "clip-path": `url(#cum-down-${idx})` }));
+  // Fronteras de plan: donde la serie empieza a jugar con otro plan.
+  s.planBoundaries.forEach((b, i) => {
+    const x = i === 0 ? m.l : X(b.n - 0.5);
+    if (i > 0) chart.append(svg("line", { class: "plan-line", x1: x, x2: x, y1: m.t - 6, y2: H - m.b }));
+    chart.append(svg("text", { class: "plan-label", x: x + (i === 0 ? 0 : 4), y: m.t - 8 }, b.planId != null ? `plan #${b.planId}` : "sin plan"));
+  });
+  chart.append(svg("path", { class: "cum", d: line }));
+  const r = N > 60 ? 2.5 : N > 30 ? 3 : 4;
+  for (const p of s.points) {
+    const kind = p.crash ? "bust" : p.hit ? "win" : p.resultPct >= 0 ? "up" : "down";
+    const g = svg("g", { class: "p" });
+    g.append(svg("title", {}, `Misión #${p.missionId}${p.symbol ? ` · ${p.symbol}` : ""} · ${signed(p.resultPct, " %")} (${money(p.pnlUsd)}) · acumulado ${money(p.cumUsd)}`));
+    g.append(svg("circle", { class: `pt ${kind}`, cx: X(p.n), cy: Y(p.cumUsd), r }));
+    chart.append(g);
+  }
+  const last = s.points.at(-1);
+  chart.append(svg("text", { class: "end", x: X(N) + 8, y: Y(last.cumUsd) + 4 }, money(last.cumUsd)));
+  chart.append(svg("text", { class: "axis", x: X(1), y: H - 4, "text-anchor": "middle" }, "1"));
+  if (N > 1) chart.append(svg("text", { class: "axis", x: X(N), y: H - 4, "text-anchor": "middle" }, String(N)));
+  if (N > 4) chart.append(svg("text", { class: "axis", x: (X(1) + X(N)) / 2, y: H - 4, "text-anchor": "middle" }, "misiones de la serie →"));
+}
+// Al cambiar el ancho (no la altura, que cambia al redibujar), los gráficos se rehacen con el nuevo.
+let batchWidth = 0;
+new ResizeObserver(() => { if (state?.batches && $("seriesGrid").clientWidth !== batchWidth) renderBatches(); }).observe($("seriesGrid"));
+
 // ── Qué aprende ──────────────────────────────────────────────
 // ── Todas sus misiones ───────────────────────────────────────
 const isWin = (h) => h.outcome === "objetivo conseguido";
@@ -874,15 +1294,17 @@ function renderLearn() {
 // ── Radio del equipo: el agente a la izquierda, el revisor a la derecha ──
 const TAG = {
   thought: "anota", thinking: "razona", text: "dice", note: "apunta", request: "pide", lesson: "aprende", review: "revisa",
-  trade: "opera", order: "orden", hypothetical: "hipótesis",
+  trade: "opera", order: "orden", hypothetical: "hipótesis", plan: "escribe el plan",
 };
 const GROUP = {
-  thought: "mind", thinking: "mind", text: "mind", note: "mind", request: "mind",
+  thought: "mind", thinking: "mind", text: "mind", note: "mind", request: "mind", plan: "mind",
   lesson: "learn", review: "learn",
-  search: "research", browse: "research", fetch: "research", tool: "research", result: "research",
+  search: "research", browse: "research", fetch: "research", tool: "research", result: "research", signal: "research",
   trade: "trades", order: "trades", hypothetical: "trades",
-  mission: "system", session: "system", error: "system",
+  mission: "system", session: "system", error: "system", step: "system",
 };
+// Quién habla: el trader (misiones largas) o, en las rápidas, el ejecutor, el cerebro (planner) y el revisor.
+const SPEAKER = { trader: "agente", executor: "ejecutor", planner: "cerebro", reviewer: "revisor" };
 const EMPTY = {
   mind: "Todavía no ha dicho nada.",
   research: "Todavía no ha investigado nada.",
@@ -895,7 +1317,8 @@ let firstFeed = true;
 let lastSpeaker = null;
 let unread = 0;
 const chainOf = (e) => e.body?.match(/"(?:chain|venue)":\s*"(\w+)"/)?.[1];
-const needsUpdate = (e) => !seen.has(e.id) || (e.body && seen.get(e.id).dataset.body !== "1");
+// Se rehace lo que ya estaba cuando llega su resultado (o termina su llamada, aunque no devuelva texto).
+const needsUpdate = (e) => !seen.has(e.id) || (e.body && seen.get(e.id).dataset.body !== "1") || (e.endTs && seen.get(e.id).dataset.end !== "1");
 
 function renderThesis(note) {
   const parts = note.split("\n").map((line) => line.match(/^(Por qué|Pruebas|Fuentes|Plan|Memoria|Lecciones): ([\s\S]*)$/));
@@ -915,17 +1338,19 @@ function renderThesis(note) {
 }
 
 function makeItem(e) {
-  const g = GROUP[e.kind] ?? "research";
+  // Lo que dice el revisor va a «Aprende», aunque sea un texto de su sesión.
+  const g = e.agent === "reviewer" && e.kind === "text" ? "learn" : (GROUP[e.kind] ?? "research");
   const time = el("time", { class: "tab" }, hm(e.ts));
   let item;
   if (g === "mind" || g === "learn") {
     // Mensajes seguidos del mismo tipo y de hace poco van sin cabecera, como en un chat.
-    const who = g === "learn" ? "revisor" : "agente";
+    const who = e.agent ? SPEAKER[e.agent] ?? "agente" : g === "learn" ? "revisor" : "agente";
     const t = new Date(e.ts).getTime();
     const cont = lastSpeaker && lastSpeaker.who === who && lastSpeaker.kind === e.kind && t - lastSpeaker.t < 180_000;
     lastSpeaker = { who, kind: e.kind, t };
     const text = e.body ?? e.title;
-    item = el("div", { class: `msg${who === "revisor" ? " rev" : ""}${e.kind === "thinking" ? " quiet-msg" : ""}${cont ? " cont" : ""}` },
+    const side = who === "revisor" ? " rev" : who === "cerebro" ? " plan" : "";
+    item = el("div", { class: `msg${side}${e.kind === "thinking" ? " quiet-msg" : ""}${cont ? " cont" : ""}` },
       el("div", { class: "meta" }, el("b", {}, who), `${TAG[e.kind]} · `, time),
       el("div", { class: "bubble" }, e.body ? el("strong", {}, e.title) : null, el("div", { class: "txt" }, text)));
     if (text.length > 420 || text.split("\n").length > 7) {
@@ -943,17 +1368,20 @@ function makeItem(e) {
       item.append(el("details", {}, el("summary", {}, e.note ? "por qué" : "detalle"),
         e.note ? renderThesis(e.note) : null, e.body ? el("pre", {}, e.body) : null));
     }
-  } else if (e.kind === "mission") {
+  } else if (e.kind === "mission" || e.kind === "step") {
     lastSpeaker = null;
     item = el("div", { class: "sys" }, `${e.title} · ${hm(e.ts)}`);
   } else {
-    // Investigación, sesiones y errores: una línea discreta; si trae resultado, se despliega.
-    const cls = `line${e.kind === "error" ? " err" : ""}`;
-    const row = [el("span", { title: e.title }, e.title), time];
+    // Investigación, sesiones y errores: una línea discreta; si trae resultado, se despliega. La señal, resaltada.
+    const cls = `line${e.kind === "error" ? " err" : e.kind === "signal" ? " sig" : ""}`;
+    // Una llamada del simulador sin resultado todavía (una espera de la señal puede durar 4,5 min): en curso.
+    const title = e.tool && !e.endTs && !e.body && e.kind !== "error" ? `${e.title} · en curso…` : e.title;
+    const row = [el("span", { title }, title), time];
     item = e.body ? el("details", { class: cls }, el("summary", {}, ...row), el("pre", {}, e.body)) : el("div", { class: cls }, el("div", {}, ...row));
   }
   item.dataset.g = g;
   item.dataset.body = e.body ? "1" : "";
+  item.dataset.end = e.endTs ? "1" : "";
   return item;
 }
 

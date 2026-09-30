@@ -7340,6 +7340,60 @@ var init_text = __esm({
 // src/migrations.ts
 import { mkdirSync as mkdirSync2, readdirSync, rmSync } from "node:fs";
 import path4 from "node:path";
+function backfillAgentEntries(db2) {
+  const orders = db2.prepare(
+    `SELECT o.mission_id, o.trigger_asset, o.trigger_price, o.created_at, m.created_at AS m_created, m.deadline, m.mode
+       FROM orders o JOIN missions m ON m.id = o.mission_id
+       WHERE o.venue = 'solana' AND o.condition = 'above' AND o.reasoning LIKE 'Toma de beneficio de enter_with_exits%' AND m.started_at IS NOT NULL
+       ORDER BY o.id`
+  ).all();
+  const insert = db2.prepare(
+    `INSERT OR IGNORE INTO agent_entries (mission_id, token, symbol, entered_at, horizon_end, usd_in, tokens, entry_price_usd, tp_price_usd, features)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  );
+  const done = /* @__PURE__ */ new Set();
+  for (const o of orders) {
+    if (done.has(o.mission_id)) continue;
+    done.add(o.mission_id);
+    if (o.mode === "live" || !isFastMinutes(missionDurationMinutes({ created_at: o.m_created, deadline: o.deadline }))) continue;
+    try {
+      const buy = db2.prepare("SELECT ts, details FROM journal WHERE mission_id = ? AND kind = 'swap' AND ts <= ? AND json_extract(details, '$.outputMint') = ? ORDER BY id LIMIT 1").get(o.mission_id, o.created_at, o.trigger_asset);
+      if (!buy) continue;
+      const d = JSON.parse(buy.details);
+      const usdIn = parseFloat(String(d.sold ?? ""));
+      const tokens = parseFloat(String(d.received ?? ""));
+      if (!(usdIn > 0) || !(tokens > 0)) continue;
+      const pos = db2.prepare("SELECT opened_at, symbol, entry_features FROM positions WHERE mission_id = ? AND venue = 'solana' AND asset = ? ORDER BY id LIMIT 1").get(o.mission_id, o.trigger_asset);
+      insert.run(o.mission_id, o.trigger_asset, pos?.symbol ?? null, pos?.opened_at ?? buy.ts, o.deadline, usdIn, tokens, usdIn / tokens, o.trigger_price, legacyFicha(pos?.entry_features));
+    } catch {
+    }
+  }
+}
+function legacyFicha(raw) {
+  try {
+    const f = JSON.parse(raw ?? "null");
+    if (!f) return null;
+    const pick = {
+      launchpad: "launchpad",
+      holders: "holders",
+      mcapUsd: "jupMcapUsd",
+      liquidityUsd: "jupLiquidityUsd",
+      organicScore: "organicScore",
+      topHoldersPct: "topHoldersPct",
+      devHoldingPct: "devBalancePct",
+      creatorTokens: "devMints",
+      creatorGraduated: "devMigrations",
+      creator: "dev",
+      netBuyers5m: "netBuyers5m"
+    };
+    const out = { from: "posici\xF3n (le\xEDdos tras la compra, antes de v0.37.2)" };
+    for (const [k, v] of Object.entries(pick)) if (f[k] !== void 0 && f[k] !== null) out[v] = f[k];
+    if (typeof f.pairAgeMinutes === "number") out.graduatedAgoS = f.pairAgeMinutes * 60;
+    return JSON.stringify(out);
+  } catch {
+    return null;
+  }
+}
 function decisionBackfill(db2) {
   const positions = db2.prepare("SELECT id, mission_id, venue, asset, opened_at, closed_at, status, cost_open_usd, realized_cost_usd, realized_proceeds_usd, research FROM positions ORDER BY opened_at, id").all();
   const missions = new Map(db2.prepare("SELECT id, initial_usd, deadline FROM missions").all().map((m) => [m.id, m]));
@@ -7554,7 +7608,7 @@ function runMigrations(db2, dataDir, migrations = MIGRATIONS) {
   }
   return applied;
 }
-var MIGRATIONS, MAX_BACKUPS, schemaVersion;
+var MIGRATIONS, CANDLE_COLUMNS, MAX_BACKUPS, schemaVersion;
 var init_migrations = __esm({
   "src/migrations.ts"() {
     "use strict";
@@ -7801,7 +7855,72 @@ var init_migrations = __esm({
         -- Red y renta de cada gemelo con costes realistas, en USD (con los de siempre, 0: como hasta ahora).
         ALTER TABLE shadow_positions ADD COLUMN costs_usd REAL NOT NULL DEFAULT 0;
       `)
+      },
+      {
+        version: 15,
+        description: "Misiones r\xE1pidas: ficha de entrada y resultado medido con velas de 1 min, del agente y de cada gemelo; cotizaciones perdidas del gemelo",
+        up: (db2) => {
+          db2.exec(`
+        -- Lo le\xEDdo de la se\xF1al de wait_for_signal (pool, GeckoTerminal y Jupiter): la ficha de la entrada del agente.
+        ALTER TABLE missions ADD COLUMN signal_features TEXT;
+        -- Ficha de entrada del gemelo (JSON) y cotizaciones que tocaban y no se pudieron hacer (Jupiter ocupado, 429, sin turno).
+        ALTER TABLE shadow_positions ADD COLUMN features TEXT;
+        ALTER TABLE shadow_positions ADD COLUMN quotes_missed INTEGER NOT NULL DEFAULT 0;
+        -- La entrada del agente en cada misi\xF3n r\xE1pida (la primera de enter_with_exits), para medirla con velas como a los gemelos.
+        CREATE TABLE agent_entries (
+          mission_id INTEGER PRIMARY KEY,
+          token TEXT NOT NULL,
+          symbol TEXT,
+          pool TEXT,                         -- el de la se\xF1al o el graduatedPool de Jupiter; si falta, lo busca la medida con velas
+          entered_at TEXT NOT NULL,
+          horizon_end TEXT NOT NULL,         -- el plazo de la misi\xF3n: hasta ah\xED se mide aunque la misi\xF3n acabe antes
+          usd_in REAL NOT NULL,
+          tokens REAL NOT NULL,
+          entry_price_usd REAL NOT NULL,     -- lo pagado entre los tokens recibidos
+          tp_price_usd REAL,                 -- el precio de la toma de beneficio (la orden de enter_with_exits)
+          features TEXT
+        );
+      `);
+          for (const table of ["shadow_positions", "agent_entries"]) for (const [name, type] of CANDLE_COLUMNS) db2.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${type}`);
+          backfillAgentEntries(db2);
+        }
+      },
+      {
+        version: 16,
+        description: "Tokens descartados por misi\xF3n: una compra de enter_with_exits que revierte por el precio no se vuelve a ofrecer ni a intentar",
+        up: (db2) => db2.exec(`
+        -- En la M18 (costes reales) la compra del segundo candidato revirti\xF3 dos veces con el precio movi\xE9ndose un 12 % en la
+        -- latencia, y a la tercera se forz\xF3 subiendo el slippage al 25 %: el token cay\xF3 un 79 %. wait_for_signal no los
+        -- devuelve y enter_with_exits no los compra en esa misi\xF3n.
+        CREATE TABLE entry_exclusions (
+          mission_id INTEGER NOT NULL,
+          token TEXT NOT NULL,
+          ts TEXT NOT NULL,
+          reason TEXT NOT NULL,
+          PRIMARY KEY (mission_id, token)
+        );
+      `)
       }
+    ];
+    CANDLE_COLUMNS = [
+      ["candle_status", "TEXT"],
+      ["candle_attempts", "INTEGER NOT NULL DEFAULT 0"],
+      ["candle_next_at", "TEXT"],
+      // no se vuelve a pedir antes (tras un 429 o si las velas aún no estaban)
+      ["candle_note", "TEXT"],
+      ["candle_hit_wick", "INTEGER"],
+      // algún máximo llegó a la toma de beneficio
+      ["candle_hit_close", "INTEGER"],
+      // algún cierre llegó
+      ["minutes_to_tp", "REAL"],
+      // de la entrada a la primera vela que la toca (0: la vela de la entrada)
+      ["max_drawdown_pct", "REAL"],
+      // el mínimo antes de tocarla (o en todo el plazo) frente al precio de entrada
+      ["max_runup_pct", "REAL"],
+      // el máximo de todo el plazo frente al precio de entrada
+      ["candle_count", "INTEGER"],
+      ["candle_gap_pct", "REAL"]
+      // cierre de la vela de la entrada frente al precio de entrada: si es grande, poco fiable
     ];
     MAX_BACKUPS = 10;
     schemaVersion = (db2) => db2.prepare("PRAGMA user_version").get().user_version;
@@ -7997,7 +8116,7 @@ var init_db = __esm({
       }
     }
     runMigrations(db, config.dataDir);
-    CODE_VERSION = "0.37.1";
+    CODE_VERSION = "0.37.2";
     semver = (v) => v.split(".").map((n3) => Number.parseInt(n3, 10) || 0);
     newer = (a, b) => {
       const [x, y] = [semver(a), semver(b)];
@@ -8084,17 +8203,17 @@ async function request(url, opts) {
     }
     if (res.status === 418) {
       blockStmt.run(host, banUntil(res, body));
-      return { status: res.status, body };
+      return { status: res.status, body, atMs: Date.now() };
     }
     if ((res.status === 429 || res.status === 503) && attempt2 < MAX_RETRIES) {
       const retryAfter = Number(res.headers.get("retry-after"));
       const wait2 = Number.isFinite(retryAfter) && retryAfter > 0 ? Math.min(retryAfter, 15) * 1e3 : COOLDOWN_MS;
       if (MIN_INTERVAL_MS[host]) cooldownStmt.run(host, Date.now() + wait2);
-      if (opts.lowPriority) return { status: res.status, body };
+      if (opts.lowPriority) return { status: res.status, body, atMs: Date.now() };
       if (!MIN_INTERVAL_MS[host]) await sleep(wait2);
       continue;
     }
-    return { status: res.status, body };
+    return { status: res.status, body, atMs: Date.now() };
   }
 }
 function fetchText(url, opts = {}) {
@@ -8123,9 +8242,12 @@ function isNoRouteError(err) {
 }
 async function fetchJson(url, a = {}, ttlMs) {
   const opts = typeof a === "number" ? { timeoutMs: a, ttlMs } : a;
-  const { status, body } = await fetchText(url, opts);
+  return (await fetchJsonAt(url, opts)).data;
+}
+async function fetchJsonAt(url, opts = {}) {
+  const { status, body, atMs } = await fetchText(url, opts);
   if (status < 200 || status >= 300) throw new Error(`HTTP ${status} en ${url}: ${body.slice(0, 300)}`);
-  return JSON.parse(body);
+  return { data: JSON.parse(body), atMs };
 }
 var DEFAULT_TTL_MS, MAX_PARALLEL_PER_HOST, MAX_RETRIES, MIN_INTERVAL_MS, DEFAULT_BAN_MS, COOLDOWN_MS, reserveStmt, takeFreeStmt, nextAtStmt, cooldownStmt, blockedStmt, blockStmt, LOW_PRIORITY_MAX_WAIT_MS, HostBusyError, MAX_CACHE_ENTRIES, cache, active, waiting, sleep, fetchImpl, budgetStmt;
 var init_http = __esm({
@@ -9487,6 +9609,20 @@ var init_baselines2 = __esm({
   }
 });
 
+// src/sim/candles.ts
+var CANDLE_SETTLE_MS, TRANSIENT_RETRY_MIN_MS, TRANSIENT_RETRY_MAX_MS, RATE_LIMIT_BACKOFF_MS;
+var init_candles = __esm({
+  "src/sim/candles.ts"() {
+    "use strict";
+    init_db();
+    init_http();
+    CANDLE_SETTLE_MS = 5 * 6e4;
+    TRANSIENT_RETRY_MIN_MS = 10 * 6e4;
+    TRANSIENT_RETRY_MAX_MS = 6 * 36e5;
+    RATE_LIMIT_BACKOFF_MS = 2 * 6e4;
+  }
+});
+
 // src/sim/costs.ts
 var init_costs = __esm({
   "src/sim/costs.ts"() {
@@ -9507,8 +9643,10 @@ var init_stats = __esm({
 var init_class_stats = __esm({
   "src/sim/class-stats.ts"() {
     "use strict";
+    init_config();
     init_db();
     init_baselines2();
+    init_candles();
     init_costs();
     init_stats();
   }
@@ -9591,12 +9729,20 @@ var init_transfers = __esm({
   }
 });
 
+// src/sim/ficha.ts
+var init_ficha = __esm({
+  "src/sim/ficha.ts"() {
+    "use strict";
+  }
+});
+
 // src/sim/signals.ts
 var init_signals = __esm({
   "src/sim/signals.ts"() {
     "use strict";
     init_http();
     init_jupiter();
+    init_ficha();
   }
 });
 
@@ -9608,6 +9754,8 @@ var init_shadow = __esm({
     init_config();
     init_db();
     init_http();
+    init_candles();
+    init_ficha();
     init_jupiter();
     init_costs();
     init_mission_kind();
@@ -9629,6 +9777,7 @@ var init_shadow = __esm({
 function getMission(id) {
   return db.prepare("SELECT * FROM missions WHERE id = ?").get(id);
 }
+var ENTRY_FILL_GRACE_MS;
 var init_mission = __esm({
   "src/sim/mission.ts"() {
     "use strict";
@@ -9644,6 +9793,7 @@ var init_mission = __esm({
     init_shadow();
     init_venues();
     init_mission_kind();
+    ENTRY_FILL_GRACE_MS = 5 * 6e4;
   }
 });
 

@@ -8,8 +8,11 @@
 // vuelta retrasaban la revisión de la toma de beneficio del agente y del plazo (se midieron vueltas de 14-24 s).
 // Jupiter admite una petición cada 1,1 s entre todos los procesos (market/http.ts). Por eso las vueltas no se solapan
 // (la siguiente se programa al acabar la anterior) y nadie repite una vuelta que otro proceso acaba de hacer.
+// La medida con velas de las entradas de las misiones rápidas (candles.ts) va en un tercer bucle, lento: una petición a
+// GeckoTerminal cada 30 s como mucho, por el carril de baja prioridad, y solo si hay alguna entrada por medir.
 import { config } from "../config.js";
 import { db, getMeta, setMeta } from "../db.js";
+import { CANDLE_LOOP_MS, candlesDue, checkCandleOutcomes } from "./candles.js";
 import { checkMission } from "./mission.js";
 import { isShortMission } from "./mission-kind.js";
 import { checkOrders } from "./orders.js";
@@ -145,10 +148,23 @@ export function startWatchLoop(opts: { canRun?: () => boolean; log?: (line: stri
     if (!stopped) shadowTimer = setTimeout(shadowBeat, Math.max(MIN_GAP_MS, shadowMs - (Date.now() - started)));
   };
   shadowTimer = setTimeout(shadowBeat, shadowMs);
+
+  // Las velas: sin prisa y sin compartir vuelta con nadie (si GeckoTerminal tarda o responde 429, solo espera este bucle).
+  let candleTimer: ReturnType<typeof setTimeout> | undefined;
+  const candleBeat = async () => {
+    try {
+      if ((opts.canRun?.() ?? true) && candlesDue()) for (const line of await checkCandleOutcomes({ maxRequests: 1 })) opts.log?.(line);
+    } catch (err) {
+      opts.log?.(`Error midiendo con velas: ${(err as Error).message}`);
+    }
+    if (!stopped) candleTimer = setTimeout(candleBeat, CANDLE_LOOP_MS);
+  };
+  candleTimer = setTimeout(candleBeat, CANDLE_LOOP_MS);
   return () => {
     stopped = true;
     clearTimeout(timer);
     clearTimeout(shadowTimer);
+    clearTimeout(candleTimer);
   };
 }
 

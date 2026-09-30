@@ -13,12 +13,13 @@ import * as sim from "../sim/portfolio.js";
 import * as transfers from "../sim/transfers.js";
 import { estimateTokenLaunch } from "../sim/launch.js";
 import { checkBuyAgainstMemory, memoryBlockers } from "../sim/guard.js";
-import { enterWithExits, prepareEntry } from "../sim/entry.js";
+import { buyEntry, entryExclusion, excludedTokens, placeExits, prepareEntry } from "../sim/entry.js";
+import { ENTRY_SLIPPAGE_BPS, entrySlippageBps } from "../sim/mission-kind.js";
 import * as plans from "../sim/plans.js";
 import { DEFAULT_MAX_ROUND_TRIP_COST_PCT, describeSourceErrors, waitForSignal } from "../sim/signals.js";
 import { baselineForClass } from "../sim/baselines.js";
 import { asset } from "../paths.js";
-import { AGENTS, json, MARKET_READERS, OPERATORS, tool, type ToolCtx, type ToolOutput } from "./define.js";
+import { AGENTS, json, MARKET_READERS, OPERATORS, tool, type EntryResult, type ToolCtx, type ToolOutput } from "./define.js";
 import { toText } from "./format.js";
 import { recordFeatures, recordRead, recordScan } from "../sim/market-state.js";
 import { WAIT_MIN_MINUTES, waitTiming, watchTick } from "../sim/watch.js";
@@ -28,6 +29,38 @@ const mid = (ctx: ToolCtx): number => {
   if (ctx.missionId === null) throw new Error("No hay ninguna misión");
   return ctx.missionId;
 };
+
+/**
+ * En una misión rápida, comprar un token fuera de enter_with_exits (simulate_swap, o una orden condicional que compra) sigue
+ * las reglas de la entrada: no se compra un token descartado (su compra revirtió porque el precio se movió más que el
+ * slippage) ni con más slippage que el de la entrada (el del plan o ENTRY_SLIPPAGE_BPS). En la M18 se forzó una entrada
+ * subiendo el slippage al 25 % y el token cayó un 79 %: con el reloj en marcha, simulate_swap permitía repetirlo. Vender
+ * (a efectivo o al nativo de la cadena) no tiene tope.
+ */
+async function checkFastBuy(a: { missionId: number; chain: ChainId; output: string; slippageBps: number; via: string }) {
+  const m = mission.getMission(a.missionId);
+  if (!m || !mission.isFastMission(m)) return;
+  const chain = getChain(a.chain);
+  const token = await chain.resolveToken(a.output);
+  if (chain.isCash(token.address) || token.address === chain.native.address) return;
+  const excluded = entryExclusion(a.missionId, token.address);
+  if (excluded) {
+    throw new Error(
+      `${token.symbol} está descartado en esta misión (${excluded.reason}): no se compra, ni con enter_with_exits ni con ${a.via}. ` +
+        "Espera al siguiente candidato con wait_for_signal",
+    );
+  }
+  const plan = plans.planForMission(a.missionId);
+  const max = entrySlippageBps(plan);
+  if (a.slippageBps > max) {
+    const from = plan?.body.slippage_bps !== undefined ? `el del plan #${plan.id}` : "el de por defecto";
+    throw new Error(
+      `slippage_bps ${a.slippageBps} pasa del tope de ${max} para comprar un token en una misión rápida (${from}, el mismo que en enter_with_exits): ` +
+        "una compra no se fuerza subiendo el slippage. Si revierte, el precio se está moviendo en tu contra más de lo que admite el plan, y eso es " +
+        "justo de lo que protege la reversión",
+    );
+  }
+}
 
 
 // Las esperas no pasan de 4,5 minutos: la caché de prompts de los subagentes dura 5, y una espera más
@@ -612,7 +645,11 @@ export const SIM_TOOLS = [
       source: z.enum(plans.SIGNAL_SOURCES).optional().describe("Por defecto, la del plan (o graduado)"),
       max_minutes: z.number().min(0.25).max(MAX_WAIT_MINUTES).default(MAX_WAIT_MINUTES),
       usd_amount: z.number().positive().optional().describe("Con cuánto cotizar la ida y vuelta (por defecto, el importe del plan o todo tu efectivo en Solana)"),
-      exclude: z.array(z.string()).max(100).optional().describe("Tokens que ya has descartado: no los devuelve"),
+      exclude: z
+        .array(z.string())
+        .max(100)
+        .optional()
+        .describe("Tokens que ya has descartado: no los devuelve (los que revirtieron al comprarlos con enter_with_exits ya van descartados solos)"),
     }),
     run: async (i, ctx) => {
       const m = ctx.missionId !== null ? mission.getMission(ctx.missionId) : undefined;
@@ -634,7 +671,8 @@ export const SIM_TOOLS = [
         shortlist,
         usdAmount,
         maxMinutes: i.max_minutes,
-        exclude: i.exclude,
+        // Con los que ya revirtieron al comprarlos en esta misión (entry_exclusions): no se vuelven a ofrecer.
+        exclude: [...(i.exclude ?? []), ...(active ? excludedTokens(active.id) : [])],
         shouldStop: () => (active && mission.getMission(active.id)?.status !== "active" ? "la misión ya no está activa" : null),
         // Un candidato que la memoria va a rechazar al entrar no sirve: enter_with_exits lo frenaría con el evento ya pasado.
         accept: async (c) => {
@@ -665,7 +703,7 @@ export const SIM_TOOLS = [
       }
       positions.logResearch(ctx.missionId, "wait_for_signal", r.candidate.token);
       // La hora de la señal queda en la misión: con la de la compra (enter_with_exits), cuánto se tarda en entrar.
-      if (active) mission.recordSignal(active.id, r.candidate.token);
+      if (active) mission.recordSignal(active.id, r.candidate.token, r.snapshot);
       return toText({
         signal: `${r.candidate.symbol ?? r.candidate.token} pasa los filtros${plan ? ` del plan #${plan.id}` : ""}`,
         ...r.candidate,
@@ -733,7 +771,9 @@ export const SIM_TOOLS = [
       "slippage_bps protege la cotización que acabas de ver: si cotizaste este mismo swap con quote_swap hace menos de 60 s y el precio se ha movido " +
       "más que tu slippage, el swap revierte (pagas solo la red). Sin cotización previa, se ejecuta al precio del momento. " +
       "Con costes realistas (mission_status.costs empieza por \"real\"), en Solana siempre se vuelve a cotizar tras la latencia: sin quote_swap previo, " +
-      "el slippage se mide contra la cotización con la que se decidió y, si ha empeorado más, revierte y pagas la red. En memecoins usa ~300 bps (con 50 revierte a menudo).",
+      "el slippage se mide contra la cotización con la que se decidió y, si ha empeorado más, revierte y pagas la red. En memecoins usa ~300 bps (con 50 revierte a menudo). " +
+      "En una misión rápida, comprar un token sigue las reglas de enter_with_exits: no compra un token descartado (su compra revirtió) ni con más " +
+      `slippage que el del plan (por defecto, ${ENTRY_SLIPPAGE_BPS}). Vender no tiene tope.`,
     schema: z.object({
       chain: chainParam,
       input: z.string(),
@@ -746,6 +786,7 @@ export const SIM_TOOLS = [
     run: async (i, ctx) => {
       const t = fullThesis(i.thesis, ctx);
       if (sim.isLiveMission(mid(ctx))) throw new Error("Esta misión es REAL: usa execute_swap (opera con dinero de verdad). simulate_swap solo sirve en misiones simuladas.");
+      await checkFastBuy({ missionId: mid(ctx), chain: i.chain, output: i.output, slippageBps: i.slippage_bps, via: "simulate_swap" });
       await checkBuyAgainstMemory({ chain: i.chain, output: i.output, overrides: t.overrides, risksChecked: t.risks_checked, missionId: mid(ctx), input: i.input, amount: i.amount });
       return json(
         await sim.swap({
@@ -1025,6 +1066,7 @@ export const SIM_TOOLS = [
     run: async (i, ctx) => {
       const t = fullThesis(i.thesis, ctx);
       if (!i.sell_all && i.amount === undefined) throw new Error("Indica amount o sell_all");
+      await checkFastBuy({ missionId: mid(ctx), chain: i.chain, output: i.output, slippageBps: i.slippage_bps, via: "una orden condicional" });
       await checkBuyAgainstMemory({ chain: i.chain, output: i.output, overrides: t.overrides, risksChecked: t.risks_checked, missionId: mid(ctx), input: i.input, amount: i.amount });
       return json(
         await orders.placeOrder({
@@ -1048,12 +1090,14 @@ export const SIM_TOOLS = [
     startsClock: true,
     journaled: true,
     description:
-      "Entrada de una misión rápida en UNA llamada: si el reloj no ha arrancado, lo arranca (igual que start_session), compra el token con todo tu " +
-      "efectivo de la cadena (el nativo se queda para la red) o con usd_amount, y deja puesta la toma de beneficio: una orden límite que vende todo " +
-      "el token a un precio fijo. Ese precio sale de tp_ratio (× el precio de compra), del plan citado o, si no, del objetivo de la misión (el que " +
-      "la deja cumplida neta de costes; también con tp_at_target, p. ej. en una reentrada). Devuelve la compra, la orden y el plazo del reloj. " +
-      "Antes de arrancar el reloj lo comprueba todo (tesis o plan, efectivo, token, una cotización de ida y vuelta —más del 10 % es un pool " +
-      "vaciado— y tu memoria): si algo falla, no compra ni arranca el reloj. " +
+      "Entrada de una misión rápida en UNA llamada: compra el token con todo tu efectivo de la cadena (el nativo se queda para la red) o con " +
+      "usd_amount; si el reloj no corría, lo arranca en el momento en que la compra se llena (igual que start_session), y deja puesta la toma de " +
+      "beneficio: una orden límite que vende todo el token a un precio fijo. Ese precio sale de tp_ratio (× el precio de compra), del plan citado " +
+      "o, si no, del objetivo de la misión (el que la deja cumplida neta de costes; también con tp_at_target, p. ej. en una reentrada). Devuelve " +
+      "la compra, la orden y el plazo del reloj. Antes de comprar lo comprueba todo (tesis o plan, efectivo, token, slippage, una cotización de " +
+      "ida y vuelta —más del 10 % es un pool vaciado— y tu memoria): si algo falla, o si la compra revierte, no compra ni arranca el reloj. " +
+      "Una compra que revierte porque el precio se ha movido más que el slippage deja ese token descartado en la misión: wait_for_signal no " +
+      `lo vuelve a dar y aquí no se reintenta. El slippage no puede pasar del del plan (por defecto, ${ENTRY_SLIPPAGE_BPS} = 3 %). ` +
       "Con thesis { plan_ref } la tesis es la del plan. Solo en misiones simuladas.",
     schema: z.object({
       chain: chainParam.default("solana"),
@@ -1061,16 +1105,37 @@ export const SIM_TOOLS = [
       usd_amount: z.number().positive().optional().describe("Cuánto gastar (por defecto, el importe del plan o todo el efectivo de la cadena)"),
       tp_ratio: z.number().min(1.01).max(20).optional().describe("Toma de beneficio = precio de compra × tp_ratio (por defecto, la del plan o la del objetivo)"),
       tp_at_target: z.boolean().optional().describe("Toma de beneficio en el precio que deja el objetivo cumplido, aunque el plan tenga tp_ratio"),
-      slippage_bps: z.number().int().min(1).max(5000).default(300),
+      slippage_bps: z
+        .number()
+        .int()
+        .min(1)
+        .max(5000)
+        .optional()
+        .describe(`Por defecto y como máximo, el del plan (${ENTRY_SLIPPAGE_BPS} si no fija otro): no se sube para forzar una entrada que revierte`),
       thesis: thesisParam,
     }),
-    // Todo lo que puede fallar sin operar se comprueba antes de arrancar el reloj (runTool): si falla, el reloj sigue
-    // parado y el executor espera al siguiente candidato gratis.
+    // Todo lo que puede fallar sin operar se comprueba antes de comprar (runTool): si falla, el reloj sigue parado y el
+    // executor espera al siguiente candidato gratis.
     preflight: async (i, ctx) => {
       const m = mid(ctx);
       if (sim.isLiveMission(m)) throw new Error("enter_with_exits solo existe en misiones simuladas");
       const t = fullThesis(i.thesis, ctx);
       const plan = "plan_ref" in i.thesis ? plans.getPlan(i.thesis.plan_ref) : undefined;
+      // El slippage de la compra: el del plan (el citado o el de la misión) o el de por defecto, y nunca más. Subirlo tras
+      // una reversión es entrar justo en lo que la reversión evitaba (M18: al 25 % entró, y el token cayó un 79 %).
+      const slippagePlan = plan ?? plans.planForMission(m);
+      const maxSlippage = entrySlippageBps(slippagePlan);
+      const slippageBps = i.slippage_bps ?? maxSlippage;
+      if (slippageBps > maxSlippage) {
+        const from = slippagePlan?.body.slippage_bps !== undefined ? `el del plan #${slippagePlan.id}` : "el de por defecto";
+        throw new Error(
+          `slippage_bps ${slippageBps} pasa del tope de ${maxSlippage} (${from}): una entrada no se fuerza subiendo el slippage. Si la compra ` +
+            "revierte, el precio se está moviendo en tu contra más de lo que admite el plan, y eso es justo de lo que protege la reversión. " +
+            "Espera al siguiente candidato con wait_for_signal",
+        );
+      }
+      const excluded = entryExclusion(m, i.token);
+      if (excluded) throw new Error(`Ese token ya está descartado en esta misión (${excluded.reason}): no se reintenta. Espera al siguiente candidato con wait_for_signal`);
       // El importe fijo del plan se recorta al efectivo (la clase no dice el capital); uno pedido aquí tiene que caber.
       const entry = await prepareEntry({
         missionId: m,
@@ -1078,28 +1143,50 @@ export const SIM_TOOLS = [
         token: i.token,
         usdAmount: i.usd_amount,
         planUsdAmount: plan?.body.usd_amount,
-        slippageBps: i.slippage_bps,
+        slippageBps,
         // El plan puede subir el tope mecánico de la ida y vuelta, no bajarlo aquí: esto es la red contra un pool vaciado.
         maxRoundTripCostPct: Math.max(DEFAULT_MAX_ROUND_TRIP_COST_PCT, plan?.body.filters.max_round_trip_cost_pct ?? 0),
       });
+      const resolved = entryExclusion(m, entry.token.address);
+      if (resolved) throw new Error(`${entry.token.symbol} ya está descartado en esta misión (${resolved.reason}): no se reintenta. Espera al siguiente candidato con wait_for_signal`);
       await checkBuyAgainstMemory({ chain: i.chain, output: entry.token.address, overrides: t.overrides, risksChecked: t.risks_checked, missionId: m, input: entry.stable.address, amount: entry.amount });
-      return { thesis: t, plan, entry };
+      return { thesis: t, plan, entry, slippageBps };
     },
-    run: async (i, ctx, { thesis: t, plan, entry }) => {
-      const m = mid(ctx);
-      const tpRatio = i.tp_ratio ?? (i.tp_at_target ? undefined : plan?.body.tp_ratio);
-      const out = await enterWithExits({
-        missionId: m,
+    // La compra: la única operación antes del reloj. runTool lo arranca solo si se llena, a la hora de la compra.
+    entry: async (i, ctx, { thesis: t, entry, slippageBps }) =>
+      buyEntry({
+        missionId: mid(ctx),
         sessionId: ctx.sessionId,
         chain: i.chain,
-        token: entry.token.address,
-        usdAmount: entry.amount,
-        tpRatio,
-        tpRatioFrom: i.tp_ratio !== undefined ? "parámetro" : plan ? `plan #${plan.id}` : undefined,
-        slippageBps: i.slippage_bps,
+        token: entry.token,
+        stable: entry.stable,
+        amount: entry.amount,
+        slippageBps,
         reasoning: formatThesis(t),
         meta: tradeMeta(t),
-      });
+      }),
+    run: async (i, ctx, { thesis: t, plan, entry, slippageBps }, fill) => {
+      const m = mid(ctx);
+      const tpRatio = i.tp_ratio ?? (i.tp_at_target ? undefined : plan?.body.tp_ratio);
+      let out: Awaited<ReturnType<typeof placeExits>>;
+      try {
+        out = await placeExits({
+          missionId: m,
+          sessionId: ctx.sessionId,
+          chain: i.chain,
+          fill,
+          tpRatio,
+          tpRatioFrom: i.tp_ratio !== undefined ? "parámetro" : plan ? `plan #${plan.id}` : undefined,
+          slippageBps,
+          reasoning: formatThesis(t),
+        });
+      } catch (err) {
+        // La compra ya está hecha (y el reloj corre desde ella): el error no puede sonar a entrada rechazada.
+        throw new Error(
+          `La compra de ${fill.token.symbol} SÍ se ha hecho (${Number(fill.bought.toPrecision(6))} tokens por ${Number(fill.amount.toFixed(2))} ${fill.stable.symbol}) ` +
+            `y el reloj corre desde ella, pero la toma de beneficio no se ha podido calcular ni poner (${(err as Error).message}). Ponla con place_swap_trigger_order`,
+        );
+      }
       // Con plan_ref, la misión queda con ese plan (su P y la de la línea base) para compararla después. Solo con la
       // compra hecha: una entrada rechazada no asigna nada.
       if (plan && mission.getMission(m)?.plan_id !== plan.id) plans.attachPlan(m, plan);
@@ -1263,6 +1350,16 @@ export const SIM_TOOLS = [
       sizing: z.string().min(1).default("todo el capital menos el gas"),
       usd_amount: z.number().positive().optional().describe("Importe fijo de cada entrada (por defecto, todo el efectivo de la cadena)"),
       tp_ratio: z.number().min(1.01).max(20).optional().describe("Toma de beneficio = precio de compra × tp_ratio (sin él, en el precio que da el objetivo neto)"),
+      slippage_bps: z
+        .number()
+        .int()
+        .min(50)
+        .max(1000)
+        .optional()
+        .describe(
+          `Slippage de la compra de enter_with_exits (por defecto, ${ENTRY_SLIPPAGE_BPS} = 3 %; el gemelo usa el mismo). Es un tope: el executor no puede ` +
+            "subirlo para forzar una entrada que revierte",
+        ),
       reentry: z.string().min(1).describe("Regla de reentrada (o por qué no la hay)"),
       reentry_allowed: z.boolean(),
       risks_checked: z.string().min(15).describe("Lo comprobado en contra (creencias negativas, riskCheck): vale para cada compra que cite el plan"),
@@ -1459,9 +1556,40 @@ export const SIM_TOOLS = [
       "Lo que tienes pendiente como revisor: misiones terminadas sin retrospectiva, la misión activa (actividad desde tu última revisión, " +
       "cada cuánto conviene revisarla y si tiene briefing), observaciones del agente sin procesar, errores repetidos sin howto y creencias sin condición. " +
       "missionClasses: por clase de misión, aciertos con su IC de Wilson, la suma de las P predichas frente a los aciertos (calibración), la " +
-      "línea base, los aciertos del gemelo mecánico y la comparación misión a misión con él.",
+      "línea base, los aciertos del gemelo mecánico y la comparación misión a misión con él; `candles`, los aciertos del agente y del gemelo " +
+      "medidos con velas de 1 min (la misma vara para los dos: los del gemelo con cotizaciones pueden quedarse cortos, ver twinObservation).",
     schema: z.object({}),
     run: async () => toText(memory.reviewQueue()),
+  }),
+  tool({
+    name: "entry_dataset",
+    kind: "memory",
+    role: ["planner", "reviewer"],
+    description:
+      "Las entradas de una clase de misión rápida, una fila por entrada del agente y por gemelo mecánico: su ficha al entrar (edad del pool y " +
+      "desde la graduación, liquidez, FDV y mcap, compras, compradores y volumen de 5 min, holders, % de los mayores holders y del creador, " +
+      "sus lanzamientos, organicScore, ida y vuelta…), su resultado real (realHit, retPct) y el medido con velas de 1 min (wick/close, minutos " +
+      "hasta tocar la toma de beneficio, lo más bajo antes y lo más alto). Con classStats de la clase (aciertos del agente, del gemelo con " +
+      "cotizaciones y de los dos con velas, con su IC). Con split_by (un campo de la ficha) y split_at, los aciertos de cada lado con su IC, " +
+      "del agente, de los gemelos y de todos: para buscar un filtro con evidencia antes de proponerlo.",
+    schema: z.object({
+      mission_class: z.string().optional().describe("Clase, p. ej. graduado-10m-+25% (por defecto, la de la misión activa o la del plan vigente)"),
+      costs: z.enum(["sim", "real"]).optional().describe("Solo las misiones con ese modo de costes (por defecto, todas: cada fila dice el suyo)"),
+      who: z.enum(["all", "agent", "twin"]).default("all"),
+      split_by: z.string().optional().describe("Campo de la ficha por el que partir las entradas, p. ej. holders, jupMcapUsd, topHoldersPct, mintDisabled"),
+      split_at: z.number().optional().describe("Umbral de split_by (≤ y >); por defecto, su mediana"),
+      limit: z.number().int().min(1).max(400).default(120).describe("Filas, las más recientes"),
+    }),
+    run: async (i, ctx) => {
+      const { classMissionIds, defaultDatasetClass, entryDataset } = await import("../sim/entry-dataset.js");
+      const m = ctx.missionId !== null ? mission.getMission(ctx.missionId) : undefined;
+      const cls = i.mission_class ?? defaultDatasetClass(m?.class, plans.latestActivePlan()?.class);
+      if (!cls) return "Aún no hay entradas de misiones rápidas: indica mission_class cuando las haya.";
+      // Si faltan velas de entradas ya terminadas, unas pocas ahora (el bucle de fondo mide el resto poco a poco).
+      const { checkCandleOutcomes } = await import("../sim/candles.js");
+      await checkCandleOutcomes({ missionIds: classMissionIds(cls), maxRequests: 2 }).catch(() => []);
+      return toText(entryDataset({ cls, costs: i.costs, who: i.who, splitBy: i.split_by, splitAt: i.split_at, limit: i.limit }));
+    },
   }),
   tool({
     name: "mission_review_data",
@@ -1473,9 +1601,15 @@ export const SIM_TOOLS = [
       "Con since (fecha ISO) solo lo posterior a esa fecha (útil a mitad de misión). Sin since incluye `counterfactuals`: para cada " +
       "operación cerrada, con el precio real minuto a minuto, cuánto llegó a subir mientras la tenía y qué habría dado mantenerla 15 o " +
       "30 min más (en una misión rápida, 1, 3 y 5). Sirve para distinguir una mala entrada de una mala salida. En una misión rápida, twin es " +
-      "su gemelo mecánico (los eventos siguientes con la regla sin inteligencia, en la misma franja) y missionClass, cómo va su clase.",
+      "su gemelo mecánico (los eventos siguientes con la regla sin inteligencia, en la misma franja; observation dice qué parte del tiempo que " +
+      "estuvo abierto se cotizó de verdad), agentEntry la entrada del agente con su ficha, los dos con `candles` (velas de 1 min del pool: si tocó la toma " +
+      "de beneficio, en cuántos minutos, lo más bajo antes y lo más alto; la misma vara para los dos, se mide unos minutos después de su plazo) " +
+      "y missionClass, cómo va su clase (también con velas).",
     schema: z.object({ mission_id: z.number().int(), since: z.string().optional() }),
     run: async ({ mission_id, since }) => {
+      // Las velas de las entradas de esta misión cuyo plazo ya terminó, si faltan (pocas peticiones, sin hacer cola delante de nadie).
+      const { checkCandleOutcomes } = await import("../sim/candles.js");
+      await checkCandleOutcomes({ missionIds: [mission_id], maxRequests: 4 }).catch(() => []);
       const data = memory.missionReviewData(mission_id, since);
       if (since) return toText(data);
       const { missionCounterfactuals } = await import("../sim/counterfactuals.js");
@@ -1802,7 +1936,8 @@ ${steps}` : ""),
   if (trading && current?.status !== "active") return notActive();
   const clockStopped = trading && !!current && !current.started_at;
   // Antes del reloj se puede preparar y esperar, pero no operar: sería tiempo gratis. Las herramientas con
-  // startsClock (enter_with_exits) arrancan el reloj ellas mismas, igual que start_session, y operan después.
+  // startsClock (enter_with_exits) arrancan el reloj ellas mismas, igual que start_session; con una entrada (ToolDef.entry:
+  // su compra), solo cuando esa operación se ha hecho, que es la única que se admite antes del reloj.
   if (clockStopped && !def.startsClock) return { content: `Error: ${CLOCK_NOT_STARTED}`, isError: true };
   const beliefs = (parsed.data as { thesis?: { beliefs_applied?: number[] } }).thesis?.beliefs_applied;
   if (beliefs?.length) {
@@ -1826,17 +1961,45 @@ ${steps}` : ""),
       return rejected(clockStopped ? `${message} (el reloj no ha arrancado)` : message);
     }
   }
+  // La operación que arranca el reloj va antes que él: el reloj arranca solo si se hace, y a la hora en que se hizo. Si
+  // falla no queda nada que deshacer (ni reloj, ni sesión, ni gemelo, ni plan asignado, ni plazo movido). En la M18 la
+  // compra revertía con el reloj ya en marcha y el error no lo decía: el executor forzó otra entrada y perdió el 94 %.
+  let entered: EntryResult | undefined;
+  const journalMark = def.entry && clockStopped ? (db.prepare("SELECT COALESCE(MAX(id), 0) AS id FROM journal").get() as { id: number }).id : 0;
+  if (def.entry) {
+    try {
+      entered = await (def.entry as (i: unknown, c: ToolCtx, p: unknown) => Promise<EntryResult>)(parsed.data, ctx, prepared);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return rejected(clockStopped && !/el reloj no ha arrancado/.test(message) ? `${message} (el reloj no ha arrancado)` : message);
+    }
+  }
   if (clockStopped) {
-    if (ctx.startClock) ctx = { ...ctx, sessionId: await ctx.startClock() };
-    else mission.startMissionClock(current.id);
-    if (mission.getMission(current.id)?.status !== "active") return notActive();
+    const preClockSession = ctx.sessionId;
+    if (entered) mission.startMissionClock(current.id, entered.clock);
+    // La misión puede haber dejado de estar activa mientras se compraba (p. ej. create_mission la sustituye, o el usuario la
+    // para): no se abre sesión ni se arranca nada, y menos en otra misión (la sesión de trabajo es la de ESTA misión).
+    const endedMeanwhile = async () =>
+      entered
+        ? fail(`La compra se ha hecho, pero la misión ya no está activa: no se ha puesto la toma de beneficio. ${(await mission.missionStatus(current.id)).message ?? ""}`)
+        : notActive();
+    if (mission.getMission(current.id)?.status !== "active") return endedMeanwhile();
+    if (ctx.startClock) ctx = { ...ctx, sessionId: await ctx.startClock(current.id) };
+    else if (!entered) mission.startMissionClock(current.id);
+    // Lo que la entrada dejó en el diario (la compra) va en la sesión de trabajo que abre el reloj, como si se hubiera
+    // abierto antes: la sesión se abre solo con la compra hecha. Solo a una sesión de esta misión.
+    const sessionMission = (db.prepare("SELECT mission_id FROM sessions WHERE id = ?").get(ctx.sessionId) as { mission_id: number | null } | undefined)?.mission_id;
+    if (entered && ctx.sessionId !== preClockSession && sessionMission === current.id) {
+      db.prepare("UPDATE journal SET session_id = ? WHERE mission_id = ? AND id > ? AND session_id IS ?").run(ctx.sessionId, current.id, journalMark, preClockSession);
+    }
+    if (mission.getMission(current.id)?.status !== "active") return endedMeanwhile();
   }
   if (def.researchTarget) {
     const target = (def.researchTarget as (i: unknown) => string | string[] | undefined)(parsed.data);
     for (const t of Array.isArray(target) ? target : [target]) positions.logResearch(ctx.missionId, name, t?.trim() || undefined);
   }
   try {
-    let content = await (def.run as (i: unknown, c: typeof ctx, p: unknown) => Promise<ToolOutput>)(parsed.data, ctx, prepared);
+    let content = await (def.run as (i: unknown, c: typeof ctx, p: unknown, e: unknown) => Promise<ToolOutput>)(parsed.data, ctx, prepared, entered);
     if (trading) {
       // Tras cada operación se comprueba si ya se ha alcanzado el objetivo.
       const ended = await mission.checkMission(ctx.missionId ?? undefined).catch(() => []);

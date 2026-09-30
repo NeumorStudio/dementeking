@@ -77,6 +77,16 @@ export const NATIVE_DRIFT_MARGIN = 0.005;
  */
 export const TP_LIFT_BAND = 0.02;
 
+/**
+ * Slippage de la compra de enter_with_exits si el plan no fija otro (slippage_bps): 300 = 3 %, el mismo que el del gemelo
+ * mecánico. Es también el tope: una entrada no se fuerza subiéndolo. En la M18 (costes reales) la compra revirtió dos
+ * veces con el precio moviéndose un 12 % en los 2 s de latencia; a la tercera, con el 25 %, entró, y el token cayó un 79 %.
+ */
+export const ENTRY_SLIPPAGE_BPS = 300;
+
+/** El slippage máximo (y por defecto) de la entrada con un plan: el suyo o ENTRY_SLIPPAGE_BPS. */
+export const entrySlippageBps = (plan?: { body: { slippage_bps?: number } }) => plan?.body.slippage_bps ?? ENTRY_SLIPPAGE_BPS;
+
 /** La parte de la cartera que no es el token, tal como queda tras venderlo y al cerrar la misión. */
 export interface RestAfterSale {
   /** Estables y todo lo que no es el token ni el nativo de su cadena, valorado ahora. */

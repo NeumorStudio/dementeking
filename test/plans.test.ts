@@ -9,7 +9,7 @@ import { checkMission, createLiveMission, createMission, getMission, startMissio
 import { checkOrders } from "../src/sim/orders.js";
 import { PLAN_BLOCK_SIZE, activePlan, getPlan, markPlanForMission, planBlock, planForMission } from "../src/sim/plans.js";
 import { balance, valuation } from "../src/sim/portfolio.js";
-import { sessionBriefing } from "../src/sim/session.js";
+import { sessionBriefing, startSession } from "../src/sim/session.js";
 import { TP_TARGET_MARGIN } from "../src/sim/entry.js";
 import { NATIVE_DRIFT_MARGIN } from "../src/sim/mission-kind.js";
 import { config } from "../src/config.js";
@@ -143,7 +143,9 @@ test("enter_with_exits: arranca el reloj, compra con todo el efectivo y deja la 
   setPrice(MEME, 0.01);
   const plan = activePlan("graduado-10m-+25%")!;
   const m = await createMission(50, 62.5, 10, undefined, { solana: 100 });
-  const ctx = { sessionId: 1, missionId: m.id, startClock: async () => (startMissionClock(m.id), 42) };
+  // La sesión de trabajo que abre el reloj es una de esta misión (como openWorkSession): la compra pasa a ella.
+  let clockSession = 0;
+  const ctx = { sessionId: 1, missionId: m.id, startClock: async () => (startMissionClock(m.id), (clockSession = startSession(m.id))) };
   const usdc = balance(m.id, "solana", USDC_MINT);
   const sol = balance(m.id, "solana", SOL_MINT);
 
@@ -160,7 +162,7 @@ test("enter_with_exits: arranca el reloj, compra con todo el efectivo y deja la 
   assert.equal(out.clock.deadline, after.deadline);
   assert.equal(after.plan_id, plan.id);
   assert.equal(after.predicted_p, plan.predicted_p);
-  assert.equal((db.prepare("SELECT session_id FROM journal WHERE mission_id = ? AND kind = 'swap'").get(m.id) as { session_id: number }).session_id, 42, "en la sesión nueva");
+  assert.equal((db.prepare("SELECT session_id FROM journal WHERE mission_id = ? AND kind = 'swap'").get(m.id) as { session_id: number }).session_id, clockSession, "en la sesión nueva");
 
   // Dinero: todo el USDC sale y entra el token que da la cotización (comisión del pool incluida); el SOL solo paga la red.
   const qty = balance(m.id, "solana", MEME);

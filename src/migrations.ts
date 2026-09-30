@@ -7,7 +7,7 @@
 import { mkdirSync, readdirSync, rmSync } from "node:fs";
 import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
-import { missionClass, missionDurationMinutes } from "./sim/mission-kind.js";
+import { isFastMinutes, missionClass, missionDurationMinutes } from "./sim/mission-kind.js";
 import { fingerprint, lessonRefs } from "./sim/text.js";
 
 export interface Migration {
@@ -275,7 +275,141 @@ export const MIGRATIONS: Migration[] = [
         ALTER TABLE shadow_positions ADD COLUMN costs_usd REAL NOT NULL DEFAULT 0;
       `),
   },
+  {
+    version: 15,
+    description: "Misiones rápidas: ficha de entrada y resultado medido con velas de 1 min, del agente y de cada gemelo; cotizaciones perdidas del gemelo",
+    up: (db) => {
+      db.exec(`
+        -- Lo leído de la señal de wait_for_signal (pool, GeckoTerminal y Jupiter): la ficha de la entrada del agente.
+        ALTER TABLE missions ADD COLUMN signal_features TEXT;
+        -- Ficha de entrada del gemelo (JSON) y cotizaciones que tocaban y no se pudieron hacer (Jupiter ocupado, 429, sin turno).
+        ALTER TABLE shadow_positions ADD COLUMN features TEXT;
+        ALTER TABLE shadow_positions ADD COLUMN quotes_missed INTEGER NOT NULL DEFAULT 0;
+        -- La entrada del agente en cada misión rápida (la primera de enter_with_exits), para medirla con velas como a los gemelos.
+        CREATE TABLE agent_entries (
+          mission_id INTEGER PRIMARY KEY,
+          token TEXT NOT NULL,
+          symbol TEXT,
+          pool TEXT,                         -- el de la señal o el graduatedPool de Jupiter; si falta, lo busca la medida con velas
+          entered_at TEXT NOT NULL,
+          horizon_end TEXT NOT NULL,         -- el plazo de la misión: hasta ahí se mide aunque la misión acabe antes
+          usd_in REAL NOT NULL,
+          tokens REAL NOT NULL,
+          entry_price_usd REAL NOT NULL,     -- lo pagado entre los tokens recibidos
+          tp_price_usd REAL,                 -- el precio de la toma de beneficio (la orden de enter_with_exits)
+          features TEXT
+        );
+      `);
+      for (const table of ["shadow_positions", "agent_entries"]) for (const [name, type] of CANDLE_COLUMNS) db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${type}`);
+      backfillAgentEntries(db);
+    },
+  },
+  {
+    version: 16,
+    description: "Tokens descartados por misión: una compra de enter_with_exits que revierte por el precio no se vuelve a ofrecer ni a intentar",
+    up: (db) =>
+      db.exec(`
+        -- En la M18 (costes reales) la compra del segundo candidato revirtió dos veces con el precio moviéndose un 12 % en la
+        -- latencia, y a la tercera se forzó subiendo el slippage al 25 %: el token cayó un 79 %. wait_for_signal no los
+        -- devuelve y enter_with_exits no los compra en esa misión.
+        CREATE TABLE entry_exclusions (
+          mission_id INTEGER NOT NULL,
+          token TEXT NOT NULL,
+          ts TEXT NOT NULL,
+          reason TEXT NOT NULL,
+          PRIMARY KEY (mission_id, token)
+        );
+      `),
+  },
 ];
+
+/**
+ * El resultado de cada entrada medido con las velas de 1 min del pool (candles.ts), igual para el agente y los gemelos.
+ * candle_status: NULL (pendiente) | 'done' | 'unavailable'.
+ */
+const CANDLE_COLUMNS: Array<[string, string]> = [
+  ["candle_status", "TEXT"],
+  ["candle_attempts", "INTEGER NOT NULL DEFAULT 0"],
+  ["candle_next_at", "TEXT"], // no se vuelve a pedir antes (tras un 429 o si las velas aún no estaban)
+  ["candle_note", "TEXT"],
+  ["candle_hit_wick", "INTEGER"], // algún máximo llegó a la toma de beneficio
+  ["candle_hit_close", "INTEGER"], // algún cierre llegó
+  ["minutes_to_tp", "REAL"], // de la entrada a la primera vela que la toca (0: la vela de la entrada)
+  ["max_drawdown_pct", "REAL"], // el mínimo antes de tocarla (o en todo el plazo) frente al precio de entrada
+  ["max_runup_pct", "REAL"], // el máximo de todo el plazo frente al precio de entrada
+  ["candle_count", "INTEGER"],
+  ["candle_gap_pct", "REAL"], // cierre de la vela de la entrada frente al precio de entrada: si es grande, poco fiable
+];
+
+/**
+ * Las entradas del agente de antes de v0.37.2, reconstruidas para medirlas con velas: la primera toma de beneficio de
+ * enter_with_exits de cada misión rápida simulada (su precio), la compra del diario (lo pagado y los tokens) y la hora
+ * de la posición. El pool no se guardaba: lo busca la medida con velas. De ficha, lo que guardó la posición al comprar
+ * (leído tras la compra, con otros nombres), solo lo que coincide.
+ */
+function backfillAgentEntries(db: DatabaseSync) {
+  const orders = db
+    .prepare(
+      `SELECT o.mission_id, o.trigger_asset, o.trigger_price, o.created_at, m.created_at AS m_created, m.deadline, m.mode
+       FROM orders o JOIN missions m ON m.id = o.mission_id
+       WHERE o.venue = 'solana' AND o.condition = 'above' AND o.reasoning LIKE 'Toma de beneficio de enter_with_exits%' AND m.started_at IS NOT NULL
+       ORDER BY o.id`,
+    )
+    .all() as Array<{ mission_id: number; trigger_asset: string; trigger_price: number; created_at: string; m_created: string; deadline: string; mode: string | null }>;
+  const insert = db.prepare(
+    `INSERT OR IGNORE INTO agent_entries (mission_id, token, symbol, entered_at, horizon_end, usd_in, tokens, entry_price_usd, tp_price_usd, features)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  const done = new Set<number>();
+  for (const o of orders) {
+    if (done.has(o.mission_id)) continue;
+    done.add(o.mission_id);
+    if (o.mode === "live" || !isFastMinutes(missionDurationMinutes({ created_at: o.m_created, deadline: o.deadline }))) continue;
+    try {
+      const buy = db
+        .prepare("SELECT ts, details FROM journal WHERE mission_id = ? AND kind = 'swap' AND ts <= ? AND json_extract(details, '$.outputMint') = ? ORDER BY id LIMIT 1")
+        .get(o.mission_id, o.created_at, o.trigger_asset) as { ts: string; details: string } | undefined;
+      if (!buy) continue;
+      const d = JSON.parse(buy.details) as { sold?: string; received?: string };
+      const usdIn = parseFloat(String(d.sold ?? ""));
+      const tokens = parseFloat(String(d.received ?? ""));
+      if (!(usdIn > 0) || !(tokens > 0)) continue;
+      const pos = db.prepare("SELECT opened_at, symbol, entry_features FROM positions WHERE mission_id = ? AND venue = 'solana' AND asset = ? ORDER BY id LIMIT 1").get(o.mission_id, o.trigger_asset) as
+        | { opened_at: string; symbol: string; entry_features: string | null }
+        | undefined;
+      insert.run(o.mission_id, o.trigger_asset, pos?.symbol ?? null, pos?.opened_at ?? buy.ts, o.deadline, usdIn, tokens, usdIn / tokens, o.trigger_price, legacyFicha(pos?.entry_features));
+    } catch {
+      // Una fila que no se entiende no para la migración: esa misión se queda sin medir.
+    }
+  }
+}
+
+/** De los datos de entrada de una posición (entryFeatures, leídos tras la compra) a la ficha: solo lo que coincide. */
+function legacyFicha(raw: string | null | undefined): string | null {
+  try {
+    const f = JSON.parse(raw ?? "null") as Record<string, unknown> | null;
+    if (!f) return null;
+    const pick: Record<string, string> = {
+      launchpad: "launchpad",
+      holders: "holders",
+      mcapUsd: "jupMcapUsd",
+      liquidityUsd: "jupLiquidityUsd",
+      organicScore: "organicScore",
+      topHoldersPct: "topHoldersPct",
+      devHoldingPct: "devBalancePct",
+      creatorTokens: "devMints",
+      creatorGraduated: "devMigrations",
+      creator: "dev",
+      netBuyers5m: "netBuyers5m",
+    };
+    const out: Record<string, unknown> = { from: "posición (leídos tras la compra, antes de v0.37.2)" };
+    for (const [k, v] of Object.entries(pick)) if (f[k] !== undefined && f[k] !== null) out[v] = f[k];
+    if (typeof f.pairAgeMinutes === "number") out.graduatedAgoS = f.pairAgeMinutes * 60;
+    return JSON.stringify(out);
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Las posiciones guardan desde v0.30 cómo decidió el agente (qué parte del capital puso, si volvía a un token

@@ -12,6 +12,8 @@ interface Token {
   /** Lo que Jupiter dice de su origen: launchpad y cuándo se graduó (ISO). */
   launchpad?: string;
   graduatedAt?: string;
+  /** Más campos de su fila en la búsqueda de Jupiter (holderCount, audit, stats5m, graduatedPool…). */
+  extra?: Record<string, unknown>;
 }
 
 export const tokens: Record<string, Token> = {
@@ -79,7 +81,7 @@ function handle(url: URL, body?: unknown): Response {
       // MEME lo lanzó un creador "en serie" (40 tokens, ninguno graduado).
       const creator = id === MEME ? { dev: MEME_DEV, audit: { devMints: 40, devMigrations: 0, devBalancePercentage: 8 } } : {};
       const origin = t ? { launchpad: t.launchpad, graduatedAt: t.graduatedAt } : {};
-      return json(t ? [{ id, symbol: t.symbol, name: t.symbol, decimals: t.decimals, usdPrice: t.price, ...creator, ...origin }] : []);
+      return json(t ? [{ id, symbol: t.symbol, name: t.symbol, decimals: t.decimals, usdPrice: t.price, ...creator, ...origin, ...t.extra }] : []);
     }
     if (url.pathname === "/price/v3") {
       const ids = url.searchParams.get("ids")!.split(",");

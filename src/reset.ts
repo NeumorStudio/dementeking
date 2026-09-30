@@ -2,7 +2,7 @@
 // El perfil del navegador se conserva.
 import { db } from "./db.js";
 
-for (const table of ["meta", "holdings", "sessions", "journal", "notes", "snapshots", "orders", "missions", "activity", "lessons", "positions", "research_log", "plans", "shadow_runs", "shadow_positions",
+for (const table of ["meta", "holdings", "sessions", "journal", "notes", "snapshots", "orders", "missions", "activity", "lessons", "positions", "research_log", "plans", "shadow_runs", "shadow_positions", "agent_entries", "entry_exclusions",
   "howtos", "beliefs", "mission_reviews", "review_checkpoints", "briefings", "observations", "tool_errors", "api_observations", "capability_requests"]) {
   db.exec(`DELETE FROM ${table}`);
 }

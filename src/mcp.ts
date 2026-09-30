@@ -52,12 +52,14 @@ const sessionFor = (missionId: number | null) => {
 /**
  * Lo que hace start_session salvo el briefing: pone al día órdenes y misión, arranca el reloj de la misión (solo
  * la primera vez) y abre una sesión de trabajo. Lo reutilizan las herramientas que arrancan el reloj ellas mismas
- * (ToolDef.startsClock, p. ej. enter_with_exits).
+ * (ToolDef.startsClock, p. ej. enter_with_exits). Con una entrada (ToolDef.entry), runTool ya ha arrancado el reloj a
+ * la hora de la compra, y solo con la compra hecha: aquí solo se abre la sesión.
  */
-async function openWorkSession(): Promise<{ missionId: number | null; sessionId: number }> {
+async function openWorkSession(forMission?: number): Promise<{ missionId: number | null; sessionId: number }> {
   await checkOrders().catch(() => []);
   await checkMission().catch(() => []);
-  const missionId = currentMission();
+  // La de la herramienta que lo pide (ToolCtx.startClock): si la han sustituido mientras compraba, la activa sería otra.
+  const missionId = forMission ?? currentMission();
   startMissionClock(missionId);
   const sessionId = startSession(missionId);
   sessions.set(missionId, sessionId);
@@ -325,7 +327,7 @@ for (const tool of SIM_TOOLS) {
   server.registerTool(tool.name, { description: tool.description, inputSchema: tool.schema.shape as z.ZodRawShape }, async (input: Record<string, unknown>) => {
     try {
       const missionId = currentMission();
-      const startClock = async () => (await openWorkSession()).sessionId;
+      const startClock = async (id: number) => (await openWorkSession(id)).sessionId;
       const { content, isError } = await runTool(tool.name, input, { sessionId: sessionFor(missionId), missionId, startClock });
       return { ...text(typeof content === "string" ? content : JSON.stringify(content)), isError };
     } catch (err) {

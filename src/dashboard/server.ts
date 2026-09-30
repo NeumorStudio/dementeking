@@ -10,7 +10,9 @@ import { getActiveMission, getLastMission, missionHistory, type Mission } from "
 import { listOrders } from "../sim/orders.js";
 import { valuation } from "../sim/portfolio.js";
 import { listPositions } from "../sim/positions.js";
-import { timeline } from "./timeline.js";
+import { loadBatches } from "./batches.js";
+import { nowState } from "./now.js";
+import { agentSessions, signalSymbols, timeline } from "./timeline.js";
 import { walletBalances } from "../live/chain.js";
 import { signerStatus, walletUrl } from "../live/client.js";
 import { readWalletPublic } from "../live/keystore.js";
@@ -87,17 +89,38 @@ function memorySummary(missionId: number | null) {
   return memoryCache.value;
 }
 
+/** Desde cuándo mirar la actividad de una misión: desde que se pidió (created_at se mueve al arrancar el reloj). */
+const missionSince = (m: Mission | undefined) => m?.requested_at ?? m?.created_at ?? "1970";
+
+/** Lo nuevo del panel no puede tumbar lo de siempre: si falla, esa parte sale vacía y se dice en el registro. */
+function safe<T>(what: string, fn: () => T): T | null {
+  try {
+    return fn();
+  } catch (err) {
+    console.error(`Panel: no se pudo calcular ${what}: ${(err as Error).message}`);
+    return null;
+  }
+}
+
 function state() {
   const mission: Mission | undefined = getActiveMission() ?? getLastMission();
   const snapshots = mission
     ? (db.prepare("SELECT ts, total_usd FROM snapshots WHERE mission_id = ? ORDER BY ts").all(mission.id) as Array<{ ts: string; total_usd: number }>)
     : [];
+  // La valoración en caché puede ser de la misión anterior justo después de crear otra.
+  const valuation = cached && mission && cached.value.missionId === mission.id ? cached.value : null;
+  const since = missionSince(mission);
   return {
     now: new Date().toISOString(),
     mission: mission ?? null,
-    // La valoración en caché puede ser de la misión anterior justo después de crear otra.
-    valuation: cached && mission && cached.value.missionId === mission.id ? cached.value : null,
+    valuation,
     valuedAt: cached?.at ?? null,
+    // Ahora mismo: en qué fase de la tanda está el equipo (esperando plan, señal, reloj, revisión o pausa).
+    phase: safe("la fase de ahora", () =>
+      nowState({ mission: mission ?? null, sessions: agentSessions(since), symbols: signalSymbols(since), valuation, valuedAt: valuation ? (cached?.at ?? null) : null }),
+    ),
+    // Las tandas: todas las misiones rápidas por serie (clase y costes) y plan.
+    batches: safe("las tandas", () => loadBatches()),
     orders: mission ? listOrders(mission.id, "open") : [],
     snapshots,
     history: missionHistory(),
@@ -153,7 +176,8 @@ function handler(port: number) {
       }
       if (url.pathname === "/api/events") {
         const mission = getActiveMission() ?? getLastMission();
-        const since = url.searchParams.get("all") ? "1970" : (mission?.created_at ?? "1970");
+        // Desde que se pidió la misión: la espera de la señal y el plan del cerebro van antes del reloj.
+        const since = url.searchParams.get("all") ? "1970" : missionSince(mission);
         return send(res, 200, "application/json", JSON.stringify(timeline(since, mission?.id ?? null)));
       }
       send(res, 404, "text/plain", "No encontrado");

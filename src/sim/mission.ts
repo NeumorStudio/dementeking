@@ -11,6 +11,7 @@ import { closingCostsUsd, liquidateAll, planPortfolio, resetPortfolio, validateA
 import { DEFAULT_ALLOCATION, type Allocation, type ChainId, type Holding } from "./types.js";
 import { settleTransfers } from "./transfers.js";
 import { startShadowRun } from "./shadow.js";
+import type { EntrySnapshot } from "./ficha.js";
 import { allChains, getVenue } from "./venues/index.js";
 
 export * from "./mission-kind.js";
@@ -60,6 +61,8 @@ export interface Mission {
   /** La última señal de wait_for_signal antes de la entrada: cuándo y qué token. */
   signal_at: string | null;
   signal_token: string | null;
+  /** Lo leído de esa señal (JSON de EntrySnapshot, ficha.ts): la ficha de la entrada del agente si compra ese token. */
+  signal_features: string | null;
   /** La primera compra de enter_with_exits y los segundos desde la señal (null si compró otro token o no hubo señal). */
   entry_at: string | null;
   entry_latency_s: number | null;
@@ -194,10 +197,16 @@ function insertMission(args: {
 
 /**
  * wait_for_signal ha devuelto un candidato: queda en la misión activa (la última señal antes de la primera compra), para
- * medir cuánto se tarda en entrar desde que llega el evento.
+ * medir cuánto se tarda en entrar desde que llega el evento. Con lo leído del candidato (snapshot), que será la ficha de
+ * la entrada si el agente compra ese token.
  */
-export function recordSignal(missionId: number, token: string) {
-  db.prepare("UPDATE missions SET signal_at = ?, signal_token = ? WHERE id = ? AND status = 'active' AND entry_at IS NULL").run(now(), token, missionId);
+export function recordSignal(missionId: number, token: string, snapshot?: EntrySnapshot) {
+  db.prepare("UPDATE missions SET signal_at = ?, signal_token = ?, signal_features = ? WHERE id = ? AND status = 'active' AND entry_at IS NULL").run(
+    now(),
+    token,
+    snapshot ? JSON.stringify(snapshot) : null,
+    missionId,
+  );
 }
 
 /**
@@ -326,14 +335,16 @@ function leftText(ms: number) {
  * El reloj de la misión arranca cuando el agente empieza a trabajar, no al crearla: así no se pierde
  * el tiempo que tarda en prepararse (el plan, el briefing del revisor, esperar a un evento). Solo la primera
  * vez: deadline = ahora + duración. Antes de eso no se puede operar (runTool) ni caduca (checkOne).
+ * Con una entrada que lo arranca (enter_with_exits, ToolDef.entry), arranca a la hora en que se llenó la compra y el
+ * gemelo se dimensiona con la cartera de antes de comprar (ClockStart).
  * Devuelve true si lo ha arrancado esta llamada.
  */
-export function startMissionClock(missionId: number | null): boolean {
+export function startMissionClock(missionId: number | null, opts: ClockStart = {}): boolean {
   if (missionId === null) return false;
   const m = getMission(missionId);
   if (!m || m.status !== "active" || m.started_at) return false;
   const durationMs = new Date(m.deadline).getTime() - new Date(m.created_at).getTime();
-  const start = new Date();
+  const start = new Date(opts.atMs ?? Date.now());
   const changed = db
     .prepare(
       "UPDATE missions SET started_at = ?, created_at = ?, deadline = ?, class = COALESCE(class, ?) WHERE id = ? AND started_at IS NULL AND status = 'active'",
@@ -352,9 +363,9 @@ export function startMissionClock(missionId: number | null): boolean {
   const cls = getMission(missionId)?.class;
   const table = baselineForClass(cls);
   if (table) db.prepare("UPDATE missions SET baseline_p = ? WHERE id = ? AND baseline_p IS NULL").run(table.p, missionId);
-  // El gemelo mecánico (shadow.ts) se prepara ya, antes de que el agente compre: mismo tamaño y misma toma de beneficio.
+  // El gemelo mecánico (shadow.ts) se prepara ya, a la vez que el reloj: mismo tamaño y misma toma de beneficio.
   try {
-    startShadowRun(missionId);
+    startShadowRun(missionId, opts.walletBefore);
   } catch (err) {
     console.error(`No se pudo preparar el gemelo de la misión #${missionId}: ${(err as Error).message}`);
   }
@@ -362,9 +373,30 @@ export function startMissionClock(missionId: number | null): boolean {
     missionId,
     sessionId: null,
     kind: "mission",
-    summary: `El agente empieza a trabajar: el reloj de la misión #${missionId} arranca ahora${plan ? ` (plan #${plan.id})` : ""}`,
+    summary: `El agente empieza a trabajar: el reloj de la misión #${missionId} arranca ${opts.cause ?? "ahora"}${plan ? ` (plan #${plan.id})` : ""}`,
   });
   return true;
+}
+
+/** Cómo arranca el reloj una entrada que lo arranca (enter_with_exits): solo cuando su compra se ha llenado. */
+export interface ClockStart {
+  /** Hora de arranque (ms): la de la compra. Por defecto, ahora. */
+  atMs?: number;
+  /**
+   * La cartera justo antes de esa compra: el gemelo se dimensiona con ella (el efectivo de Solana y lo que queda al
+   * cerrar), igual que si hubiera arrancado antes de comprar. Con la de después ya no quedaría efectivo.
+   */
+  walletBefore?: Holding[];
+  /** Por qué arranca, para el diario (p. ej. «con la compra de MEME»). Por defecto, «ahora». */
+  cause?: string;
+}
+
+/**
+ * Las compras de enter_with_exits que revirtieron en una misión (entry_exclusions, entry.ts): el token, cuándo y por qué.
+ * Una misión cancelada por prep_timeout con alguna no se quedó sin candidatos: le llegaron y su compra revirtió.
+ */
+export function revertedEntries(missionId: number): Array<{ ts: string; token: string; reason: string }> {
+  return db.prepare("SELECT ts, token, reason FROM entry_exclusions WHERE mission_id = ? ORDER BY ts").all(missionId) as Array<{ ts: string; token: string; reason: string }>;
 }
 
 /** Minutos que le quedan a la misión: toda la duración mientras el reloj no ha arrancado. */
@@ -389,8 +421,13 @@ export async function missionStatus(missionId?: number) {
         finalUsd: mission.final_usd,
         deadline: mission.deadline,
         endedAt: mission.ended_at,
-        // prep_timeout: se canceló sin arrancar el reloj (en una rápida, no llegó ningún candidato que pasara el plan).
+        // prep_timeout: se canceló sin arrancar el reloj. En una rápida, sin candidato que pasara el plan o, si trae
+        // revertedEntries, con candidatos cuya compra revirtió (el precio se movió más que el slippage).
         ...(mission.end_reason ? { endReason: mission.end_reason } : {}),
+        ...(() => {
+          const reverted = revertedEntries(mission.id);
+          return reverted.length ? { revertedEntries: reverted } : {};
+        })(),
         ...(mission.class ? { missionClass: mission.class } : {}),
         costs: mission.cost_mode,
         ...(missionMeasurement(mission) ? { measurement: missionMeasurement(mission) } : {}),
@@ -524,13 +561,24 @@ export function lossFloor(mission: Mission): number | null {
 const lastSync = new Map<number, number>();
 
 /**
+ * Una compra de enter_with_exits recién llenada arranca el reloj en cuanto vuelve (runTool), pero entre medias hay unos
+ * segundos (registrar la posición): en ese rato la misión no se cancela por prep_timeout, o la compra quedaría en una
+ * misión cancelada. Pasado este margen (si el proceso murió antes de arrancar el reloj), se cancela igualmente.
+ */
+export const ENTRY_FILL_GRACE_MS = 5 * 60_000;
+
+/**
  * Misión que lleva PREP_TIMEOUT_MINUTES sin arrancar el reloj: se cancela sin tocar la cartera (antes del reloj no
- * se puede operar). Queda fuera de la cola de retrospectivas y del historial de resultados (sin final_usd).
+ * se puede operar). Queda fuera de la cola de retrospectivas y del historial de resultados (sin final_usd). Si llegaron
+ * candidatos y sus compras revirtieron, quedan en entry_exclusions (planBlock y get_plan lo distinguen de «sin candidato»).
  */
 function cancelForPrepTimeout(mission: Mission): string[] {
   const changed = db
-    .prepare("UPDATE missions SET status = 'cancelled', ended_at = ?, end_reason = 'prep_timeout' WHERE id = ? AND status = 'active' AND started_at IS NULL")
-    .run(now(), mission.id).changes;
+    .prepare(
+      `UPDATE missions SET status = 'cancelled', ended_at = ?, end_reason = 'prep_timeout' WHERE id = ? AND status = 'active' AND started_at IS NULL
+         AND NOT EXISTS (SELECT 1 FROM journal j WHERE j.mission_id = missions.id AND j.kind = 'swap' AND j.ts >= ?)`,
+    )
+    .run(now(), mission.id, new Date(Date.now() - ENTRY_FILL_GRACE_MS).toISOString()).changes;
   if (!changed) return [];
   db.prepare("UPDATE orders SET status = 'cancelled', closed_at = ? WHERE status = 'open' AND mission_id = ?").run(now(), mission.id);
   const summary = `Misión #${mission.id} cancelada: el reloj no arrancó en ${PREP_TIMEOUT_MINUTES} min desde que se creó (prep_timeout)`;

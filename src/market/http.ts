@@ -96,9 +96,16 @@ const MAX_CACHE_ENTRIES = 2_000;
 
 interface Cached {
   expires: number;
-  value: Promise<{ status: number; body: string }>;
+  value: Promise<HttpResult>;
 }
 const cache = new Map<string, Cached>();
+
+/** Respuesta: el código HTTP, el cuerpo y cuándo llegó (atMs: una respuesta de la caché conserva la hora de la petición). */
+export interface HttpResult {
+  status: number;
+  body: string;
+  atMs: number;
+}
 
 // Limitador de concurrencia por servicio (host).
 const active = new Map<string, number>();
@@ -149,7 +156,7 @@ export interface RequestOpts {
   fresh?: boolean;
 }
 
-async function request(url: string, opts: RequestOpts & { timeoutMs: number }): Promise<{ status: number; body: string }> {
+async function request(url: string, opts: RequestOpts & { timeoutMs: number }): Promise<HttpResult> {
   const host = new URL(url).host;
   for (let attempt = 0; ; attempt++) {
     const blocked = (blockedStmt.get(host) as { until: number } | undefined)?.until ?? 0;
@@ -181,7 +188,7 @@ async function request(url: string, opts: RequestOpts & { timeoutMs: number }): 
     // IP bloqueada: se anota para todos los procesos y no se reintenta.
     if (res.status === 418) {
       blockStmt.run(host, banUntil(res, body));
-      return { status: res.status, body };
+      return { status: res.status, body, atMs: Date.now() };
     }
     // Demasiadas peticiones o servicio saturado: esperar y reintentar (una de baja prioridad no reintenta: la pausa
     // queda para todos igual, y ella vuelve en la siguiente vuelta).
@@ -190,11 +197,11 @@ async function request(url: string, opts: RequestOpts & { timeoutMs: number }): 
       const wait = Number.isFinite(retryAfter) && retryAfter > 0 ? Math.min(retryAfter, 15) * 1000 : COOLDOWN_MS;
       // Los servicios con turnos pausan a todos los procesos; el resto solo reintenta esta petición.
       if (MIN_INTERVAL_MS[host]) cooldownStmt.run(host, Date.now() + wait);
-      if (opts.lowPriority) return { status: res.status, body };
+      if (opts.lowPriority) return { status: res.status, body, atMs: Date.now() };
       if (!MIN_INTERVAL_MS[host]) await sleep(wait);
       continue;
     }
-    return { status: res.status, body };
+    return { status: res.status, body, atMs: Date.now() };
   }
 }
 
@@ -203,7 +210,7 @@ async function request(url: string, opts: RequestOpts & { timeoutMs: number }): 
  * Devuelve el código HTTP y el cuerpo en texto. Solo se guardan en caché las respuestas correctas;
  * los errores se reintentan en la siguiente llamada.
  */
-export function fetchText(url: string, opts: RequestOpts = {}): Promise<{ status: number; body: string }> {
+export function fetchText(url: string, opts: RequestOpts = {}): Promise<HttpResult> {
   const ttl = opts.ttlMs ?? DEFAULT_TTL_MS;
   const key = opts.body !== undefined || opts.method === "POST" ? `${opts.method ?? "GET"} ${url} ${JSON.stringify(opts.body ?? null)}` : url;
   const nowMs = Date.now();
@@ -243,9 +250,14 @@ export async function fetchJson<T = unknown>(url: string, timeoutMs?: number, tt
 export async function fetchJson<T = unknown>(url: string, opts: RequestOpts): Promise<T>;
 export async function fetchJson<T = unknown>(url: string, a: number | RequestOpts = {}, ttlMs?: number): Promise<T> {
   const opts: RequestOpts = typeof a === "number" ? { timeoutMs: a, ttlMs } : a;
-  const { status, body } = await fetchText(url, opts);
+  return (await fetchJsonAt<T>(url, opts)).data;
+}
+
+/** Como fetchJson, y además cuándo se pidió de verdad (atMs): si viene de la caché, la hora de la petición que la llenó. */
+export async function fetchJsonAt<T = unknown>(url: string, opts: RequestOpts = {}): Promise<{ data: T; atMs: number }> {
+  const { status, body, atMs } = await fetchText(url, opts);
   if (status < 200 || status >= 300) throw new Error(`HTTP ${status} en ${url}: ${body.slice(0, 300)}`);
-  return JSON.parse(body) as T;
+  return { data: JSON.parse(body) as T, atMs };
 }
 
 // ─── Cupos por ventana de tiempo ────────────────────────────────────────────

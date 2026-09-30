@@ -2,11 +2,13 @@
 // dejar puesta al momento la toma de beneficio. Es lo más parecido a una orden preparada que admite un memecoin: el
 // token no se conoce hasta que llega el evento. Medido en las misiones anteriores: entre start_session y la primera
 // operación pasaban 84-111 s, y cada minuto de retraso al entrar cuesta 3-4 puntos de P.
-import { logJournal } from "../db.js";
-import { getMission, minutesLeft, recordEntry } from "./mission.js";
-import { liftTakeProfit, restAtCloseUsd, takeProfitProceeds, TP_TARGET_MARGIN, type RestAfterSale } from "./mission-kind.js";
+import { db, logJournal, now } from "../db.js";
+import { fetchJsonAt } from "../market/http.js";
+import { fichaAt, jupiterValues, parseSnapshot, snapshotFrom } from "./ficha.js";
+import { getMission, minutesLeft, recordEntry, type ClockStart } from "./mission.js";
+import { isFastMission, liftTakeProfit, restAtCloseUsd, takeProfitProceeds, TP_TARGET_MARGIN, type RestAfterSale } from "./mission-kind.js";
 import { placeOrder } from "./orders.js";
-import { balance, liquidationReserve, swap, valuation, walletView } from "./portfolio.js";
+import { balance, getHoldings, liquidationReserve, SlippageExceeded, swap, valuation, walletView } from "./portfolio.js";
 import type { ChainId, TradeMeta } from "./types.js";
 import { getChain, type TokenRef } from "./venues/index.js";
 
@@ -48,6 +50,68 @@ export function restAfterTakeProfit(a: {
     closeFeeNative,
     nativeUsd: native > 0 ? (nativeLine?.usd ?? 0) / native : 0,
   };
+}
+
+/**
+ * La primera entrada del agente en una misión rápida (agent_entries): lo pagado, los tokens, el precio de la toma de
+ * beneficio y su ficha (ficha.ts). La ficha es la de la señal de wait_for_signal si compró ese token (con su pool); si no,
+ * se completa aparte con la búsqueda de Jupiter, sin hacer esperar al agente. Se mide hasta el plazo de la misión.
+ * Solo en Solana: la medida con velas (candles.ts) busca el pool en la red solana de GeckoTerminal y en Jupiter, y los
+ * gemelos son de Solana; una entrada en Base o BNB Chain no se podría medir (y gastaría peticiones con 404).
+ */
+export function recordAgentEntry(a: {
+  missionId: number;
+  chain: ChainId;
+  token: TokenRef;
+  usdIn: number;
+  tokens: number;
+  entryPrice: number;
+  tpPrice?: number;
+  enteredMs: number;
+}): boolean {
+  if (a.chain !== "solana") return false;
+  const m = getMission(a.missionId);
+  if (!m || !isFastMission(m) || !(a.tokens > 0) || !(a.usdIn > 0)) return false;
+  const signal = m.signal_token === a.token.address ? parseSnapshot(m.signal_features) : null;
+  const changed = db
+    .prepare(
+      `INSERT OR IGNORE INTO agent_entries (mission_id, token, symbol, pool, entered_at, horizon_end, usd_in, tokens, entry_price_usd, tp_price_usd, features)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      a.missionId,
+      a.token.address,
+      a.token.symbol ?? null,
+      signal?.pool ?? null,
+      new Date(a.enteredMs).toISOString(),
+      m.deadline,
+      a.usdIn,
+      a.tokens,
+      a.entryPrice,
+      a.tpPrice ?? null,
+      signal ? JSON.stringify(fichaAt(signal, a.enteredMs, "señal")) : null,
+    ).changes;
+  if (changed && !signal) void completeAgentFicha(a.missionId, a.token.address, a.enteredMs).catch(() => undefined);
+  return changed > 0;
+}
+
+/**
+ * Ficha de una entrada del agente sin señal (compró otro token que el de wait_for_signal): la búsqueda de Jupiter, que la
+ * compra suele dejar en caché, por el carril de baja prioridad. Con ella llega también el pool (graduatedPool).
+ */
+export async function completeAgentFicha(missionId: number, mint: string, enteredMs: number) {
+  const { data: list, atMs } = await fetchJsonAt<Array<Record<string, any>>>(`https://lite-api.jup.ag/tokens/v2/search?query=${mint}`, {
+    timeoutMs: 15_000,
+    ttlMs: 30_000,
+    lowPriority: true,
+  });
+  const jupiter = jupiterValues(list.find((t) => t.id === mint));
+  const snap = snapshotFrom({ capturedAtMs: Date.now(), jupiter, jupiterAtMs: atMs });
+  db.prepare("UPDATE agent_entries SET features = ?, pool = COALESCE(pool, ?) WHERE mission_id = ? AND features IS NULL").run(
+    JSON.stringify(fichaAt(snap, enteredMs, "jupiter (tras la compra)")),
+    snap.pool ?? null,
+    missionId,
+  );
 }
 
 /**
@@ -104,47 +168,123 @@ export async function prepareEntry(a: {
   return { stable, amount, token, roundTrip: { backUsd, costPct: Number(roundTripCostPct.toFixed(2)) } };
 }
 
+
 /**
- * Compra el token y pone la toma de beneficio: una orden límite que vende todo el saldo del token a un precio fijo.
- * El precio sale de tpRatio (× el precio de compra) o, sin él, del objetivo de la misión: el que, al venderlo todo,
- * deja la cartera en el objetivo neto de costes (con lo demás que tenga, gas incluido). Si la orden no se puede poner,
- * la compra queda hecha y la respuesta lo dice.
+ * Tokens descartados en una misión: su compra de enter_with_exits revirtió porque el precio se movió más que el slippage.
+ * wait_for_signal no los vuelve a ofrecer y enter_with_exits no los compra: en la M18 (costes reales) la compra de un
+ * candidato revirtió dos veces con el precio moviéndose un 12 % en la latencia, a la tercera se forzó subiendo el slippage
+ * al 25 % y el token cayó un 79 %. Un precio que se mueve así de rápido es justo de lo que protege la reversión.
  */
-export async function enterWithExits(a: {
+export function excludedTokens(missionId: number): string[] {
+  return (db.prepare("SELECT token FROM entry_exclusions WHERE mission_id = ? ORDER BY ts").all(missionId) as Array<{ token: string }>).map((r) => r.token);
+}
+
+export function entryExclusion(missionId: number, token: string): { ts: string; reason: string } | undefined {
+  return db.prepare("SELECT ts, reason FROM entry_exclusions WHERE mission_id = ? AND token = ?").get(missionId, token) as { ts: string; reason: string } | undefined;
+}
+
+export function excludeFromEntry(missionId: number, token: string, reason: string) {
+  db.prepare("INSERT OR IGNORE INTO entry_exclusions (mission_id, token, ts, reason) VALUES (?, ?, ?, ?)").run(missionId, token, now(), reason);
+}
+
+/** La compra de enter_with_exits, ya llenada: con ella arranca el reloj si no corría (runTool, ToolDef.entry). */
+export interface EntryFill {
+  buy: Awaited<ReturnType<typeof swap>>;
+  token: TokenRef;
+  stable: TokenRef;
+  /** Lo pagado, en el estable. */
+  amount: number;
+  /** Los tokens que ha dado la compra. */
+  bought: number;
+  entryPrice: number;
+  /** Con qué arranca el reloj: la hora en que se llenó la compra y la cartera de justo antes (para el gemelo). */
+  clock: ClockStart & { atMs: number };
+}
+
+/**
+ * La compra de enter_with_exits. Es la única operación que se admite antes del reloj, y solo dentro de esa herramienta:
+ * el reloj arranca cuando se llena (runTool), así que si falla no queda nada (ni reloj, ni sesión, ni gemelo, ni plan
+ * asignado). Si revierte porque el precio se ha movido más que el slippage (costes reales: en los 2 s de latencia), el
+ * token queda descartado en la misión y el error lo explica.
+ */
+export async function buyEntry(a: {
   missionId: number;
   sessionId: number | null;
   chain: ChainId;
-  token: string;
-  usdAmount?: number;
+  token: TokenRef;
+  stable: TokenRef;
+  amount: number;
+  slippageBps: number;
+  reasoning: string;
+  meta?: TradeMeta;
+}): Promise<EntryFill> {
+  const chain = getChain(a.chain);
+  const clockRunning = !!getMission(a.missionId)?.started_at;
+  const walletBefore = getHoldings(a.missionId);
+  const before = balance(a.missionId, chain.id, a.token.address);
+  let buy: Awaited<ReturnType<typeof swap>>;
+  try {
+    buy = await swap({
+      missionId: a.missionId,
+      sessionId: a.sessionId,
+      chain: chain.id,
+      input: a.stable.address,
+      output: a.token.address,
+      amount: a.amount,
+      slippageBps: a.slippageBps,
+      reasoning: a.reasoning,
+      meta: a.meta,
+    });
+  } catch (err) {
+    if (!(err instanceof SlippageExceeded)) throw err;
+    const sym = a.token.symbol ?? a.token.address;
+    const pct = err.worsePct.toFixed(1);
+    const during = err.latencyMs > 0 ? `durante los ${err.latencyMs / 1000} s de latencia entre cotizar y ejecutar` : "desde tu última cotización";
+    const why = `el precio se ha movido en tu contra un ${pct} % ${during} (la compra daba un ${pct} % menos de ${sym}), más que tu slippage del ${err.slippageBps / 100} %`;
+    excludeFromEntry(a.missionId, a.token.address, `la compra revirtió: ${why}`);
+    throw new Error(
+      `La compra de ${sym} ha revertido${clockRunning ? "" : " y el reloj no ha arrancado"}: ${why}. ` +
+        `No se ha comprado nada; solo has pagado la red (${Number(err.burnedNative.toPrecision(3))} ${err.nativeSymbol}). ` +
+        `${sym} queda descartado en esta misión: wait_for_signal no te lo volverá a dar y enter_with_exits no lo compra. ` +
+        "No lo reintentes ni subas el slippage: un precio que se mueve así de rápido es justo de lo que te protege la reversión. " +
+        (clockRunning ? "Si aún te queda reloj, vuelve a wait_for_signal." : "Vuelve a wait_for_signal: el reloj sigue parado."),
+    );
+  }
+  const filledAtMs = Date.now();
+  const bought = balance(a.missionId, chain.id, a.token.address) - before;
+  recordEntry(a.missionId, a.token.address);
+  return {
+    buy,
+    token: a.token,
+    stable: a.stable,
+    amount: a.amount,
+    bought,
+    entryPrice: a.amount / bought,
+    clock: { atMs: filledAtMs, walletBefore, cause: `con la compra de ${a.token.symbol ?? a.token.address} (enter_with_exits)` },
+  };
+}
+
+/**
+ * Tras la compra (y con el reloj ya en marcha), la toma de beneficio: una orden límite que vende todo el saldo del token
+ * a un precio fijo. El precio sale de tpRatio (× el precio de compra) o, sin él, del objetivo de la misión: el que, al
+ * venderlo todo, deja la cartera en el objetivo neto de costes (con lo demás que tenga, gas incluido). Si la orden no se
+ * puede poner, la compra queda hecha y la respuesta lo dice.
+ */
+export async function placeExits(a: {
+  missionId: number;
+  sessionId: number | null;
+  chain: ChainId;
+  fill: EntryFill;
   tpRatio?: number;
   /** De dónde sale tpRatio (para la respuesta y el diario): 'parámetro' o 'plan #N'. */
   tpRatioFrom?: string;
   slippageBps: number;
   reasoning: string;
-  meta?: TradeMeta;
 }) {
   const chain = getChain(a.chain);
-  const token = await chain.resolveToken(a.token);
-  if (chain.isCash(token.address) || token.address === chain.native.address) {
-    throw new Error("enter_with_exits compra un token: ni el efectivo ni el nativo de la cadena");
-  }
-  const { stable, amount } = entryCash(a.missionId, chain.id, a.usdAmount);
-  const before = balance(a.missionId, chain.id, token.address);
-  const buy = await swap({
-    missionId: a.missionId,
-    sessionId: a.sessionId,
-    chain: chain.id,
-    input: stable.address,
-    output: token.address,
-    amount,
-    slippageBps: a.slippageBps,
-    reasoning: a.reasoning,
-    meta: a.meta,
-  });
+  const { token, stable, amount, bought, entryPrice, buy } = a.fill;
+  const enteredMs = a.fill.clock.atMs;
   const qty = balance(a.missionId, chain.id, token.address);
-  const bought = qty - before;
-  const entryPrice = amount / bought;
-  recordEntry(a.missionId, token.address);
 
   // Lo que vale ahora cada parte de la cartera (el token, a precio de venta real con esa cantidad).
   const mission = getMission(a.missionId)!;
@@ -202,9 +342,12 @@ export async function enterWithExits(a: {
     };
   }
 
-  const now = getMission(a.missionId)!;
+  // Misión rápida: la entrada queda para medirla con velas como a los gemelos (candles.ts), con su ficha.
+  recordAgentEntry({ missionId: a.missionId, chain: chain.id, token, usdIn: amount, tokens: bought, entryPrice, tpPrice: triggerPrice, enteredMs });
+
+  const after = getMission(a.missionId)!;
   return {
-    clock: now.started_at ? { startedAt: now.started_at, deadline: now.deadline, minutesLeft: Number(minutesLeft(now).toFixed(1)) } : undefined,
+    clock: after.started_at ? { startedAt: after.started_at, deadline: after.deadline, minutesLeft: Number(minutesLeft(after).toFixed(1)) } : undefined,
     buy,
     tokensBought: bought,
     entryPrice,

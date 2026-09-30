@@ -2,7 +2,7 @@
 import { db } from "../db.js";
 import { listCapabilityRequests } from "./memory.js";
 import { describeCostMode } from "./costs.js";
-import { getActiveMission, getLastMission, getMission, missionDurationMinutes, missionMeasurement, PREP_TIMEOUT_MINUTES } from "./mission.js";
+import { getActiveMission, getLastMission, getMission, missionDurationMinutes, missionMeasurement, PREP_TIMEOUT_MINUTES, revertedEntries } from "./mission.js";
 import { listOrders } from "./orders.js";
 import { valuation } from "./portfolio.js";
 import { listPositions } from "./positions.js";
@@ -30,7 +30,10 @@ export async function statusReport(missionId?: number): Promise<string> {
         ? `en curso, quedan ${timeLeft(m.deadline)}`
         : `preparándose: el reloj (${Math.round(missionDurationMinutes(m))} min) aún no ha arrancado`
       : m.end_reason === "prep_timeout"
-        ? `cancelada: el reloj no arrancó en ${PREP_TIMEOUT_MINUTES} min`
+        ? `cancelada: el reloj no arrancó en ${PREP_TIMEOUT_MINUTES} min${(() => {
+            const n = revertedEntries(m.id).length;
+            return n ? ` (llegaron candidatos, pero ${n === 1 ? "su compra revirtió" : `${n} compras revirtieron`})` : "";
+          })()}`
         : m.status === "succeeded"
         ? "CONSEGUIDA"
         : m.status === "expired"

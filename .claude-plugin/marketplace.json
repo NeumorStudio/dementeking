@@ -9,7 +9,7 @@
       "name": "dementeking",
       "source": "./plugin",
       "description": "Agente de trading cripto en simulación con precios reales, misiones, memoria y panel en directo.",
-      "version": "0.37.1",
+      "version": "0.37.2",
       "displayName": "DementeKing",
       "author": {
         "name": "NeumorStudio"

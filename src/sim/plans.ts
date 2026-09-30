@@ -57,6 +57,11 @@ export interface PlanBody {
   usd_amount?: number;
   /** Precio de la toma de beneficio = precio de compra × tp_ratio (calculado con quote_swap para el capital). */
   tp_ratio?: number;
+  /**
+   * Slippage de la compra (bps). Sin él, ENTRY_SLIPPAGE_BPS (300). enter_with_exits no admite más: si la compra revierte
+   * por el precio, no se reintenta subiéndolo. El gemelo usa el mismo.
+   */
+  slippage_bps?: number;
   /** Regla de reentrada, en palabras. */
   reentry: string;
   reentry_allowed: boolean;
@@ -101,10 +106,18 @@ export const activePlan = (cls: string) => toPlan(db.prepare("SELECT * FROM plan
 
 export const latestActivePlan = () => toPlan(db.prepare("SELECT * FROM plans WHERE active = 1 ORDER BY id DESC LIMIT 1").get() as PlanRow | undefined);
 
+// Una misión cancelada por prep_timeout a la que sí le llegó algún candidato: wait_for_signal devolvió uno (signal_at) o
+// una compra de enter_with_exits revirtió (entry_exclusions). No es un plan cuya fuente o filtros no dejan pasar nada.
+const HAD_CANDIDATE = "(signal_at IS NOT NULL OR EXISTS (SELECT 1 FROM entry_exclusions e WHERE e.mission_id = missions.id))";
+const HAD_REVERT = "EXISTS (SELECT 1 FROM entry_exclusions e WHERE e.mission_id = missions.id)";
+
 /**
  * Cómo va el bloque de un plan: misiones que lo han jugado hasta el final y cuántas lo consiguieron. Y las que se
- * prepararon con él pero se cancelaron a los 60 min sin que llegara ningún candidato (prep_timeout): no cuentan en el
- * bloque, pero si su fuente o sus filtros no dejan pasar nada, el plan no sirve y hay que sustituirlo.
+ * prepararon con él pero se cancelaron a los 60 min sin arrancar el reloj (prep_timeout), que no cuentan en el bloque y
+ * son dos cosas distintas: sin que llegara ningún candidato (noCandidate: si su fuente o sus filtros no dejan pasar nada,
+ * el plan no sirve y hay que sustituirlo) o con candidatos en los que no se llegó a entrar (candidateNoEntry), casi
+ * siempre porque su compra revirtió (reverted: el precio se movió más que el slippage en la latencia; M18). Aflojar los
+ * filtros por estas últimas sería justo lo contrario de lo que piden.
  */
 export function planBlock(planId: number) {
   const r = db
@@ -112,18 +125,27 @@ export function planBlock(planId: number) {
       `SELECT COALESCE(SUM(started_at IS NOT NULL), 0) AS played,
               COALESCE(SUM(started_at IS NOT NULL AND status IN ('succeeded', 'expired', 'bust')), 0) AS finished,
               COALESCE(SUM(started_at IS NOT NULL AND status = 'succeeded'), 0) AS succeeded,
-              COALESCE(SUM(end_reason = 'prep_timeout'), 0) AS noCandidate
+              COALESCE(SUM(end_reason = 'prep_timeout' AND NOT ${HAD_CANDIDATE}), 0) AS noCandidate,
+              COALESCE(SUM(end_reason = 'prep_timeout' AND ${HAD_CANDIDATE}), 0) AS candidateNoEntry,
+              COALESCE(SUM(end_reason = 'prep_timeout' AND ${HAD_REVERT}), 0) AS reverted
        FROM missions WHERE plan_id = ?`,
     )
-    .get(planId) as { played: number; finished: number; succeeded: number; noCandidate: number };
-  // La última misión terminada del plan (sin contar las que paró o sustituyó el usuario): ¿se canceló sin candidato?
+    .get(planId) as { played: number; finished: number; succeeded: number; noCandidate: number; candidateNoEntry: number; reverted: number };
+  // La última misión terminada del plan (sin contar las que paró o sustituyó el usuario): ¿se canceló sin candidato, o
+  // con candidatos pero sin entrar?
   const last = db
     .prepare(
-      `SELECT id, end_reason FROM missions WHERE plan_id = ? AND status NOT IN ('active', 'closing')
+      `SELECT id, end_reason, ${HAD_CANDIDATE} AS had_candidate FROM missions WHERE plan_id = ? AND status NOT IN ('active', 'closing')
          AND (started_at IS NOT NULL OR end_reason = 'prep_timeout') ORDER BY id DESC LIMIT 1`,
     )
-    .get(planId) as { id: number; end_reason: string | null } | undefined;
-  return { ...r, left: Math.max(0, PLAN_BLOCK_SIZE - r.finished), lastWithoutCandidate: last?.end_reason === "prep_timeout" ? last.id : null };
+    .get(planId) as { id: number; end_reason: string | null; had_candidate: number } | undefined;
+  const lastTimedOut = last?.end_reason === "prep_timeout";
+  return {
+    ...r,
+    left: Math.max(0, PLAN_BLOCK_SIZE - r.finished),
+    lastWithoutCandidate: lastTimedOut && !last!.had_candidate ? last!.id : null,
+    lastCandidateNoEntry: lastTimedOut && last!.had_candidate ? last!.id : null,
+  };
 }
 
 /**
@@ -282,6 +304,21 @@ export function describePlan(plan: Plan) {
     predictedP: plan.predicted_p,
     baselineP: plan.baseline_p,
     block: `${block.finished} de ${PLAN_BLOCK_SIZE} misiones terminadas (${block.succeeded} conseguidas)`,
+    ...(block.candidateNoEntry
+      ? {
+          candidatesNotEntered: {
+            missions: block.candidateNoEntry,
+            reverted: block.reverted,
+            lastMissionNotEntered: block.lastCandidateNoEntry,
+            note:
+              `${block.candidateNoEntry} misión(es) preparadas con este plan se cancelaron a los 60 min sin arrancar el reloj, pero SÍ les llegaron ` +
+              `candidatos${block.reverted ? ` (en ${block.reverted}, la compra de enter_with_exits revirtió: el precio se movió en contra más que el slippage en la latencia)` : ""}` +
+              ": la fuente y los filtros dejan pasar candidatos, así que no es motivo para aflojarlos. Los tokens cuya compra revirtió, con el motivo, " +
+              "están en entryExclusions de mission_review_data y en journal_history de esa misión. Si revierten a menudo, son precios que se mueven en " +
+              "segundos: un filtro que los evite (cambio de precio o compras en 5 min) solo con evidencia (entry_dataset)",
+          },
+        }
+      : {}),
     ...(block.noCandidate
       ? {
           withoutCandidate: {

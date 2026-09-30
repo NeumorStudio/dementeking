@@ -16,7 +16,7 @@ Datos verificados el 27 y el 28 de septiembre de 2026; las plataformas cambian, 
 | Binance spot | Orden de mercado contra el order book real | `simulate_binance_market_order` |
 | Órdenes condicionales | Por precio (se disparan con el precio de venta real, comprobado cada 15 s; cada 5 s en una misión rápida) o por tiempo (se ejecutan a los minutos que indiques, pase lo que pase) | `place_*_trigger_order` |
 | Futuros perpetuos, largos o cortos, con apalancamiento | Precio y funding reales de Hyperliquid (sección 6); el margen sale del efectivo de una cadena | `open_perp`, `close_perp`, `set_perp_exits` |
-| Entrada de una misión rápida | Compra con todo el efectivo de la cadena y deja puesta la toma de beneficio en una llamada; si el reloj no ha arrancado, lo arranca, pero solo si antes pasa todas las comprobaciones (plan, efectivo, token, una ida y vuelta de más del 10 %, memoria): si falla, el reloj sigue parado (sección 7) | `enter_with_exits` |
+| Entrada de una misión rápida | Compra con todo el efectivo de la cadena y deja puesta la toma de beneficio en una llamada; si el reloj no ha arrancado, lo arranca en el momento en que la compra se llena, y solo si antes pasa todas las comprobaciones (plan, efectivo, token, slippage no mayor que el del plan, una ida y vuelta de más del 10 %, memoria): si una falla o la compra revierte, el reloj sigue parado; un token cuya compra revierte queda descartado en la misión (sección 7) | `enter_with_exits` |
 
 **No ejecutable** (solo se puede anotar con `record_hypothetical_action`): crear tokens, publicar en redes,
 otras blockchains (Ethereum, Arbitrum…), préstamos, staking, airdrops. Los futuros sí se ejecutan, pero solo en simulación. Si necesitas algo que no
@@ -84,7 +84,7 @@ BNB Chain.
   liquidez ese valor puede quedar muy por debajo del precio "de pantalla".
 - Al terminar la misión se vende todo a mercado; en tokens ilíquidos eso también tiene coste.
 - Tiempo: cada paso tuyo (decidir, llamar a una herramienta, leer el resultado) también cuenta. Medido en misiones anteriores: 11 s de mediana por paso, 28-57 s cuando se redacta una tesis, y 84-111 s entre `start_session` y la primera operación. Una sola decisión tarda unos 17 s con esfuerzo medio, unos 60 s con esfuerzo alto y 5-7 min con el máximo.
-- El reloj de la misión arranca con el primer `start_session` o `enter_with_exits`, no al crearla. Antes se puede preparar y esperar, pero no operar; si no arranca en 60 min desde que se creó, la misión se cancela.
+- El reloj de la misión arranca con el primer `start_session` o con la compra de `enter_with_exits` (cuando se llena), no al crearla. Antes se puede preparar y esperar, pero no operar; si no arranca en 60 min desde que se creó, la misión se cancela.
 
 ## 3. pump.fun
 

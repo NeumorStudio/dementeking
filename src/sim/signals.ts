@@ -13,8 +13,9 @@
 //   launchpad se comprueba con Jupiter, que además da los decimales y la hora de la graduación.
 // - La API de pump.fun (coins con complete=true) respondió 429 a la primera: no sirve para sondear.
 // - Jupiter cotizó compra y venta de un pool con 49 s de vida (ida y vuelta de 48,5 $: un 1,5 %).
-import { fetchJson, HostBusyError } from "../market/http.js";
+import { fetchJsonAt, HostBusyError } from "../market/http.js";
 import { fromBaseUnits, getQuote, SOL_MINT, toBaseUnits, USDC_MINT } from "../market/jupiter.js";
+import { geckoValues, jupiterValues, snapshotFrom, type EntrySnapshot, type Ficha } from "./ficha.js";
 import type { PlanFilters, SignalSource } from "./plans.js";
 
 const GECKO_NEW_POOLS = "https://api.geckoterminal.com/api/v2/networks/solana/new_pools";
@@ -80,6 +81,8 @@ export interface SignalResult {
   rejected: Record<string, number>;
   /** Por qué volvió antes sin candidato (p. ej. la misión ya no está activa). */
   stopped?: string;
+  /** Con candidato: lo leído de él al detectarlo (la ficha de entrada, ficha.ts). No es para el agente: se guarda en la misión. */
+  snapshot?: EntrySnapshot;
   /** Lecturas de la fuente que fallaron (GeckoTerminal con 429 o caído): sin esto, "no hubo eventos" y "no se pudo mirar" se confunden. */
   sourceErrors?: SourceErrors;
 }
@@ -122,6 +125,10 @@ interface PoolInfo {
   buyers5m?: number;
   volume5mUsd?: number;
   priceChange5mPct?: number;
+  /** La fila del pool para la ficha de entrada (ficha.ts). */
+  gecko: Ficha;
+  /** Cuándo se pidió la página de la que sale (una de la caché conserva su hora): la edad de lo de GeckoTerminal en la ficha. */
+  fetchedAtMs: number;
 }
 
 const num = (v: unknown): number | undefined => {
@@ -130,8 +137,8 @@ const num = (v: unknown): number | undefined => {
 };
 const stripNetwork = (id: unknown) => String(id ?? "").replace(/^solana_/, "");
 
-/** Los pools de PumpSwap de una página de new_pools, con el token (el lado que no es SOL). */
-export function pumpSwapPools(data: unknown): PoolInfo[] {
+/** Los pools de PumpSwap de una página de new_pools, con el token (el lado que no es SOL). fetchedAtMs: cuándo se pidió. */
+export function pumpSwapPools(data: unknown, fetchedAtMs = Date.now()): PoolInfo[] {
   if (!Array.isArray(data)) return [];
   return data.flatMap((p: any): PoolInfo[] => {
     if (p?.relationships?.dex?.data?.id !== "pumpswap") return [];
@@ -154,6 +161,8 @@ export function pumpSwapPools(data: unknown): PoolInfo[] {
         buyers5m: num(a.transactions?.m5?.buyers),
         volume5mUsd: num(a.volume_usd?.m5),
         priceChange5mPct: num(a.price_change_percentage?.m5),
+        gecko: geckoValues(a),
+        fetchedAtMs,
       },
     ];
   });
@@ -189,11 +198,15 @@ interface TokenMeta {
   decimals?: number;
   launchpad?: string;
   graduatedAtMs?: number;
+  /** Lo que va a la ficha de entrada (ficha.ts). */
+  jupiter: ReturnType<typeof jupiterValues>;
+  /** Cuándo se pidió a Jupiter (una respuesta de la caché conserva su hora). */
+  fetchedAtMs: number;
 }
 
 /** Datos del token en Jupiter (la misma búsqueda que usa el simulador para resolverlo). */
 async function tokenMeta(mint: string, ttlMs: number, lowPriority?: boolean): Promise<TokenMeta | null> {
-  const list = await fetchJson<Array<Record<string, any>>>(`${JUPITER_SEARCH}?query=${encodeURIComponent(mint)}`, { timeoutMs: 15_000, ttlMs, lowPriority });
+  const { data: list, atMs } = await fetchJsonAt<Array<Record<string, any>>>(`${JUPITER_SEARCH}?query=${encodeURIComponent(mint)}`, { timeoutMs: 15_000, ttlMs, lowPriority });
   const t = list.find((x) => x.id === mint);
   if (!t) return null;
   const graduatedAtMs = t.graduatedAt ? Date.parse(t.graduatedAt) : NaN;
@@ -203,6 +216,8 @@ async function tokenMeta(mint: string, ttlMs: number, lowPriority?: boolean): Pr
     decimals: typeof t.decimals === "number" ? t.decimals : undefined,
     launchpad: typeof t.launchpad === "string" ? t.launchpad : undefined,
     graduatedAtMs: Number.isFinite(graduatedAtMs) ? graduatedAtMs : undefined,
+    jupiter: jupiterValues(t),
+    fetchedAtMs: atMs,
   };
 }
 
@@ -213,7 +228,7 @@ const rethrowBusy = (err: unknown) => {
 };
 
 /** Qué pasa con un token que se comprueba: pasa, se descarta para siempre o se vuelve a mirar más tarde. */
-type Check = { ok: true; candidate: SignalCandidate; decimals: number; tokensOutRaw: string } | { ok: false; reason: string; retry: boolean };
+type Check = { ok: true; candidate: SignalCandidate; decimals: number; tokensOutRaw: string; snapshot: EntrySnapshot } | { ok: false; reason: string; retry: boolean };
 
 /** Un candidato que pasa los filtros, con lo que hace falta para seguir su precio (el gemelo mecánico, shadow.ts). */
 export interface ScannerHit {
@@ -221,6 +236,8 @@ export interface ScannerHit {
   decimals: number;
   /** Tokens que da la compra cotizada, en unidades base (lo que se vende después). */
   tokensOutRaw: string;
+  /** Lo leído del pool y del token al detectarlo: la ficha de entrada (ficha.ts). */
+  snapshot?: EntrySnapshot;
 }
 
 /**
@@ -317,6 +334,18 @@ export class SignalScanner {
       ok: true,
       decimals: meta.decimals,
       tokensOutRaw,
+      // Cada fuente con su hora: la fila de new_pools puede ser de una lectura anterior (se guarda mientras Jupiter no conoce el
+      // token, aunque el pool ya no salga en las páginas) y lo de Jupiter, de su caché.
+      snapshot: snapshotFrom({
+        capturedAtMs: nowMs,
+        pool: pool?.pool,
+        poolCreatedMs: pool?.createdMs,
+        gecko: pool?.gecko,
+        geckoAtMs: pool?.fetchedAtMs,
+        jupiter: meta.jupiter,
+        jupiterAtMs: meta.fetchedAtMs,
+        roundTripPct: roundTripCostPct,
+      }),
       candidate: {
         token,
         symbol: meta.symbol,
@@ -358,7 +387,7 @@ export class SignalScanner {
         if (nowMs < (this.pageRetryAt[i] ?? 0)) continue;
         this.sourceErrors.reads++;
         const url = `${GECKO_NEW_POOLS}?page=${i + 1}`;
-        const page = await fetchJson<{ data?: unknown }>(url, { timeoutMs: 15_000, ttlMs: ttl, lowPriority: opts.lowPriority }).catch((err) => {
+        const page = await fetchJsonAt<{ data?: unknown }>(url, { timeoutMs: 15_000, ttlMs: ttl, lowPriority: opts.lowPriority }).catch((err) => {
           if (err instanceof HostBusyError) {
             this.sourceErrors.reads--;
             return null;
@@ -370,9 +399,10 @@ export class SignalScanner {
           this.pageRetryAt[i] = Date.now() + ttl;
           return null;
         });
-        for (const p of pumpSwapPools(page?.data)) {
+        for (const p of pumpSwapPools(page?.data.data, page?.atMs)) {
+          // El pool más reciente del token y, del mismo pool, la lectura más reciente (una página de la caché puede ser más vieja).
           const prev = pools.get(p.token);
-          if (!prev || p.createdMs >= prev.createdMs) pools.set(p.token, p);
+          if (!prev || p.createdMs > prev.createdMs || (p.createdMs === prev.createdMs && p.fetchedAtMs >= prev.fetchedAtMs)) pools.set(p.token, p);
         }
       }
     }
@@ -440,7 +470,7 @@ export class SignalScanner {
         lastChecked.delete(q.token);
         return null;
       }
-      if (r.ok) return { candidate: r.candidate, decimals: r.decimals, tokensOutRaw: r.tokensOutRaw };
+      if (r.ok) return { candidate: r.candidate, decimals: r.decimals, tokensOutRaw: r.tokensOutRaw, snapshot: r.snapshot };
       verdicts.set(q.token, r.reason);
       if (!r.retry) dropped.add(q.token);
     }
@@ -479,7 +509,7 @@ export async function waitForSignal(opts: {
     const stop = opts.shouldStop?.();
     if (stop) return done({ stopped: stop });
     const hit = await scanner.poll();
-    if (hit) return { ...done({ candidate: hit.candidate }), found: true };
+    if (hit) return { ...done({ candidate: hit.candidate }), found: true, ...(hit.snapshot ? { snapshot: hit.snapshot } : {}) };
     const left = until - Date.now();
     if (left <= 0) return done({});
     await new Promise((r) => setTimeout(r, Math.min(scanner.timing.pollMs, left)));

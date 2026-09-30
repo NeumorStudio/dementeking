@@ -7,7 +7,7 @@
 // La escribe el agente revisor, no el que opera: así el agente no juzga sus propias decisiones.
 // El que opera deja observaciones (report_observation) y el revisor decide qué pasa a la memoria.
 import { db, logActivity, now } from "../db.js";
-import { getActiveMission, getLastMission, getMission, missionMeasurement, type Mission } from "./mission.js";
+import { getActiveMission, getLastMission, getMission, missionMeasurement, revertedEntries, type Mission } from "./mission.js";
 import { isFastMission } from "./mission-kind.js";
 import { listPositions } from "./positions.js";
 import { DUPLICATE_THRESHOLD, fingerprint, similarity } from "./text.js";
@@ -15,6 +15,7 @@ import { launchpadOf } from "./launchpads.js";
 import { wilson } from "./stats.js";
 import { classStats, missionComparison, twinCounts } from "./class-stats.js";
 import { shadowSummary } from "./shadow.js";
+import { agentEntrySummary } from "./candles.js";
 
 // ─── Parecido entre misiones ────────────────────────────────────────────────
 
@@ -444,7 +445,7 @@ export function recall(missionId?: number | null, limit?: number) {
         result:
           m.status === "cancelled"
             ? m.end_reason === "prep_timeout"
-              ? "cancelada: el reloj no llegó a arrancar"
+              ? `cancelada: el reloj no llegó a arrancar${revertedEntries(m.id).length ? " (sus compras revirtieron)" : ""}`
               : "cancelada por el usuario"
             : `${m.status === "succeeded" ? "objetivo conseguido" : "no llegó al objetivo"}: ${m.initial_usd} → ${m.final_usd?.toFixed(2)} USD (${(
                 ((m.final_usd! - m.initial_usd) / m.initial_usd) *
@@ -1035,7 +1036,7 @@ export function missionReviewData(missionId: number, since?: string) {
   const m = getMission(missionId);
   if (!m) throw new Error(`No existe la misión #${missionId}`);
   const from = since ?? "";
-  const { benchmark: _b, benchmark_sol_price: _s, ...mission } = m as Mission & { benchmark?: unknown; benchmark_sol_price?: unknown };
+  const { benchmark: _b, benchmark_sol_price: _s, signal_features: _f, ...mission } = m as Mission & { benchmark?: unknown; benchmark_sol_price?: unknown };
   const briefing = db.prepare("SELECT text, updated_at, seen_at FROM briefings WHERE mission_id = ?").get(missionId) as
     | { text: string; updated_at: string; seen_at: string | null }
     | undefined;
@@ -1052,6 +1053,8 @@ export function missionReviewData(missionId: number, since?: string) {
     : allPositions;
   // El gemelo, solo con la misión terminada: a mitad de misión podría llegarle al agente por el briefing.
   const twin = m.status === "active" || m.status === "closing" ? null : shadowSummary(missionId);
+  // La entrada del agente medida con velas como sus gemelos (misma vara), con su ficha. Con la misión terminada, como el gemelo.
+  const agentEntry = m.status === "active" || m.status === "closing" ? null : agentEntrySummary(missionId);
   const measurement = missionMeasurement(m);
   return {
     mission: { ...mission, profile: describe(profile(m)) },
@@ -1060,6 +1063,7 @@ export function missionReviewData(missionId: number, since?: string) {
     stats: missionStats(missionId),
     // Misión rápida: su gemelo mecánico (los eventos siguientes con la regla sin inteligencia) y cómo va su clase.
     ...(twin ? { twin } : {}),
+    ...(agentEntry ? { agentEntry } : {}),
     ...(m.class && !since
       ? { missionClass: classStats({ cls: m.class, costMode: m.cost_mode, perMissionLimit: 10 })[0] ?? `${m.class} (costes ${m.cost_mode}): aún sin misiones terminadas` }
       : {}),
@@ -1082,6 +1086,12 @@ export function missionReviewData(missionId: number, since?: string) {
     observations: db
       .prepare("SELECT id, ts, kind, text, status FROM observations WHERE mission_id = ? AND (status = 'pending' OR ts > ?) ORDER BY id")
       .all(missionId, from),
+    // Candidatos cuya compra de enter_with_exits revirtió (el precio se movió más que el slippage en la latencia): quedaron
+    // descartados en la misión. Antes del reloj no cuentan como operación, pero dicen por qué tardó en entrar o no entró.
+    ...(() => {
+      const reverted = revertedEntries(missionId).filter((r) => r.ts > from);
+      return reverted.length ? { entryExclusions: reverted } : {};
+    })(),
     // El mensaje solo si dice algo más que su clase normalizada.
     toolErrors: errors.map(({ error_class, message, ...e }) => ({
       ...e,
